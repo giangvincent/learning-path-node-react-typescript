@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Reference 02 — Express MVC in KinLink</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="lesson-header">
+        <p class="eyebrow">Reference 02 · keep this open for every feature</p>
+        <h1>Express MVC in KinLink</h1>
+        <p class="lede">
+          The folder map, the request lifecycle, and what each layer is allowed to do.
+          Every feature you build for the next eight weeks follows this page.
+        </p>
+        <div class="meta-row">
+          <span>Used by: <a href="../lessons/0001-the-kinlink-skeleton.html">Lesson 01</a></span>
+          <span>Vocabulary: <a href="../GLOSSARY.md">GLOSSARY.md</a></span>
+        </div>
+      </header>
+
+      <h2>1. The project folder</h2>
+
+      <pre><code>kinlink/
+├── package.json            one manifest for the whole website
+├── tsconfig.json           server + shared compiler options
+├── vite.config.ts          client build (root: client/)
+├── docker-compose.yml      MySQL 8
+├── client/
+│   ├── index.html
+│   ├── tsconfig.json       browser libs, JSX
+│   └── src/
+│       ├── main.tsx
+│       ├── App.tsx
+│       ├── contracts.ts    re-export of ../../shared/contracts
+│       ├── brand/
+│       └── lib/api.ts      the only place that calls fetch
+├── server/
+│   └── src/
+│       ├── server.ts       opens the port
+│       ├── app.ts          builds the app (no port)
+│       ├── config/env.ts   typed environment
+│       ├── contracts.ts    re-export of ../../shared/contracts
+│       ├── routes/         URL → controller bindings
+│       ├── controllers/    the HTTP boundary
+│       ├── services/       business rules
+│       ├── models/         data access
+│       ├── views/          domain → resource
+│       ├── middlewares/    auth, validation, errors
+│       └── utils/
+├── shared/
+│   └── contracts/          types both sides compile against
+└── docs/</code></pre>
+
+      <div class="callout">
+        <span class="callout-title">Why <code>shared/</code> is not a package</span>
+        <p>
+          It has no <code>package.json</code> and no build step. It is a folder of
+          types that both <code>tsconfig.json</code> files include. Because everything
+          in it is type-only, it produces no runtime code — the types vanish at build
+          and cannot leak into the browser bundle.
+        </p>
+      </div>
+
+      <h2>2. The request lifecycle</h2>
+
+      <pre><code>  browser
+     │  GET /api/people
+     ▼
+  vite dev proxy ──────────────▶ express
+                                   │
+                              ┌────┴─────┐
+                              │  ROUTE   │  bind URL + verb to a controller
+                              └────┬─────┘
+                              ┌────┴──────────┐
+                              │  MIDDLEWARE   │  auth · family context · validation
+                              └────┬──────────┘
+                              ┌────┴─────────┐
+                              │  CONTROLLER  │  read request, call one service
+                              └────┬─────────┘
+                              ┌────┴────────┐
+                              │  SERVICE    │  business rules, transactions
+                              └────┬────────┘
+                              ┌────┴──────┐
+                              │   MODEL   │  the only layer that queries
+                              └────┬──────┘
+                                   ▼
+                                 MySQL
+                                   │
+                              ┌────┴──────┐
+                              │   VIEW    │  domain → resource (JSON shape)
+                              └────┬──────┘
+                                   ▼
+                            res.json(body)  ──▶  React renders</code></pre>
+
+      <p>
+        Read it top to bottom in each direction and memorise it. Every layer violation
+        you will ever be asked about in an interview is a shortcut across this diagram.
+      </p>
+
+      <h2>3. What each layer owns</h2>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Layer</th>
+            <th>Owns</th>
+            <th>Must never</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>routes/</code></td>
+            <td>Binding a URL and verb to one controller; the middleware chain for it.</td>
+            <td>Contain logic, or reach past the controller.</td>
+          </tr>
+          <tr>
+            <td><code>middlewares/</code></td>
+            <td>Cross-cutting concerns: who you are, which family, is the body valid, what happens on error.</td>
+            <td>Contain business rules.</td>
+          </tr>
+          <tr>
+            <td><code>controllers/</code></td>
+            <td>Reading the request, calling <em>one</em> service, choosing the status code.</td>
+            <td>Contain business logic, or touch the database.</td>
+          </tr>
+          <tr>
+            <td><code>services/</code></td>
+            <td>Business rules, orchestration, transactions, permission checks.</td>
+            <td>Know that <code>req</code> and <code>res</code> exist.</td>
+          </tr>
+          <tr>
+            <td><code>models/</code></td>
+            <td>Data access: how a thing is stored and retrieved.</td>
+            <td>Contain HTTP or business rules.</td>
+          </tr>
+          <tr>
+            <td><code>views/</code></td>
+            <td>Turning a domain object into the <strong>resource</strong> the client may see.</td>
+            <td>Query the database, or fetch anything.</td>
+          </tr>
+          <tr>
+            <td><code>shared/contracts/</code></td>
+            <td>The types both sides compile against.</td>
+            <td>Contain runtime code, or any implementation detail.</td>
+          </tr>
+          <tr>
+            <td><code>client/</code></td>
+            <td>Presentation and interaction.</td>
+            <td>Decide permissions, or own the truth about who you are.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2>4. The honest note about "View"</h2>
+
+      <p>
+        MVC was invented for server-rendered pages, where the View is an HTML template.
+        KinLink is a JSON API with a React client, so there is no template to render.
+        The View layer survives as <strong>the thing that decides the shape of the
+        response</strong> — some teams call it a serializer, a presenter, or a
+        resource mapper. It is the same seam.
+      </p>
+
+      <p>
+        It earns its place by making one thing impossible: a database column leaking
+        into the UI. When the client needs <code>name</code> but the table stores
+        <code>given_name</code>, <code>middle_name</code> and <code>surname</code>, the
+        View is where that decision is made — once, instead of in twelve components.
+      </p>
+
+      <h2>5. Response shapes</h2>
+
+      <p>Every successful response, without exception:</p>
+
+      <pre><code>{
+  "data": { },
+  "meta": { }
+}</code></pre>
+
+      <p>Every failed response, without exception:</p>
+
+      <pre><code>{
+  "message": "Validation failed",
+  "errors": { }
+}</code></pre>
+
+      <p>
+        One shape means the client has one error path to write instead of one per
+        endpoint. The single place these are produced is
+        <code>middlewares/errorHandler.ts</code>.
+      </p>
+
+      <h2>6. Conventions</h2>
+
+      <ul>
+        <li>One router file per resource: <code>people.routes.ts</code>, never <code>routes.ts</code>.</li>
+        <li>File names are <code>kebab-case</code>; exported symbols are <code>camelCase</code> functions or <code>PascalCase</code> types.</li>
+        <li><code>createApp()</code> builds; <code>server.ts</code> listens. Tests import the first and never open a port.</li>
+        <li>Anything that can fail asynchronously goes to <code>next(error)</code>; the error handler is the only place that writes a 500.</li>
+        <li>The client's only <code>fetch</code> call lives in <code>client/src/lib/api.ts</code>. Components call functions, not URLs.</li>
+        <li>Contracts use <code>import type</code>. With <code>verbatimModuleSyntax</code> on, a type import can never become a runtime import.</li>
+        <li>
+          The server uses <code>module: NodeNext</code>, so its relative imports end in
+          <code>.js</code> even though the files are <code>.ts</code>. The client uses
+          <code>bundler</code> resolution and omits the extension. That difference is
+          intentional: Node really does need the extension at runtime, the bundler does
+          not.
+        </li>
+      </ul>
+
+      <h2>7. Commands</h2>
+
+      <pre><code>npm run dev          # api on :4000 and vite on :5173, one terminal
+npm run dev:server   # express only
+npm run dev:client   # vite only
+npm run typecheck    # both tsconfigs, no emit
+npm run build        # client bundle + compiled server
+npm start            # run the built server</code></pre>
+
+      <div class="callout win">
+        <span class="callout-title">Primary sources</span>
+        <p>
+          <a href="https://expressjs.com/en/guide/routing/">Express — Routing guide</a>
+          for <code>Router</code> and TypeScript request typing, and
+          <a
+            href="https://developer.mozilla.org/en-US/docs/Learn_web_development/Extensions/Server-side/Express_Nodejs/routes"
+            >MDN — Routes and controllers</a
+          >
+          for MVC mapped onto a real Express app.
+        </p>
+      </div>
+
+      <footer class="lesson-footer">
+        <p>
+          If a layer rule here blocks you in practice, that is worth a conversation —
+          rules that get broken silently are worse than rules that get argued with.
+        </p>
+      </footer>
+    </div>
+  </body>
+</html>

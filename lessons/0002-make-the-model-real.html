@@ -1,0 +1,672 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lesson 02 — Make the Model real</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="lesson-header">
+        <p class="eyebrow">Lesson 02 · Week 2 · about three hours</p>
+        <h1>Make the Model real: MySQL 8 + Prisma</h1>
+        <p class="lede">
+          Swap the array in <code>person.model.ts</code> for a real MySQL database —
+          and prove the seam held by changing nothing above it.
+        </p>
+        <div class="meta-row">
+          <span>Mission: ship KinLink</span>
+          <span>
+            Reference: <a href="../reference/0003-prisma-data-layer.html">Prisma data layer</a>
+          </span>
+          <span>Requires: <a href="0001-the-kinlink-skeleton.html">Lesson 01</a></span>
+        </div>
+      </header>
+
+      <div class="callout win">
+        <span class="callout-title">The win</span>
+        <p>
+          MySQL 8 runs in a container, Prisma owns the schema, and the same
+          <code>/api/people</code> response now comes out of a real table. The only
+          file you edit above the database is <code>person.model.ts</code> — the
+          service, the view, the controller and the route stay byte-for-byte identical,
+          and the JSON still says <code>name</code> instead of
+          <code>display_name</code>. That is the architecture paying you back.
+        </p>
+      </div>
+
+      <h2>Why the layer boundary is about to be tested</h2>
+
+      <p>
+        In lesson 01 you built six layers and took it on faith that they were worth the
+        ceremony. Today is the test. You are replacing the entire storage mechanism —
+        no array, no in-memory anything, a different data type for dates, a different
+        naming convention — and the honest measure of the design is <strong>how many
+        files have to change</strong>.
+      </p>
+
+      <p>
+        The answer should be one. If it turns out to be six, we learn that too, and we
+        fix it. Both outcomes are useful; that is the point of doing this early rather
+        than in week six.
+      </p>
+
+      <div class="callout">
+        <span class="callout-title">Before you start</span>
+        <p>
+          Lesson 01 must actually run: <code>npm run dev</code> serving
+          <code>/api/people</code> from the in-memory array. If it doesn't, stop and
+          tell me — a lesson that assumes a broken foundation wastes more time than it
+          saves.
+        </p>
+      </div>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Build it</h2>
+
+      <ol class="steps">
+        <li>
+          <h3>Start MySQL 8 in a container</h3>
+          <p>
+            Docker is already installed and running on your machine, and port 3306 is
+            free. A container gives you a disposable, reproducible database — no system
+            install to fight, no version drift, and <code>docker compose down -v</code>
+            resets everything when a migration goes wrong.
+          </p>
+
+          <div class="file">
+            <span class="file-path">docker-compose.yml</span>
+            <pre><code>services:
+  mysql:
+    image: mysql:8.0
+    container_name: kinlink-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: kinlink
+      MYSQL_USER: kinlink
+      MYSQL_PASSWORD: kinlink
+    ports:
+      - "3306:3306"
+    volumes:
+      - kinlink-mysql-data:/var/lib/mysql
+
+volumes:
+  kinlink-mysql-data:</code></pre>
+          </div>
+
+          <p>
+            <code>mysql:8.0</code> is pinned rather than <code>mysql:8</code> on
+            purpose: the floating tag can move between minor versions and silently
+            change defaults under you. When your database is the thing holding the
+            family's history, you choose the version and you write it down.
+          </p>
+
+          <pre><code>docker compose up -d
+docker compose ps</code></pre>
+
+          <p>
+            Wait until <code>STATUS</code> reads <code>healthy</code> —
+            <code>starting</code> means the server is still initialising and Prisma will
+            fail if you jump the gun.
+          </p>
+        </li>
+
+        <li>
+          <h3>Install Prisma 7 — pinned, not latest</h3>
+
+          <p>
+            Here is a real decision you are making right now, and it is worth
+            understanding because it will come up in interviews.
+          </p>
+
+          <div class="callout warn">
+            <span class="callout-title">Look before you <code>install latest</code></span>
+            <p>
+              At the time of writing, <code>prisma@latest</code> resolves to
+              <code>8.0.0-rc.19</code> — a <strong>release candidate</strong>. Prisma 8
+              is a rewrite that changes how schemas are authored and how migrations are
+              planned. Building KinLink on an RC means your foundation can change under
+              you mid-project, and the docs you find online will describe a different
+              API than the one you have.
+            </p>
+            <p>
+              So we pin <strong>7.10.0</strong> across every Prisma package. Not because
+              newer is worse, but because <em>the version you choose is a decision, and
+              an unexamined <code>latest</code> is how projects die</em>.
+            </p>
+          </div>
+
+          <pre><code>npm install @prisma/client@7.10.0 @prisma/adapter-mariadb@7.10.0 dotenv
+npm install -D prisma@7.10.0</code></pre>
+
+          <p>
+            Three packages, one version number. Prisma's CLI, client and driver adapter
+            are released in lockstep; mixing versions produces confusing type errors
+            that look like your fault and are not.
+          </p>
+
+          <p>The adapter needs explaining, because it is new in this generation:</p>
+
+          <table>
+            <thead>
+              <tr>
+                <th>Package</th>
+                <th>What it is</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>prisma</code></td>
+                <td>The CLI: <code>init</code>, <code>migrate</code>, <code>generate</code>, <code>studio</code>.</td>
+              </tr>
+              <tr>
+                <td><code>@prisma/client</code></td>
+                <td>The query API you will call from the model layer.</td>
+              </tr>
+              <tr>
+                <td><code>@prisma/adapter-mariadb</code></td>
+                <td>
+                  The driver that actually speaks MySQL's wire protocol. Prisma 7 talks
+                  to MySQL through this adapter instead of a built-in engine.
+                </td>
+              </tr>
+            </tbody>
+          </table>
+
+          <div class="file">
+            <span class="file-path">.env — and note it is already gitignored</span>
+            <pre><code>DATABASE_URL="mysql://kinlink:kinlink@127.0.0.1:3306/kinlink"
+DATABASE_HOST="127.0.0.1"
+DATABASE_PORT=3306
+DATABASE_USER="kinlink"
+DATABASE_PASSWORD="kinlink"
+DATABASE_NAME="kinlink"</code></pre>
+          </div>
+
+          <p>
+            <code>DATABASE_URL</code> is for the CLI, the discrete variables are for the
+            runtime adapter. Yes, that is the same information written twice, and yes,
+            it is annoying — it is a rough edge in this Prisma generation, not a pattern
+            worth copying. The variable <em>names</em> are the pattern worth copying:
+            every secret comes from the environment, and the environment is gitignored.
+          </p>
+        </li>
+
+        <li>
+          <h3>Initialise Prisma and write the schema</h3>
+          <pre><code>npx prisma init --datasource-provider mysql --output ../server/generated/prisma</code></pre>
+
+          <p>
+            This creates <code>prisma/schema.prisma</code>, a
+            <code>prisma7.config.ts</code>, and generates the client into
+            <code>server/generated/prisma</code>. <strong>Confirm where the generated
+            folder actually landed</strong> — the <code>--output</code> path resolves
+            relative to the schema file, not to your shell, which surprises people. If
+            it went somewhere else, fix the <code>output</code> line in the schema.
+          </p>
+
+          <div class="file">
+            <span class="file-path">prisma/schema.prisma</span>
+            <pre><code>generator client {
+  provider = "prisma-client"
+  output   = "../server/generated/prisma"
+}
+
+datasource db {
+  provider = "mysql"
+}
+
+enum Gender {
+  male
+  female
+  other
+  unknown
+}
+
+model Family {
+  id        String   @id @default(uuid())
+  slug      String   @unique
+  name      String
+  createdAt DateTime @default(now()) @map("created_at")
+
+  people Person[]
+
+  @@map("families")
+}
+
+model Person {
+  id          String    @id @default(uuid())
+  familyId    String    @map("family_id")
+  displayName String    @map("display_name")
+  gender      Gender
+  birthDate   DateTime? @map("birth_date") @db.Date
+  deathDate   DateTime? @map("death_date") @db.Date
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+
+  family Family @relation(fields: [familyId], references: [id], onDelete: Cascade)
+
+  @@index([familyId])
+  @@map("people")
+}</code></pre>
+          </div>
+
+          <p>Four decisions in that file are worth pausing on.</p>
+
+          <p>
+            <strong><code>@@map</code> and <code>@map</code>.</strong> Prisma fields are
+            <code>camelCase</code>; database columns are <code>snake_case</code>. Mapping
+            between them means each side follows its own convention instead of one
+            convention losing. Your code reads <code>displayName</code>, the table says
+            <code>display_name</code>, and the mapping is declared once, here.
+          </p>
+
+          <p>
+            <strong><code>uuid()</code> not <code>autoincrement()</code>.</strong>
+            Sequential integers leak information: <code>/api/people/47</code> tells an
+            attacker you have at least 47 people and invites them to try 48. UUIDs are
+            opaque. For a private family platform this matters.
+          </p>
+
+          <p>
+            <strong><code>onDelete: Cascade</code>.</strong> Delete a family, its people
+            go with it. Without this, MySQL refuses the delete and leaves you with rows
+            pointing at nothing. Decide the rule explicitly at design time — every
+            relation needs an answer to "what happens when the parent goes away".
+          </p>
+
+          <p>
+            <strong><code>@@index([familyId])</code>.</strong> Every single query in
+            KinLink will filter by family. Without an index, MySQL scans the whole table
+            for each one. This is the first performance decision in the project, and it
+            costs one line.
+          </p>
+
+          <div class="callout">
+            <span class="callout-title">A note on names</span>
+            <p>
+              Your spec eventually wants <code>given_name</code>,
+              <code>middle_name</code>, <code>surname</code> and
+              <code>display_name</code>. This migration deliberately keeps a single
+              <code>display_name</code> column so that exactly one file has to change
+              today. Splitting the name is a real change, and it will be made the right
+              way — as its own migration, when the People feature needs it. That is how
+              schemas are supposed to evolve.
+            </p>
+          </div>
+        </li>
+
+        <li>
+          <h3>Run the first migration</h3>
+          <pre><code>npx prisma migrate dev --name add_family_and_person</code></pre>
+
+          <p>
+            Prisma diffs your schema against the database, writes the SQL it intends to
+            run, applies it, and regenerates the client. Read the migration file it
+            produced before moving on:
+          </p>
+
+          <div class="file">
+            <span class="file-path">prisma/migrations/&lt;timestamp&gt;_add_family_and_person/migration.sql</span>
+            <pre><code>CREATE TABLE `families` (...);
+CREATE TABLE `people` (...);
+CREATE INDEX `people_family_id_idx` ON `people`(`family_id`);
+ALTER TABLE `people` ADD CONSTRAINT ... FOREIGN KEY (`family_id`) ...</code></pre>
+          </div>
+
+          <p>
+            A migration is not a magic sync. It is <strong>a file of SQL, committed to
+            git, that runs once and in order</strong>. That is why you can hand the repo
+            to a teammate or a server and get the identical schema. Never edit a
+            migration that has already run anywhere but your own machine — write a new
+            one instead.
+          </p>
+
+          <p>Want to see the tables with your own eyes?</p>
+          <pre><code>docker compose exec mysql mysql -ukinlink -pkinlink kinlink -e "DESCRIBE people;"
+npx prisma studio</code></pre>
+        </li>
+
+        <li>
+          <h3>The client, created once</h3>
+          <div class="file">
+            <span class="file-path">server/src/config/database.ts</span>
+            <pre><code>import "dotenv/config";
+import { PrismaMariaDb } from "@prisma/adapter-mariadb";
+import { PrismaClient } from "../../generated/prisma/client.js";
+
+const adapter = new PrismaMariaDb({
+  host: process.env.DATABASE_HOST ?? "127.0.0.1",
+  port: Number(process.env.DATABASE_PORT ?? 3306),
+  user: process.env.DATABASE_USER,
+  password: process.env.DATABASE_PASSWORD,
+  database: process.env.DATABASE_NAME,
+  connectionLimit: 5,
+});
+
+export const prisma = new PrismaClient({ adapter });</code></pre>
+          </div>
+
+          <p>
+            One client, one connection pool, created at import time and shared. Creating
+            a <code>new PrismaClient()</code> inside a request handler is a classic
+            production bug: it opens a fresh pool per request until MySQL refuses new
+            connections. <code>connectionLimit: 5</code> is explicit for the same
+            reason — you want to know your ceiling, not discover it during an outage.
+          </p>
+        </li>
+
+        <li>
+          <h3>The one file that changes</h3>
+          <p>
+            Here it is. This is the whole migration as far as your application code is
+            concerned.
+          </p>
+
+          <div class="file">
+            <span class="file-path">server/src/models/person.model.ts</span>
+            <pre><code>import { prisma } from "../config/database.js";
+import type { Person as PrismaPerson } from "../../generated/prisma/client.js";
+
+// The model layer re-exports the ORM's type, so no layer above it has to know
+// that Prisma exists. If we swap Prisma for something else in two years, this
+// import and these query bodies are the entire blast radius.
+export type Person = PrismaPerson;
+
+export async function findAll(): Promise&lt;Person[]&gt; {
+  return prisma.person.findMany({ orderBy: { createdAt: "asc" } });
+}</code></pre>
+          </div>
+
+          <p>
+            The hand-written <code>interface Person</code> from lesson 01 is gone. That
+            is not laziness — it is the better choice. A type you write by hand can
+            drift from the table; a type the ORM generates from the schema cannot. The
+            model layer's job is to be the <em>only</em> place that trade-off is visible.
+          </p>
+
+          <div class="callout warn">
+            <span class="callout-title">If the import fails</span>
+            <p>
+              Open <code>server/generated/prisma/client.ts</code> and look at what it
+              actually exports. Generated code is documentation you are allowed to read,
+              and the export surface of a generated client changes between versions. If
+              the model type has a different name, use that name — and tell me, so I can
+              fix this lesson.
+            </p>
+          </div>
+
+          <p>
+            Now check what did <em>not</em> change:
+            <code>people.service.ts</code>, <code>person.view.ts</code>,
+            <code>people.controller.ts</code>, <code>people.routes.ts</code>,
+            <code>shared/contracts/</code>. Not a character. The view still maps
+            <code>displayName</code> to <code>name</code>, so the browser still receives
+            <code>name</code> even though the column is <code>display_name</code>.
+          </p>
+        </li>
+
+        <li>
+          <h3>Seed some data</h3>
+          <p>
+            A hand-written script rather than Prisma's built-in seeding, because the
+            built-in configuration moves between versions and this teaches you more.
+          </p>
+
+          <div class="file">
+            <span class="file-path">server/src/scripts/seed.ts</span>
+            <pre><code>import "dotenv/config";
+import { prisma } from "../config/database.js";
+
+async function main(): Promise&lt;void&gt; {
+  const family = await prisma.family.upsert({
+    where: { slug: "nguyen" },
+    update: {},
+    create: { slug: "nguyen", name: "Nguyễn" },
+  });
+
+  await prisma.person.deleteMany({ where: { familyId: family.id } });
+
+  await prisma.person.createMany({
+    data: [
+      {
+        familyId: family.id,
+        displayName: "Nguyễn Văn An",
+        gender: "male",
+        birthDate: new Date("1948-03-02"),
+        deathDate: null,
+      },
+      {
+        familyId: family.id,
+        displayName: "Trần Thị Bình",
+        gender: "female",
+        birthDate: new Date("1952-07-19"),
+        deathDate: null,
+      },
+    ],
+  });
+
+  console.log(`seeded family "${family.slug}" with ${await prisma.person.count()} people`);
+}
+
+main()
+  .catch((error: unknown) =&gt; {
+    console.error(error);
+    process.exitCode = 1;
+  })
+  .finally(() =&gt; prisma.$disconnect());</code></pre>
+          </div>
+
+          <p>
+            Note <code>upsert</code> for the family and a delete-then-insert for the
+            people. A seed script must be <strong>safe to run twice</strong> — you will
+            run it dozens of times, and a script that duplicates data every run becomes
+            a script nobody trusts.
+          </p>
+
+          <p>Add the convenience scripts, then run it:</p>
+          <div class="file">
+            <span class="file-path">package.json (scripts, excerpt)</span>
+            <pre><code>"db:up": "docker compose up -d",
+"db:down": "docker compose down",
+"db:migrate": "prisma migrate dev",
+"db:studio": "prisma studio",
+"db:seed": "tsx server/src/scripts/seed.ts"</code></pre>
+          </div>
+
+          <pre><code>npm run db:seed
+npm run dev</code></pre>
+
+          <p>
+            Refresh <code>localhost:5173</code>. Same two names. Nothing upstream of the
+            model knows anything changed.
+          </p>
+        </li>
+
+        <li>
+          <h3>Commit</h3>
+          <pre><code>printf 'node_modules\ndist\n.env\nserver/generated\n' &gt; .gitignore
+git add -A
+git commit -m "Serve people from MySQL via Prisma, confined to the model layer"</code></pre>
+
+          <div class="callout warn">
+            <span class="callout-title">Generated code is not committed</span>
+            <p>
+              <code>server/generated</code> is gitignored and rebuilt by
+              <code>prisma generate</code>. The <code>prisma/migrations</code> folder is
+              the opposite — it is the most important thing in the repo and must always
+              be committed. Generated output is reproducible; migration history is not.
+            </p>
+          </div>
+        </li>
+      </ol>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Verify</h2>
+
+      <ul class="checklist">
+        <li><code>docker compose ps</code> shows MySQL as <code>healthy</code>.</li>
+        <li><code>git status</code> shows exactly one modified application file: <code>server/src/models/person.model.ts</code>.</li>
+        <li><code>npm run typecheck</code> passes.</li>
+        <li><code>curl http://localhost:4000/api/people</code> returns both people.</li>
+        <li>The JSON contains <code>name</code>, not <code>displayName</code> or <code>display_name</code>.</li>
+      </ul>
+
+      <h2>Break it on purpose</h2>
+
+      <ol>
+        <li>
+          Delete a person with raw SQL and refresh the browser — no code change, no
+          restart:
+          <pre><code>docker compose exec mysql mysql -ukinlink -pkinlink kinlink \
+  -e "DELETE FROM people WHERE display_name = 'Trần Thị Bình';"</code></pre>
+          Then run <code>npm run db:seed</code> to put them back. Say out loud what just
+          happened: the database is the source of truth, and your server holds no state.
+        </li>
+        <li>
+          Change <code>DATABASE_PASSWORD</code> in <code>.env</code> to something wrong,
+          restart, and call the endpoint. Read what the client receives. Now answer:
+          <strong>should that message reach the browser in production?</strong> If your
+          answer is no, go and fix <code>errorHandler.ts</code> so the message is
+          generic unless <code>NODE_ENV</code> is development. You just found a real
+          information-disclosure bug, in your own code, in week two.
+        </li>
+        <li>
+          Add a <code>notes</code> column to <code>Person</code>, run
+          <code>npx prisma migrate dev --name add_notes</code>, read the generated SQL,
+          then delete the column and migrate again. Notice that adding a nullable column
+          is safe and painless, and think about why adding a <em>required</em> one to a
+          table with rows is not.
+        </li>
+        <li>
+          <strong>Do not fix this, just write the answer down.</strong>
+          <code>findAll()</code> returns every person in the database — every family's
+          people. That is a data-isolation bug, and in KinLink it is the most serious
+          class of bug there is. Write two sentences: what is the fix, and why does the
+          <em>decision</em> about which family belongs in the service rather than the
+          model? Bring those sentences to me; they are the first half of week three.
+        </li>
+      </ol>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Retrieval practice</h2>
+
+      <p>No scrolling back. Answer first, then check.</p>
+
+      <div class="quiz" data-quiz>
+        <script type="application/json">
+          [
+            {
+              "q": "What does a migration file actually represent?",
+              "options": [
+                "A committed, ordered change to the database schema",
+                "A copy of the database kept for local development",
+                "A backup that can restore rows you deleted by mistake",
+                "A generated TypeScript type for each database table"
+              ],
+              "answer": 0,
+              "why": "It is a file of SQL, committed to git, applied once and in order. It is not a backup and it is not a type — it is the version history of your schema."
+            },
+            {
+              "q": "Which application files changed when the array became MySQL?",
+              "options": [
+                "Only the model, plus the new database config",
+                "The model, the service and the controller",
+                "The model, the view and the shared contract",
+                "Every layer, because the types now come from Prisma"
+              ],
+              "answer": 0,
+              "why": "The model re-exports Prisma's type, so the service and view kept importing Person from the same path. The view still maps displayName to name, so even the column naming change stayed invisible upstream."
+            },
+            {
+              "q": "Why does the model layer re-export Prisma's Person type?",
+              "options": [
+                "So no layer above it needs to know Prisma exists",
+                "Because Prisma types cannot be imported directly",
+                "So the browser can import the same type safely",
+                "Because TypeScript cannot infer a query result"
+              ],
+              "answer": 0,
+              "why": "It keeps the ORM behind the seam. If Prisma is replaced, the blast radius is the model files, and the service, controller and view never learn that anything happened. Prisma types can be imported directly, and nothing generated should ever reach the browser."
+            },
+            {
+              "q": "findAll() returns people belonging to every family. What bug is that?",
+              "options": [
+                "A data isolation bug, the most serious kind here",
+                "A performance bug that a database index fixes",
+                "A type bug the compiler should have caught",
+                "A caching bug that invalidation would resolve"
+              ],
+              "answer": 0,
+              "why": "Nothing throws, no test fails, and every family can read every other family's history. In a multi-tenant product that is the worst failure mode there is, and no index or type can prevent it."
+            },
+            {
+              "q": "Why pin the Prisma packages to 7.10.0 instead of latest?",
+              "options": [
+                "Latest resolves to a release candidate, not a stable release",
+                "Latest is licensed only for non commercial projects",
+                "Version 8 removed MySQL support from the client",
+                "Version 7 is the only version that supports migrations"
+              ],
+              "answer": 0,
+              "why": "prisma@latest currently resolves to an 8.0.0 release candidate that changes how schemas and migrations work. Pinning keeps the foundation stable and the documentation you read accurate."
+            }
+          ]
+        </script>
+      </div>
+
+      <h2>Primary source</h2>
+
+      <div class="callout win">
+        <span class="callout-title">Read this next</span>
+        <p>
+          <a href="https://www.prisma.io/docs/v7/prisma-orm/quickstart/mysql"
+            >Prisma ORM v7 — MySQL quickstart</a
+          >. It is the exact flow you just followed, written by the people who built it.
+          Read it end to end and note anything you did not do — especially the sections
+          on driver adapters and connection management, which are where Prisma 7 differs
+          most from the tutorials you will find on YouTube.
+        </p>
+        <p>
+          For the schema language itself:
+          <a href="https://www.prisma.io/docs/orm/v7/prisma-schema/overview">Prisma schema overview</a>.
+        </p>
+      </div>
+
+      <div class="prompt">
+        <span class="prompt-title">Ask your teacher</span>
+        <p>
+          Ask me to review your migration SQL, to explain what
+          <code>connectionLimit: 5</code> actually does when ten requests arrive at once,
+          to argue about UUIDs versus auto-increment, or to walk through what
+          <code>EXPLAIN</code> says about a query without the index. And bring me your
+          two sentences from exercise 4 — they decide how week three starts.
+        </p>
+      </div>
+
+      <footer class="lesson-footer">
+        <p class="next-up">
+          <strong>Next:</strong> Lesson 03 — authentication and family context. The
+          request stops being anonymous, <code>family_id</code> starts coming from the
+          server's own session instead of the URL, and the bug you wrote down in
+          exercise 4 gets fixed properly.
+        </p>
+        <p>
+          <a href="../MISSION.md">MISSION.md</a> ·
+          <a href="../ROADMAP.md">ROADMAP.md</a> ·
+          <a href="../GLOSSARY.md">GLOSSARY.md</a> ·
+          <a href="../PROGRESS.md">PROGRESS.md</a> ·
+          <a href="../reference/0002-express-mvc.html">Reference 02</a> ·
+          <a href="../reference/0003-prisma-data-layer.html">Reference 03</a>
+        </p>
+      </footer>
+    </div>
+
+    <script src="../assets/quiz.js"></script>
+  </body>
+</html>

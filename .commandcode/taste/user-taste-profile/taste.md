@@ -1,0 +1,12 @@
+# User Taste Profile
+- Prefers project-based learning: build real features incrementally rather than theory-first, isolated drills, or build-first-later-learn. Chose "Build it as we learn" explicitly. Confidence: 0.9
+- Frames learning goals around shipping real products, not completing tutorials or exercises. Success means something deployed and defensible. Confidence: 0.9
+- Provides comprehensive upfront planning before writing code — shared a 26-section project spec covering vision, architecture, schema, visual identity, and business model before starting implementation. Confidence: 0.95
+- Values strict type safety and correctness: explicitly states the goal of fixing TypeScript errors by correcting types, not by reaching for `any` or `as`. Confidence: 0.9
+- Prefers measuring and deriving data from real sources rather than guessing or eyeballing — the project spec emphasizes "the measurement wins" over hardcoded assumptions. Confidence: 0.8
+- Detailed and thorough communicator: provides extensive context upfront (the KinLink spec is 26 sections with database schemas, API contracts, visual direction, and product philosophy). Confidence: 0.95
+- Goal-oriented: frames work in terms of outcomes (senior-level hire, deployed product) rather than open-ended exploration. Confidence: 0.85
+- Prefers dark UI with distinctive, non-generic aesthetics. Specified pixel-art DNA visual language, teal+gold palette, and explicitly rejected "generic SaaS" and "overly corporate" looks. Confidence: 0.8
+- Prefers monolithic single-folder project structure over modular/package-based setups. Explicitly rejected a pnpm monorepo approach ("I see you are misleading me to packages divided") and insisted on one website project folder with client/server intertwined. Strong opinion — do not reintroduce packages or workspaces. Confidence: 0.95
+- Treats stated architecture as fixed constraints, not suggestions open for re-architecture. Gave a specific stack (React+TS, Node+Express+TS MVC, MySQL) and expects it followed as-is; deviation triggered a firm correction. Confidence: 0.95
+- Wants system design concepts woven into building features, not delivered as separate theory tracks. Prefers learning architecture through constructing real things and defending decisions, not lectures. Confidence: 0.85

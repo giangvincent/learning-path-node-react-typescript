@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Reference 01 — KinLink brand</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="lesson-header">
+        <p class="eyebrow">Reference 01 · the design, settled</p>
+        <h1>KinLink brand: the mark, the palette, the rules</h1>
+        <p class="lede">
+          The visual identity, compressed to one screen. Come back here whenever you
+          style a component.
+        </p>
+        <div class="meta-row">
+          <span>Vocabulary: <a href="../GLOSSARY.md">GLOSSARY.md</a></span>
+          <span>Pipeline exercise: week 1–2, in <code>client/src/brand/</code></span>
+        </div>
+      </header>
+
+      <h2>1. What the mark is</h2>
+
+      <p>
+        A <strong>pixel DNA double helix</strong> on a near-black field. Two strands
+        cross twice — once near the top, once near the bottom — and bow apart into a
+        loop in the middle. Gold rungs bridge the strands. Everything is drawn on a
+        single square <strong>grid</strong>, so every edge is a straight, unaliased run
+        of whole cells.
+      </p>
+
+      <p>
+        The mark carries the product idea: <em>family + genetics + generations +
+        connection</em>. It is the textless symbol; the <strong>logo</strong> is the
+        mark plus the wordmark.
+      </p>
+
+      <h2>2. Palette</h2>
+
+      <ul class="swatches">
+        <li class="swatch">
+          <div class="swatch-chip" style="background:#00c2a8"></div>
+          <span class="swatch-label"><b>tealBright</b>#00C2A8</span>
+        </li>
+        <li class="swatch">
+          <div class="swatch-chip" style="background:#007a6e"></div>
+          <span class="swatch-label"><b>tealDeep</b>#007A6E</span>
+        </li>
+        <li class="swatch">
+          <div class="swatch-chip" style="background:#00332e"></div>
+          <span class="swatch-label"><b>tealDark</b>#00332E</span>
+        </li>
+        <li class="swatch">
+          <div class="swatch-chip" style="background:#ffd93d"></div>
+          <span class="swatch-label"><b>gold</b>#FFD93D</span>
+        </li>
+        <li class="swatch">
+          <div class="swatch-chip" style="background:#a7f3d0"></div>
+          <span class="swatch-label"><b>mint</b>#A7F3D0</span>
+        </li>
+        <li class="swatch">
+          <div class="swatch-chip" style="background:#0b0b0d"></div>
+          <span class="swatch-label"><b>ink</b>#0B0B0D</span>
+        </li>
+      </ul>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Token</th>
+            <th>Hex</th>
+            <th>Use it for</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>tealBright</code></td>
+            <td>#00C2A8</td>
+            <td>Primary UI, connections, active states, the front strand.</td>
+          </tr>
+          <tr>
+            <td><code>tealDeep</code></td>
+            <td>#007A6E</td>
+            <td>The receding strand, depth, secondary emphasis.</td>
+          </tr>
+          <tr>
+            <td><code>tealDark</code></td>
+            <td>#00332E</td>
+            <td>Surfaces and borders when sitting on the near-black field.</td>
+          </tr>
+          <tr>
+            <td><code>gold</code></td>
+            <td>#FFD93D</td>
+            <td>Rungs, heritage moments, premium, the one important action.</td>
+          </tr>
+          <tr>
+            <td><code>mint</code></td>
+            <td>#A7F3D0</td>
+            <td>Highlights, success states, quiet accents.</td>
+          </tr>
+          <tr>
+            <td><code>ink</code></td>
+            <td>#0B0B0D</td>
+            <td>The base canvas. The product is dark-first.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="callout">
+        <span class="callout-title">Rule</span>
+        <p>
+          Teal means <em>structure and connection</em>. Gold means <em>importance</em>.
+          If everything is gold, nothing is. One gold thing per screen.
+        </p>
+      </div>
+
+      <h2>3. Type</h2>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Role</th>
+            <th>Face</th>
+            <th>Where</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Display</td>
+            <td>Pixel / bitmap style</td>
+            <td>Logo, hero headings, brand statements. Never body text.</td>
+          </tr>
+          <tr>
+            <td>UI</td>
+            <td>Inter</td>
+            <td>Navigation, forms, tables, settings, anything accessibility-critical.</td>
+          </tr>
+          <tr>
+            <td>Data</td>
+            <td>Monospace</td>
+            <td>Codes (invitation codes), IDs, dates in tables.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p>Pixel personality for the brand voice, a modern sans for everything you read.</p>
+
+      <h2>4. Where the brand lives in the code</h2>
+
+      <p>
+        One folder, one source of truth. The client imports it; nothing re-declares a
+        hex.
+      </p>
+
+      <pre><code>client/src/brand/
+├── tokens.ts            brandColors, the typed palette    (hand written)
+├── DnaMark.tsx          the mark as a React component
+├── logo.generated.ts    the pixel grid as data            (generated)
+└── index.ts             the only public entry point</code></pre>
+
+      <p>
+        The mark is pixel art, so it is not really an image — it is a grid of cells,
+        each one of four kinds. Running the generator over the PNG extracts that grid
+        as typed data, and the component renders it as <code>&lt;svg&gt;</code> rects
+        so it stays sharp at every size.
+      </p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Char</th>
+            <th>Meaning</th>
+            <th>Colour</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>.</code></td>
+            <td>Empty cell — background shows through</td>
+            <td>none</td>
+          </tr>
+          <tr>
+            <td><code>A</code></td>
+            <td>Front strand</td>
+            <td><code>#00C2A8</code></td>
+          </tr>
+          <tr>
+            <td><code>B</code></td>
+            <td>Back strand</td>
+            <td><code>#007A6E</code></td>
+          </tr>
+          <tr>
+            <td><code>G</code></td>
+            <td>Gold rung</td>
+            <td><code>#FFD93D</code></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2>5. Rules</h2>
+
+      <ul>
+        <li>
+          Components import colour from <code>client/src/brand</code>. A raw hex in a
+          component is a bug — it cannot be rethemed and it drifts.
+        </li>
+        <li>
+          The mark renders with <code>shape-rendering: crispEdges</code> and a
+          <code>viewBox</code> in cell units, so it never blurs.
+        </li>
+        <li>
+          Always give the SVG a <code>role</code> and an accessible name, or mark it
+          <code>presentation</code> when the wordmark already says "KinLink".
+        </li>
+        <li>
+          Ship sizes: 16px favicon, 32px nav, 48px app icon, 128px+ hero. One component
+          serves all four.
+        </li>
+      </ul>
+
+      <div class="callout win">
+        <span class="callout-title">Primary sources</span>
+        <p>
+          <a href="https://www.typescriptlang.org/docs/handbook/2/everyday-types.html"
+            >TypeScript Handbook — Everyday Types</a
+          >
+          for literal types, <code>as const</code> and <code>keyof typeof</code>, which
+          the tokens file relies on.
+        </p>
+      </div>
+
+      <footer class="lesson-footer">
+        <p>
+          Ask your teacher to expand any part of this. Reference docs are meant to be
+          argued with — if something here is wrong, say so and it gets fixed.
+        </p>
+      </footer>
+    </div>
+  </body>
+</html>

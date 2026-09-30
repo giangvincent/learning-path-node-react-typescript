@@ -1,0 +1,4 @@
+# The KinLink project has its own git history — keep it out of the teaching repo.
+kinlink/
+
+.DS_Store

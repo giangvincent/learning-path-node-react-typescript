@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Reference 03 — The Prisma data layer</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="lesson-header">
+        <p class="eyebrow">Reference 03 · the shape of every model file</p>
+        <h1>The Prisma data layer</h1>
+        <p class="lede">
+          Rules, conventions and commands for the one layer allowed to touch the
+          database.
+        </p>
+        <div class="meta-row">
+          <span>Used by: <a href="../lessons/0002-make-the-model-real.html">Lesson 02</a></span>
+          <span>Vocabulary: <a href="../GLOSSARY.md">GLOSSARY.md</a></span>
+        </div>
+      </header>
+
+      <h2>1. Versions, pinned</h2>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Package</th>
+            <th>Pin</th>
+            <th>Why</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>prisma</code></td>
+            <td>7.10.0</td>
+            <td>CLI. <code>latest</code> resolves to an 8.0 release candidate.</td>
+          </tr>
+          <tr>
+            <td><code>@prisma/client</code></td>
+            <td>7.10.0</td>
+            <td>Query API. Must match the CLI exactly.</td>
+          </tr>
+          <tr>
+            <td><code>@prisma/adapter-mariadb</code></td>
+            <td>7.10.0</td>
+            <td>Driver adapter that speaks the MySQL wire protocol.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p>
+        Prisma releases these in lockstep. Mixed versions produce type errors that look
+        like your mistake and are not.
+      </p>
+
+      <h2>2. Layer rules</h2>
+
+      <ul>
+        <li>
+          <strong>Only <code>config/database.ts</code> constructs the client.</strong>
+          One client, one pool, shared. A <code>new PrismaClient()</code> inside a
+          request handler opens a new pool per request.
+        </li>
+        <li>
+          <strong>Only <code>models/</code> imports from the generated client.</strong>
+          If a controller references <code>prisma</code>, the seam is broken.
+        </li>
+        <li>
+          <strong>Models re-export the ORM's types.</strong>
+          <code>export type Person = PrismaPerson;</code> — so nothing above knows the
+          ORM's name.
+        </li>
+        <li>
+          <strong>Models take plain arguments, never a <code>Request</code>.</strong>
+          <code>findAll(familyId: string)</code>, not <code>findAll(req)</code>.
+        </li>
+        <li>
+          <strong>Every query is scoped.</strong> If a function returns rows belonging to
+          more than one family, it is a data-isolation bug. There is no exception to this.
+        </li>
+        <li>
+          <strong>Models do not decide policy.</strong> They fetch. The service decides
+          what may be fetched, and for whom.
+        </li>
+      </ul>
+
+      <h2>3. Naming: code vs database</h2>
+
+      <pre><code>Prisma field      Column            Rule
+──────────────────────────────────────────────────────────────
+familyId      →   family_id         @map
+displayName   →   display_name      @map
+Person        →   people            @@map
+createdAt     →   created_at        @map
+
+camelCase in code · snake_case in SQL · one mapping, declared once</code></pre>
+
+      <h2>4. Schema decisions that are already made</h2>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Decision</th>
+            <th>Reason</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>@default(uuid())</code></td>
+            <td>Sequential ids leak volume and invite enumeration.</td>
+          </tr>
+          <tr>
+            <td><code>onDelete: Cascade</code> on <code>Person.family</code></td>
+            <td>A family's people belong to it. Decide the rule explicitly, every time.</td>
+          </tr>
+          <tr>
+            <td><code>@@index([familyId])</code></td>
+            <td>Every query filters by family. Without it, MySQL scans the table.</td>
+          </tr>
+          <tr>
+            <td><code>@db.Date</code> on birth and death dates</td>
+            <td>A birthday is a calendar date, not an instant. Storing it as a timestamp invites timezone bugs.</td>
+          </tr>
+          <tr>
+            <td>Enums for <code>gender</code></td>
+            <td>MySQL enforces the values, so bad data cannot arrive by accident.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2>5. Commands</h2>
+
+      <pre><code>npm run db:up                  docker compose up -d
+npm run db:down                docker compose down
+
+npx prisma migrate dev --name &lt;change&gt;   create + apply a migration, regenerate
+npx prisma migrate status                what has and has not been applied
+npx prisma generate                      rebuild the client only
+npx prisma studio                        browse the data in a browser
+
+npm run db:seed                          hand-written seed script</code></pre>
+
+      <h2>6. Migration rules</h2>
+
+      <ul>
+        <li>A migration is SQL, committed to git, applied once and in order. It is the version history of your schema.</li>
+        <li><strong>Never edit a migration</strong> that has run on any machine but your own. Write a new one.</li>
+        <li><code>prisma/migrations/</code> is always committed. <code>server/generated/</code> never is.</li>
+        <li><code>prisma migrate dev</code> is for development. Production uses <code>migrate deploy</code>, which applies what is committed and never invents a migration.</li>
+        <li>Adding a nullable column is cheap. Adding a <em>required</em> column to a populated table needs a default or a backfill — plan it in three steps, not one.</li>
+        <li><code>migrate reset</code> drops everything. It is the right tool when a local migration is wrong and nobody else has it yet, and the wrong tool the moment it has been shared.</li>
+      </ul>
+
+      <h2>7. Known rough edges</h2>
+
+      <ul>
+        <li>
+          <strong>The connection is configured twice.</strong> <code>DATABASE_URL</code>
+          for the CLI, discrete <code>DATABASE_*</code> variables for the runtime adapter.
+          Same information, two places.
+        </li>
+        <li>
+          <strong>The generated client lives inside the repo</strong> and is picked up by
+          <code>tsc</code>. If it ever produces type errors of its own, exclude it from
+          your tsconfig rather than fighting it.
+        </li>
+        <li>
+          <strong>Prisma 8 changes schema authoring and migration planning.</strong> When
+          you upgrade, expect a real migration task, not a version bump — see
+          <a href="https://www.prisma.io/docs/orm/coming-from-prisma-orm-7">Coming from Prisma ORM 7</a>.
+        </li>
+      </ul>
+
+      <div class="callout win">
+        <span class="callout-title">Primary source</span>
+        <p>
+          <a href="https://www.prisma.io/docs/v7/prisma-orm/quickstart/mysql"
+            >Prisma ORM v7 — MySQL quickstart</a
+          >
+          and
+          <a href="https://www.prisma.io/docs/orm/v7/prisma-schema/overview"
+            >Prisma schema overview</a
+          >.
+        </p>
+      </div>
+
+      <footer class="lesson-footer">
+        <p>Reference docs are meant to be argued with. If a rule here is wrong, say so.</p>
+      </footer>
+    </div>
+  </body>
+</html>

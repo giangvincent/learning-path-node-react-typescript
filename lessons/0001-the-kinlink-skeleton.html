@@ -1,0 +1,802 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lesson 01 — The KinLink skeleton</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="lesson-header">
+        <p class="eyebrow">Lesson 01 · Week 1 · about three hours</p>
+        <h1>The KinLink skeleton: one folder, two architectures</h1>
+        <p class="lede">
+          Stand up the real project — React + TypeScript client, Express + TypeScript
+          server organised as MVC — and push one request through every layer until a
+          relative's name appears in the browser.
+        </p>
+        <div class="meta-row">
+          <span>Mission: ship KinLink</span>
+          <span>
+            Reference: <a href="../reference/0002-express-mvc.html">Express MVC</a>
+          </span>
+          <span>Vocabulary: <a href="../GLOSSARY.md">GLOSSARY.md</a></span>
+        </div>
+      </header>
+
+      <div class="callout win">
+        <span class="callout-title">The win</span>
+        <p>
+          One project folder. One command — <code>npm run dev</code> — starts Express on
+          port 4000 and Vite on port 5173. The browser shows a person that travelled
+          from the <strong>model</strong>, through the <strong>service</strong>, shaped
+          by the <strong>view</strong>, returned by the <strong>controller</strong>,
+          and typed at both ends by a single <strong>contract</strong>.
+          <code>/api/people</code> exists because you built all six layers, not because
+          you copied a snippet.
+        </p>
+      </div>
+
+      <h2>Why this shape</h2>
+
+      <p>
+        You asked for MVC on the server, and that is what we build — but it is worth
+        being precise about why the layers exist, because "MVC" gets repeated a lot
+        without people being able to justify it.
+      </p>
+
+      <p>
+        Each layer exists to make one kind of change cheap. A new response field is a
+        <em>view</em> change. A new business rule is a <em>service</em> change. A new
+        URL is a <em>route</em> change. A new column is a <em>model</em> change. When
+        the layers are respected, none of those four edits touch the same file. When
+        they are not, every change touches everything — which is exactly what a
+        two-hundred-line <code>server.ts</code> feels like after a month.
+      </p>
+
+      <pre><code>browser ──▶ vite proxy ──▶ ROUTE ──▶ MIDDLEWARE ──▶ CONTROLLER
+                                                        │
+                                                      SERVICE
+                                                        │
+                                                       MODEL
+                                                        │
+                                                       MySQL
+                                                        │
+                                                       VIEW ──▶ JSON ──▶ React</code></pre>
+
+      <p>
+        Today the model holds an array instead of MySQL. That is deliberate: it keeps
+        the seam visible before Prisma arrives in lesson 02 and hides it behind a
+        generated client. Nothing above the model will change when the database does —
+        and at the end of this lesson you will prove that claim by breaking it on
+        purpose.
+      </p>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Build it</h2>
+
+      <ol class="steps">
+        <li>
+          <h3>Check the tools</h3>
+          <p>Node 22 or newer. That is the whole list today.</p>
+          <pre><code>node -v      # v22.x or higher
+npm -v</code></pre>
+        </li>
+
+        <li>
+          <h3>Create the folder and the single manifest</h3>
+          <pre><code>mkdir -p ~/Documents/learn-programming/kinlink
+cd ~/Documents/learn-programming/kinlink
+git init
+mkdir -p client/src/lib server/src/{config,routes,controllers,services,models,views,middlewares} shared/contracts</code></pre>
+
+          <p>
+            <strong>One</strong> <code>package.json</code> for the entire website. No
+            nested manifests, no workspaces, no packages. Client and server are folders,
+            not projects.
+          </p>
+
+          <div class="file">
+            <span class="file-path">package.json</span>
+            <pre><code>{
+  "name": "kinlink",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -n api,web -c cyan,magenta \"npm:dev:server\" \"npm:dev:client\"",
+    "dev:server": "tsx watch server/src/server.ts",
+    "dev:client": "vite",
+    "build": "npm run build:client && npm run build:server",
+    "build:client": "vite build",
+    "build:server": "tsc",
+    "start": "node dist/server/src/server.js",
+    "typecheck": "tsc --noEmit && tsc -p client/tsconfig.json --noEmit"
+  }
+}</code></pre>
+          </div>
+
+          <pre><code>npm install express react react-dom
+npm install -D typescript tsx vite @vitejs/plugin-react concurrently @types/node @types/express @types/react @types/react-dom</code></pre>
+
+          <div class="callout">
+            <span class="callout-title">Why these live where they do</span>
+            <p>
+              <code>express</code>, <code>react</code> and <code>react-dom</code> are
+              runtime dependencies — they ship. Everything else is a
+              <strong>development</strong> dependency: TypeScript, the bundler, the dev
+              runner, and all the type definitions. Vite bundles only what the client
+              actually imports, so nothing from the server ends up in the browser
+              bundle.
+            </p>
+          </div>
+        </li>
+
+        <li>
+          <h3>The contracts — the types both sides compile against</h3>
+          <p>
+            The client needs to know the shape of what the server returns. Most
+            single-folder projects solve this by writing the type twice and letting it
+            drift. We solve it with one folder both sides include.
+          </p>
+
+          <div class="file">
+            <span class="file-path">shared/contracts/api.ts</span>
+            <pre><code>export interface ApiResponse&lt;T&gt; {
+  data: T;
+  meta?: Record&lt;string, unknown&gt;;
+}
+
+export interface ApiErrorBody {
+  message: string;
+  errors?: Record&lt;string, string[]&gt;;
+}</code></pre>
+          </div>
+
+          <div class="file">
+            <span class="file-path">shared/contracts/person.ts</span>
+            <pre><code>export type Gender = "male" | "female" | "other" | "unknown";
+
+/** What the client is allowed to see. Not the same as a database row. */
+export interface PersonResource {
+  id: string;
+  familyId: string;
+  name: string;
+  living: boolean;
+}</code></pre>
+          </div>
+
+          <p>
+            Note <code>PersonResource</code> has <code>name</code>, but the model will
+            have <code>displayName</code>, and the eventual table will have
+            <code>given_name</code> and <code>surname</code>. Three different shapes for
+            three different audiences — that is not duplication, that is the point of
+            the View layer.
+          </p>
+        </li>
+
+        <li>
+          <h3>The server: config and the contract seam</h3>
+
+          <div class="file">
+            <span class="file-path">server/src/contracts.ts</span>
+            <pre><code>export type { ApiErrorBody, ApiResponse } from "../../shared/contracts/api.js";
+export type { Gender, PersonResource } from "../../shared/contracts/person.js";</code></pre>
+          </div>
+
+          <p>
+            Three lines that save you from <code>../../../..</code> everywhere. Note the
+            <code>.js</code> extension on a <code>.ts</code> file — that is not a typo.
+            The server compiles with <code>module: NodeNext</code>, and Node's ESM
+            resolver requires the real file extension at runtime. TypeScript understands
+            you mean <code>api.ts</code>.
+          </p>
+
+          <div class="file">
+            <span class="file-path">tsconfig.json (server + shared)</span>
+            <pre><code>{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "types": ["node"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "verbatimModuleSyntax": true,
+    "rootDir": ".",
+    "outDir": "dist",
+    "skipLibCheck": true
+  },
+  "include": ["server/src", "shared"]
+}</code></pre>
+          </div>
+
+          <div class="callout">
+            <span class="callout-title">One line worth staring at: <code>"lib": ["ES2022"]</code></span>
+            <p>
+              No <code>DOM</code>. The server is not allowed to know that
+              <code>document</code>, <code>window</code> or <code>fetch</code>-in-a-tab
+              exist. Type that into a server file and the compiler stops you. The client
+              tsconfig will do the exact opposite. This is how the type system enforces
+              the architectural boundary between the two halves of your website.
+            </p>
+          </div>
+
+          <div class="file">
+            <span class="file-path">server/src/config/env.ts</span>
+            <pre><code>function readPort(): number {
+  const raw = process.env.PORT ?? "4000";
+  const port = Number(raw);
+
+  if (!Number.isInteger(port) || port &lt;= 0) {
+    throw new Error(`PORT must be a positive integer, received "${raw}"`);
+  }
+
+  return port;
+}
+
+export const env = {
+  port: readPort(),
+  nodeEnv: process.env.NODE_ENV ?? "development",
+} as const;</code></pre>
+          </div>
+
+          <p>
+            Configuration is validated once, at startup, and re-exported as a typed
+            object. If <code>PORT</code> is garbage the process refuses to boot instead
+            of failing mysteriously on the first request — a rule you will appreciate
+            much more once there are database URLs and secrets in here.
+          </p>
+        </li>
+
+        <li>
+          <h3>The four layers, in the order a request hits them</h3>
+
+          <p>
+            <strong>Model</strong> — the only layer allowed to know how data is stored.
+          </p>
+          <div class="file">
+            <span class="file-path">server/src/models/person.model.ts</span>
+            <pre><code>import type { Gender } from "../contracts.js";
+
+export interface Person {
+  id: string;
+  familyId: string;
+  displayName: string;
+  gender: Gender;
+  birthDate: string | null;
+  deathDate: string | null;
+}
+
+// The Model layer. Lesson 02 replaces this array with Prisma queries --
+// and nothing above this file will need to change.
+const people: Person[] = [
+  {
+    id: "p_1",
+    familyId: "f_1",
+    displayName: "Nguyễn Văn An",
+    gender: "male",
+    birthDate: "1948-03-02",
+    deathDate: null,
+  },
+  {
+    id: "p_2",
+    familyId: "f_1",
+    displayName: "Trần Thị Bình",
+    gender: "female",
+    birthDate: "1952-07-19",
+    deathDate: null,
+  },
+];
+
+export async function findAll(): Promise&lt;Person[]&gt; {
+  return people;
+}</code></pre>
+          </div>
+
+          <p>
+            <strong>Service</strong> — where rules live. Note the signature: no
+            <code>Request</code>, no <code>Response</code>, nothing from Express. That
+            is what makes it testable and reusable from a background job later.
+          </p>
+          <div class="file">
+            <span class="file-path">server/src/services/people.service.ts</span>
+            <pre><code>import * as personModel from "../models/person.model.js";
+import type { Person } from "../models/person.model.js";
+
+export async function listPeople(): Promise&lt;Person[]&gt; {
+  return personModel.findAll();
+}</code></pre>
+          </div>
+
+          <p>
+            <strong>View</strong> — domain object in, resource out. The one place that
+            decides what the outside world may see.
+          </p>
+          <div class="file">
+            <span class="file-path">server/src/views/person.view.ts</span>
+            <pre><code>import type { PersonResource } from "../contracts.js";
+import type { Person } from "../models/person.model.js";
+
+export function toPersonResource(person: Person): PersonResource {
+  return {
+    id: person.id,
+    familyId: person.familyId,
+    name: person.displayName,
+    living: person.deathDate === null,
+  };
+}</code></pre>
+          </div>
+
+          <p>
+            <strong>Controller</strong> — HTTP in, HTTP out. It reads nothing from the
+            request today, calls exactly one service, and picks the status code.
+          </p>
+          <div class="file">
+            <span class="file-path">server/src/controllers/people.controller.ts</span>
+            <pre><code>import type { NextFunction, Request, Response } from "express";
+import type { ApiResponse, PersonResource } from "../contracts.js";
+import { listPeople } from "../services/people.service.js";
+import { toPersonResource } from "../views/person.view.js";
+
+export async function getPeople(
+  _req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise&lt;void&gt; {
+  try {
+    const people = await listPeople();
+    const body: ApiResponse&lt;PersonResource[]&gt; = {
+      data: people.map(toPersonResource),
+    };
+
+    res.status(200).json(body);
+  } catch (error) {
+    next(error);
+  }
+}</code></pre>
+          </div>
+
+          <p>
+            <strong>Route</strong> — a URL and a verb bound to a controller. Nothing
+            else belongs in this file, ever.
+          </p>
+          <div class="file">
+            <span class="file-path">server/src/routes/people.routes.ts</span>
+            <pre><code>import { Router } from "express";
+import { getPeople } from "../controllers/people.controller.js";
+
+export const peopleRouter = Router();
+
+peopleRouter.get("/", getPeople);</code></pre>
+          </div>
+
+          <div class="file">
+            <span class="file-path">server/src/routes/index.ts</span>
+            <pre><code>import { Router } from "express";
+import type { ApiResponse } from "../contracts.js";
+import { peopleRouter } from "./people.routes.js";
+
+export const apiRouter = Router();
+
+// A liveness check has no business rules and touches nothing, so it does not
+// deserve a controller. Inline is the honest choice here.
+apiRouter.get("/health", (_req, res) =&gt; {
+  const body: ApiResponse&lt;{ status: "ok" }&gt; = { data: { status: "ok" } };
+  res.status(200).json(body);
+});
+
+apiRouter.use("/people", peopleRouter);</code></pre>
+          </div>
+        </li>
+
+        <li>
+          <h3>The error handler, the app, and the port</h3>
+
+          <div class="file">
+            <span class="file-path">server/src/middlewares/errorHandler.ts</span>
+            <pre><code>import type { ErrorRequestHandler } from "express";
+import type { ApiErrorBody } from "../contracts.js";
+
+// The last line of defence. Every error the application can produce ends
+// here, so the client always receives the same shape.
+export const errorHandler: ErrorRequestHandler = (error, _req, res, _next) =&gt; {
+  const message = error instanceof Error ? error.message : "Unexpected error";
+  const body: ApiErrorBody = { message };
+
+  if (process.env.NODE_ENV !== "production") {
+    console.error(error);
+  }
+
+  res.status(500).json(body);
+};</code></pre>
+          </div>
+
+          <div class="file">
+            <span class="file-path">server/src/app.ts</span>
+            <pre><code>import express from "express";
+import { errorHandler } from "./middlewares/errorHandler.js";
+import { apiRouter } from "./routes/index.js";
+
+// Builds the application but does NOT listen. That separation is what lets a
+// test exercise the whole stack without opening a port.
+export function createApp() {
+  const app = express();
+
+  app.use(express.json());
+  app.use("/api", apiRouter);
+  app.use(errorHandler);
+
+  return app;
+}</code></pre>
+          </div>
+
+          <div class="file">
+            <span class="file-path">server/src/server.ts</span>
+            <pre><code>import { createApp } from "./app.js";
+import { env } from "./config/env.js";
+
+createApp().listen(env.port, () =&gt; {
+  console.log(`kinlink api listening on http://localhost:${env.port}`);
+});</code></pre>
+          </div>
+
+          <p>
+            Test the server on its own before touching React — one command, one
+            expected response. Never debug two halves at once.
+          </p>
+          <pre><code>npm run dev:server
+curl http://localhost:4000/api/people</code></pre>
+          <pre><code>{"data":[{"id":"p_1","familyId":"f_1","name":"Nguyễn Văn An","living":true}, ...]}</code></pre>
+          <p>
+            Look at that JSON and notice what is <em>missing</em>:
+            <code>displayName</code>, <code>gender</code>, <code>birthDate</code>. The
+            model has them. The view chose not to expose them. That is the view layer
+            doing its job.
+          </p>
+        </li>
+
+        <li>
+          <h3>The client</h3>
+          <div class="file">
+            <span class="file-path">client/tsconfig.json</span>
+            <pre><code>{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "jsx": "react-jsx",
+    "types": ["vite/client"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "verbatimModuleSyntax": true,
+    "noEmit": true,
+    "skipLibCheck": true
+  },
+  "include": ["src"]
+}</code></pre>
+          </div>
+
+          <div class="file">
+            <span class="file-path">vite.config.ts (project root)</span>
+            <pre><code>import react from "@vitejs/plugin-react";
+import { defineConfig } from "vite";
+
+export default defineConfig({
+  root: "client",
+  plugins: [react()],
+  server: {
+    port: 5173,
+    // The browser only ever talks to one origin. Vite forwards /api to
+    // Express, which is why this project needs no CORS configuration at all.
+    proxy: {
+      "/api": "http://localhost:4000",
+    },
+  },
+  build: {
+    outDir: "../dist/client",
+    emptyOutDir: true,
+  },
+});</code></pre>
+          </div>
+
+          <div class="file">
+            <span class="file-path">client/index.html</span>
+            <pre><code>&lt;!doctype html&gt;
+&lt;html lang="en"&gt;
+  &lt;head&gt;
+    &lt;meta charset="UTF-8" /&gt;
+    &lt;meta name="viewport" content="width=device-width, initial-scale=1.0" /&gt;
+    &lt;title&gt;KinLink&lt;/title&gt;
+  &lt;/head&gt;
+  &lt;body&gt;
+    &lt;div id="root"&gt;&lt;/div&gt;
+    &lt;script type="module" src="/src/main.tsx"&gt;&lt;/script&gt;
+  &lt;/body&gt;
+&lt;/html&gt;</code></pre>
+          </div>
+
+          <div class="file">
+            <span class="file-path">client/src/contracts.ts</span>
+            <pre><code>export type { ApiErrorBody, ApiResponse } from "../../shared/contracts/api";
+export type { Gender, PersonResource } from "../../shared/contracts/person";</code></pre>
+          </div>
+
+          <p>
+            The same seam as the server, minus the <code>.js</code> extensions. The
+            client bundles with <code>moduleResolution: bundler</code>, which resolves
+            extensionless imports itself.
+          </p>
+
+          <div class="file">
+            <span class="file-path">client/src/lib/api.ts</span>
+            <pre><code>import type { ApiResponse, PersonResource } from "../contracts";
+
+// Components call functions with names and types, never URLs.
+export async function getPeople(): Promise&lt;PersonResource[]&gt; {
+  const response = await fetch("/api/people");
+
+  if (!response.ok) {
+    throw new Error(`GET /api/people failed with status ${response.status}`);
+  }
+
+  const body = (await response.json()) as ApiResponse&lt;PersonResource[]&gt;;
+  return body.data;
+}</code></pre>
+          </div>
+
+          <div class="callout warn">
+            <span class="callout-title">Be suspicious of that <code>as</code></span>
+            <p>
+              <code>response.json()</code> returns <code>any</code> — the compiler has no
+              idea what the wire carries, and no amount of TypeScript can change that.
+              The honest posture is: <em>one</em> place asserts the shape, and everything
+              downstream trusts it. Lesson 03 replaces this single <code>as</code> with
+              Zod validation at the boundary, which is where the assertion becomes a
+              real check instead of a promise.
+            </p>
+          </div>
+
+          <div class="file">
+            <span class="file-path">client/src/App.tsx</span>
+            <pre><code>import { useEffect, useState } from "react";
+import type { PersonResource } from "./contracts";
+import { getPeople } from "./lib/api";
+
+export default function App() {
+  const [people, setPeople] = useState&lt;PersonResource[] | null&gt;(null);
+  const [error, setError] = useState&lt;string | null&gt;(null);
+
+  useEffect(() =&gt; {
+    getPeople()
+      .then(setPeople)
+      .catch((cause: unknown) =&gt; {
+        setError(cause instanceof Error ? cause.message : "Unknown error");
+      });
+  }, []);
+
+  if (error) return &lt;p role="alert"&gt;Failed to load: {error}&lt;/p&gt;;
+  if (!people) return &lt;p&gt;Loading…&lt;/p&gt;;
+
+  return (
+    &lt;main style={{ fontFamily: "system-ui, sans-serif", padding: "2rem" }}&gt;
+      &lt;h1&gt;KinLink&lt;/h1&gt;
+      &lt;ul&gt;
+        {people.map((person) =&gt; (
+          &lt;li key={person.id}&gt;
+            {person.name} — {person.living ? "living" : "remembered"}
+          &lt;/li&gt;
+        ))}
+      &lt;/ul&gt;
+    &lt;/main&gt;
+  );
+}</code></pre>
+          </div>
+
+          <div class="file">
+            <span class="file-path">client/src/main.tsx</span>
+            <pre><code>import { StrictMode } from "react";
+import { createRoot } from "react-dom/client";
+import App from "./App";
+
+const container = document.getElementById("root");
+if (!container) throw new Error("Missing #root element");
+
+createRoot(container).render(
+  &lt;StrictMode&gt;
+    &lt;App /&gt;
+  &lt;/StrictMode&gt;,
+);</code></pre>
+          </div>
+        </li>
+
+        <li>
+          <h3>Run the whole website</h3>
+          <pre><code>npm run dev</code></pre>
+          <p>
+            Two processes, one terminal: <code>api</code> in cyan, <code>web</code> in
+            magenta. Open <code>http://localhost:5173</code> and you should see both
+            names.
+          </p>
+          <p>
+            Now trace it by hand, out loud: the browser asked Vite for
+            <code>/api/people</code> → Vite forwarded it to <code>:4000</code> → Express
+            matched the route → the controller called the service → the service called
+            the model → the view shaped two resources → the controller sent JSON →
+            React rendered it. If you can say that without looking, you already
+            understand more of your own stack than most juniors do.
+          </p>
+        </li>
+
+        <li>
+          <h3>Commit</h3>
+          <pre><code>printf 'node_modules\ndist\n.env\n' &gt; .gitignore
+git add -A
+git commit -m "Add KinLink skeleton with layered Express API and React client"</code></pre>
+        </li>
+      </ol>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Verify</h2>
+
+      <ul class="checklist">
+        <li><code>npm run typecheck</code> passes for both tsconfigs.</li>
+        <li><code>curl http://localhost:4000/api/people</code> returns the two people.</li>
+        <li><code>http://localhost:5173</code> renders both names in the browser.</li>
+        <li>The browser console shows <strong>no CORS errors</strong>.</li>
+        <li>In <code>server/src/server.ts</code>, typing <code>document.title</code> is a compile error.</li>
+      </ul>
+
+      <h2>Break it on purpose</h2>
+
+      <p>
+        Predict the failure <em>before</em> you run it, then check whether you were
+        right. This is where the architecture stops being a diagram.
+      </p>
+
+      <ol>
+        <li>
+          In <code>shared/contracts/person.ts</code>, rename <code>name</code> to
+          <code>fullName</code>. Predict which files the compiler complains about, then
+          run <code>npm run typecheck</code>. Did it catch both sides? Now revert it.
+        </li>
+        <li>
+          In <code>person.view.ts</code>, add <code>birthDate: person.birthDate</code> to
+          the resource. Which files must change for the browser to show it? Which files
+          must <em>not</em>? Explain the shape of that answer out loud.
+        </li>
+        <li>
+          Delete the <code>proxy</code> block from <code>vite.config.ts</code> and
+          restart. Read the console error. Now say, in one sentence, what the proxy was
+          doing for you.
+        </li>
+        <li>
+          Move <code>res.status(200).json(body)</code> out of the controller and into
+          the service. Make it work, then delete it and explain in two sentences why it
+          was wrong even though it ran.
+        </li>
+      </ol>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Retrieval practice</h2>
+
+      <p>
+        No scrolling back. If you cannot recall an answer, write down what you
+        <em>do</em> remember, then check.
+      </p>
+
+      <div class="quiz" data-quiz>
+        <script type="application/json">
+          [
+            {
+              "q": "Which layers are allowed to import Express types like Request and Response?",
+              "options": [
+                "The route and the controller, and nothing below",
+                "The controller, the service and the model",
+                "The route, the service and the view",
+                "Every layer, because they all run in Express"
+              ],
+              "answer": 0,
+              "why": "Only the HTTP boundary needs to know HTTP exists. If a service imports Request, it can no longer be called from a background job or tested without faking a request."
+            },
+            {
+              "q": "In this JSON API, what is the View layer?",
+              "options": [
+                "The function that shapes a domain object into a resource",
+                "The React components that render the family tree",
+                "The HTML templates rendered by the Express server",
+                "The folder that holds the router definitions"
+              ],
+              "answer": 0,
+              "why": "MVC came from server-rendered pages, where the View is a template. With a JSON API there is no template, so the View survives as the response shaper. The React components are the client application, not this layer."
+            },
+            {
+              "q": "Why does createApp() build the app instead of also listening?",
+              "options": [
+                "So tests can exercise the app without opening a port",
+                "Because Express only allows one listen call per process",
+                "So the client can import the app for type checking",
+                "Because tsx watch already reserves the port for it"
+              ],
+              "answer": 0,
+              "why": "Separating build from listen is what makes integration tests cheap: import the app, throw a request at it, no port, no port collisions, no cleanup."
+            },
+            {
+              "q": "Why does this project need no CORS configuration at all?",
+              "options": [
+                "Vite proxies /api, so the browser sees a single origin",
+                "Express sends permissive CORS headers by default",
+                "The client and the server listen on the same port",
+                "TypeScript checks requests before the browser sends them"
+              ],
+              "answer": 0,
+              "why": "The browser only ever calls localhost:5173. Vite forwards the request server-side to :4000, and server-to-server requests have no same-origin policy. Express does not add CORS headers by default, the ports differ, and types exist only at compile time."
+            },
+            {
+              "q": "The client reads person.name. Where was that name decided?",
+              "options": [
+                "In the view layer, which renamed displayName",
+                "In the model, which stores the name column",
+                "In the controller, which writes the response",
+                "In React, which renames the field while rendering"
+              ],
+              "answer": 0,
+              "why": "The model holds displayName. The view maps it to name. That mapping is the whole reason the view layer exists: it stops storage naming from becoming UI naming."
+            }
+          ]
+        </script>
+      </div>
+
+      <h2>Primary source</h2>
+
+      <div class="callout win">
+        <span class="callout-title">Read this next</span>
+        <p>
+          <a
+            href="https://developer.mozilla.org/en-US/docs/Learn_web_development/Extensions/Server-side/Express_Nodejs/routes"
+            >MDN — Express Tutorial Part 4: Routes and controllers</a
+          >. It is the same MVC idea mapped onto a different app, and it is the
+          clearest written explanation of routes and controllers that exists. Read it
+          with your own folder tree open beside it.
+        </p>
+        <p>
+          For the mechanics of mounting routers:
+          <a href="https://expressjs.com/en/guide/routing/">Express — Routing guide</a>.
+        </p>
+      </div>
+
+      <div class="prompt">
+        <span class="prompt-title">Ask your teacher</span>
+        <p>
+          I am your teacher for this project and nothing here is fixed. Ask me to justify
+          any layer boundary, to review your files once they run, or to argue the other
+          side: when is a service layer overkill, and when should the controller do the
+          work? Bring me real errors, not descriptions of errors — a stack trace is the
+          best lesson material we have.
+        </p>
+      </div>
+
+      <footer class="lesson-footer">
+        <p class="next-up">
+          <strong>Next:</strong> Lesson 02 makes the Model real — MySQL 8 in Docker,
+          Prisma, the first migration, and the same <code>/api/people</code> served from
+          a database without changing a single line above the model.
+        </p>
+        <p>
+          <a href="../MISSION.md">MISSION.md</a> ·
+          <a href="../ROADMAP.md">ROADMAP.md</a> ·
+          <a href="../RESOURCES.md">RESOURCES.md</a> ·
+          <a href="../GLOSSARY.md">GLOSSARY.md</a> ·
+          <a href="../reference/0002-express-mvc.html">Reference 02 — Express MVC</a>
+        </p>
+      </footer>
+    </div>
+
+    <script src="../assets/quiz.js"></script>
+  </body>
+</html>
