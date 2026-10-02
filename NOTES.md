@@ -42,7 +42,14 @@ Working notes and preferences. Not a lesson — a scratchpad for me (the teacher
 
 ## Known defects to chase
 
-- **`errorHandler.ts` leaks `error.message` to the client unconditionally**, including database connection failures. Lesson 02 exercise 2 has the user find and fix it; check whether they did before week 3.
+- Both were found in lesson 02 and are fixed in lesson 03, but **were still open at session 4** — confirm closed before lesson 04:
+  1. `errorHandler.ts` returns `error.message` to the client unconditionally, including database connection failures.
+  2. `person.model.ts` still had an unscoped `findAll()`; replaced by `findByFamily(familyId: string)`.
+
+## Housekeeping worth raising
+
+- **87 files of agent skills are committed** under `.agents/`, `.claude/` and `.windsurf/` (from `npx prisma skills sync`). 120 tracked files total, so ~73% of the repo is tooling, not application code. Harmless, but it buries the real source in diffs and reviews. Suggest gitignoring them and re-syncing locally.
+- **`typescript: ^7.0.2`** resolves to 7.0.2 — TypeScript 7 is the native-port line, materially faster than 5.x. Works fine; worth a note in the portfolio.
 
 ## Working decisions
 

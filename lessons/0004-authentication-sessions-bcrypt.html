@@ -1,0 +1,822 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lesson 04 — Who are you?</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="lesson-header">
+        <p class="eyebrow">Lesson 04 · Week 4 · about two hours</p>
+        <h1>Who are you? Authentication</h1>
+        <p class="lede">
+          Replace the hardcoded <code>CURRENT_FAMILY_ID</code> with a real session:
+          register, log in, have the server prove it, and verify that nobody else can
+          read your data.
+        </p>
+        <div class="meta-row">
+          <span>Mission: ship KinLink</span>
+          <span>Vocabulary: <a href="../GLOSSARY.md">session</a>, <a href="../GLOSSARY.md">cookie</a></span>
+          <span>Requires: <a href="0003-ten-requests-one-pool-two-families.html">Lesson 03</a></span>
+        </div>
+      </header>
+
+      <div class="callout win">
+        <span class="callout-title">The win</span>
+        <p>
+          You will go from a server that trusts nothing to one that knows exactly who is
+          asking. A new <code>users</code> table is created via Prisma migration, passwords
+          are hashed with <code>bcrypt</code>, an HTTP-only session cookie replaces the
+          placeholder constant, and <code>/api/people</code> returns only the rows that
+          belong to the logged-in user's family.
+        </p>
+      </div>
+
+      <h2>Why sessions, not JWTs</h2>
+
+      <p>
+        Your spec mentions JWT as one possibility. There are good reasons to start with
+        a session instead:
+      </p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Concern</th>
+            <th>Session (cookies)</th>
+            <th>JWT</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>XSS attack surface</td>
+            <td><code>httpOnly</code> + <code>secure</code> = unreadable by JS</td>
+            <td>Stored in localStorage if used → readable by XSS</td>
+          </tr>
+          <tr>
+            <td>Revocation</td>
+            <td>Delete the session record; done</td>
+            <td>Need a blocklist or very short expiry + refresh token</td>
+          </tr>
+          <tr>
+            <td>Distributed systems</td>
+            <td>Shared store needed (Redis, DB); adds complexity</td>
+            <td>Signed, self-contained; easier scale-out</td>
+          </tr>
+          <tr>
+            <td>Family app reality</td>
+            <td>You are one domain, one server. Start with what fits.</td>
+            <td>Introduce later when you need cross-origin.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p>
+        Sessions are not "worse". They are simply the wrong choice when the architecture
+        demands distribution. Right now it does not. Choose for the problem you have,
+        not the one you hope for.
+      </p>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Build it</h2>
+
+      <ol class="steps">
+        <li>
+          <h3>Install dependencies</h3>
+          <pre><code>npm install express-session bcrypt
+npm install -D @types/express-session @types/bcrypt</code></pre>
+          <p>
+            <code>express-session</code> manages the cookie and stores the session payload.
+            <code>bcrypt</code> hashes passwords. Both are industry-standard, both well-tested,
+            both used in production apps of all sizes. No crypto shortcuts here.
+          </p>
+          <p>
+            Note: <code>@types/bcrypt</code> ships with bcrypt 6.x under the same package name
+            (<code>@types/bcrypt@6.0.0</code>). If you were using an older major version, you would
+            need <code>@types/bcrypt</code>. Modern bcrypt has bundled types.
+          </p>
+        </li>
+
+        <li>
+          <h3>Add the users table</h3>
+
+          <p>
+            One addition to <code>schema.prisma</code>. Everything above the model layer stays
+            unchanged until the moment the database requires otherwise.
+          </p>
+
+          <div class="file">
+            <span class="file-path">prisma/schema.prisma (append this model)</span>
+            <pre><code>model User {
+  id           String    @id @default(uuid())
+  email        String    @unique @map("email")
+  passwordHash String    @map("password_hash")
+  familyId     String    @map("family_id")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+
+  family Family @relation(fields: [familyId], references: [id], onDelete: Cascade)
+
+  @@map("users")
+}</code></pre>
+          </div>
+
+          <p>
+            Notice the design choices:
+          </p>
+
+          <ul>
+            <li>
+              <strong>Email is unique, not a PK.</strong> The user's identifier is opaque
+              (the UUID), but their contact point is their email. Separating identity from
+              identification is a principle worth remembering.
+            </li>
+            <li>
+              <strong><code>passwordHash</code>, not <code>password</code>.</strong> The column
+              name tells you everything: this is a hash. Never call a field <code>password</code>
+              in code, never store plaintext passwords anywhere.
+            </li>
+            <li>
+              <strong>The family link belongs on the user, not inside <code>family_members</code>.</strong>
+              For Phase 1 MVP the user IS a member. More complex setups arrive later when
+              multiple people can share one account (unlikely in a private family context).
+            </li>
+          </ul>
+
+          <pre><code>npx prisma migrate dev --name add_users_table</code></pre>
+        </li>
+
+        <li>
+          <h3>Configure the session</h3>
+
+          <p>
+            Session config lives in its own file because it touches many concerns: cookie
+            flags, lifetime, secret, storage medium. Changing any one of these has real security
+            implications, and they should be visible together.
+          </p>
+
+          <div class="file">
+            <span class="file-path">server/src/config/session.ts</span>
+            <pre><code>import type { RequestHandler } from "express";
+import session from "express-session";
+import type { SessionOptions } from "express-session";
+import "dotenv/config";
+
+const isProd = process.env.NODE_ENV === "production";
+
+const sessionConfig: SessionOptions = {
+  // Secret rotates signatures. In production this MUST be a 32-character random string
+  // stored in the environment, never in source control.
+  secret: process.env.SESSION_SECRET ?? "change-me-in-production",
+  resave: false,                          // do not save unmodified sessions back to storage
+  saveUninitialized: false,               // do not create sessions until something is stored
+  proxy: isProd,                          // trust reverse proxy headers in production
+  cookie: {
+    httpOnly: true,                       // JavaScript cannot read the cookie
+    secure: isProd,                       // send only over HTTPS in production
+    sameSite: "lax",                      // CSRF-safe: allows GET from same-site navigation
+    maxAge: 24 * 60 * 60 * 1000,          // 24 hours
+  },
+  name: "kinlink.sid",                    // custom cookie name instead of connect.sid
+  rolling: true,                          // renew expiry on each request
+};
+
+export const sessionMiddleware: RequestHandler = session(sessionConfig);</code></pre>
+          </div>
+
+          <p>Five decisions worth pausing on:</p>
+
+          <ol>
+            <li>
+              <strong><code>sameSite: "lax"</code>.</strong> This prevents CSRF for GET requests
+              and allows normal navigation from other domains. It means POST requests from another
+              domain will fail to include the cookie — which is the correct security posture. Set
+              <code>"strict"</code> once you implement CSRF tokens for forms.
+            </li>
+            <li>
+              <strong><code>secure: isProd</code>.</strong> In development, cookies are sent over
+              plain HTTP (localhost). In production, they require HTTPS. Browsers silently drop
+              <code>secure</code> cookies on non-HTTPS connections, so leaving it always-on breaks
+              local development.
+            </li>
+            <li>
+              <strong><code>rolling: true</code>.</strong> Without this, the cookie expires after the
+              last explicit login. With rolling, every page view renews the countdown — as long as the
+              user is active, their session stays alive. Idle users time out naturally.
+            </li>
+            <li>
+              <strong><code>name: "kinlink.sid"</code>.</strong> The default name is
+              <code>connect.sid</code>. Changing it avoids accidentally colliding with another
+              Express session running on the same domain. Not a security decision, but it prevents
+              hard-to-debug issues.
+            </li>
+            <li>
+              <strong><code>resave: false, saveUninitialized: false</code>.</strong> These are the
+              most misunderstood options in express-session. <code>resave: false</code> means
+              "don't write back to storage unless the session changed." <code>saveUninitialized:
+              false</code> means "don't create empty sessions for visitors who haven't logged in."
+              Together they reduce disk writes and prevent session fixation attacks on anonymous users.
+            </li>
+          </ol>
+
+          <div class="file">
+            <span class="file-path">.env (add SESSION_SECRET)</span>
+            <pre><code># Run once to generate: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+SESSION_SECRET="your-32-character-random-here"</code></pre>
+          </div>
+
+          <p>Never reuse a <code>SESSION_SECRET</code>. Rotate it periodically in production. Anyone who
+          knows it can forge sessions for anyone.</p>
+        </li>
+
+        <li>
+          <h3>Add the session middleware to the app pipeline</h3>
+
+          <p>
+            This is a small change with a large effect: from this line onward, every incoming
+            request carries a <code>req.session</code> object. Where it sits in the pipeline matters.
+          </p>
+
+          <div class="file">
+            <span class="file-path">server/src/app.ts</span>
+            <pre><code>import express from "express";
+import { errorHandler } from "./middlewares/errorHandler.js";
+import { apiRouter } from "./routes/index.js";
+import { sessionMiddleware } from "./config/session.js";
+
+// Builds the application but does NOT listen. That separation is what lets a
+// test exercise the whole stack without opening a port.
+export function createApp() {
+  const app = express();
+
+  app.use(express.json());
+  app.use(sessionMiddleware);                // ← add before routes
+  app.use("/api", apiRouter);
+  app.use(errorHandler);
+
+  return app;
+}</code></pre>
+          </div>
+
+          <p>
+            Order matters: middleware runs top-to-bottom. <code>express.json()</code> must come
+            before route handlers that parse bodies. <code>sessionMiddleware</code> must come
+            before routes that read <code>req.session</code>. Error handler goes last because
+            it catches errors thrown by everything above it.
+          </p>
+        </li>
+
+        <li>
+          <h3>The authentication routes</h3>
+
+          <p>
+            Four endpoints in one router. Keep them narrow: register, login, logout, whoami.
+            Each does exactly one thing and has exactly one response shape.
+          </p>
+
+          <div class="file">
+            <span class="file-path">shared/contracts/auth.ts</span>
+            <pre><code>/** Payload sent when registering a new user */
+export interface RegisterRequest {
+  email: string;
+  password: string;
+}
+
+/** What follows the user home after login */
+export interface AuthResponse {
+  userId: string;
+  familyId: string;
+  email: string;
+}
+
+/** Consistent error envelope */
+export interface ApiErrorBody {
+  message: string;
+}</code></pre>
+          </div>
+
+          <p>
+            Wait — this changes the contract. Lesson 01 says the contract is the boundary between
+            client and server. Adding fields to the API means the contract grows. That's fine;
+            contracts grow organically, not in bulk. The rule is: <strong>only the minimum
+            necessary data crosses the boundary</strong>, and every field earns its place.
+          </p>
+
+          <div class="file">
+            <span class="file-path">server/src/controllers/auth.controller.ts</span>
+            <pre><code>import type { NextFunction, Request, Response } from "express";
+import bcrypt from "bcrypt";
+import { prisma } from "../config/database.js";
+import type { AuthResponse } from "../../shared/contracts/auth.js";
+
+/**
+ * Register a new user. Creates the account, hashes the password, assigns the
+ * user to the specified family, and logs them in immediately.
+ *
+ * In production you would separate registration from login: create the account,
+ * send an email confirmation, then let them log in separately. For this lesson
+ * we combine both steps to keep the loop tight.
+ */
+export async function register(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise&lt;void&gt; {
+  try {
+    const { email, password }: { email: string; password: string } = req.body;
+
+    // 1. Check uniqueness before hashing — cheap failure
+    const existing = await prisma.user.findUnique({ where: { email } });
+    if (existing) {
+      res.status(409).json({ message: "Email already registered" });
+      return;
+    }
+
+    // 2. Hash the password (cost factor 12 is recommended for modern hardware)
+    const saltRounds = 12;
+    const passwordHash = await bcrypt.hash(password, saltRounds);
+
+    // 3. Look up the target family (you could also auto-create during invite flow)
+    // For this lesson: look up by slug to establish family membership.
+    const family = await prisma.family.findFirst({
+      where: { slug: "nguyen" },       // replace with user selection in future
+    });
+    if (!family) {
+      res.status(404).json({ message: "Family not found" });
+      return;
+    }
+
+    // 4. Create user with session association
+    const user = await prisma.user.create({
+      data: {
+        email,
+        passwordHash,
+        familyId: family.id,
+      },
+    });
+
+    // 5. Log them in
+    req.session.userId = user.id;
+    req.session.familyId = family.id;
+
+    res.status(201).json({
+      data: {
+        userId: user.id,
+        familyId: family.id,
+        email: user.email,
+      } satisfies AuthResponse,
+    });
+  } catch (error) {
+    next(error);
+  }
+}
+
+/** Login with email and password */
+export async function login(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise&lt;void&gt; {
+  try {
+    const { email, password }: { email: string; password: string } = req.body;
+
+    const user = await prisma.user.findUnique({ where: { email } });
+    if (!user) {
+      res.status(401).json({ message: "Invalid credentials" });
+      return;
+    }
+
+    const match = await bcrypt.compare(password, user.passwordHash);
+    if (!match) {
+      // Constant-time comparison on the hash, but timing still leaks that the
+      // email exists (user not found ≠ wrong password). Preventing user enumeration
+      // requires more care (rate limiting, generic messages). Acknowledge the leak.
+      res.status(401).json({ message: "Invalid credentials" });
+      return;
+    }
+
+    req.session.userId = user.id;
+    req.session.familyId = user.familyId;
+
+    res.status(200).json({
+      data: {
+        userId: user.id,
+        familyId: user.familyId,
+        email: user.email,
+      } satisfies AuthResponse,
+    });
+  } catch (error) {
+    next(error);
+  }
+}
+
+/** Destroy the session */
+export async function logout(
+  _req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise&lt;void&gt; {
+  try {
+    req.session.destroy((err) => {
+      if (err) {
+        next(err);
+        return;
+      }
+      res.clearCookie("kinlink.sid");
+      res.status(204).end();
+    });
+  } catch (error) {
+    next(error);
+  }
+}
+
+/** Return the authenticated user's info (no sensitive data) */
+export async function whoami(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise&lt;void&gt; {
+  try {
+    const userId = req.session.userId;
+    if (!userId) {
+      res.status(401).json({ message: "Not authenticated" });
+      return;
+    }
+
+    const user = await prisma.user.findUnique({
+      select: { id: true, email: true, familyId: true },
+      where: { id: userId },
+    });
+    if (!user) {
+      res.status(401).json({ message: "Session invalid" });
+      return;
+    }
+
+    res.status(200).json({
+      data: {
+        userId: user.id,
+        familyId: user.familyId,
+        email: user.email,
+      } satisfies AuthResponse,
+    });
+  } catch (error) {
+    next(error);
+  }
+}</code></pre>
+          </div>
+
+          <div class="file">
+            <span class="file-path">server/src/routes/auth.routes.ts</span>
+            <pre><code>import { Router } from "express";
+import { register, login, logout, whoami } from "../controllers/auth.controller.js";
+
+export const authRouter = Router();
+
+authRouter.post("/register", register);
+authRouter.post("/login", login);
+authRouter.post("/logout", logout);
+authRouter.get("/whoami", whoami);</code></pre>
+          </div>
+
+          <p>Notice that <code>login</code> uses <code>bcrypt.compare()</code>, not
+          equality. bcrypt generates a random salt per hash, so identical passwords produce
+          different hashes. <code>compare()</code> extracts the salt from the stored hash and
+          recomputes to check equality. Always use <code>compare</code>; never hash-and-compare.</p>
+
+          <div class="callout warn">
+            <span class="callout-title">Timing attack awareness</span>
+            <p>
+              <code>bcrypt.compare()</code> runs in constant time, so it doesn't leak how many
+              characters matched. But the overall response time still differs slightly between
+              "user not found" and "wrong password" because finding a user takes a DB query.
+              Mitigation: use rate limiting, or return the same generic message for both cases
+              ("Invalid credentials"). For a private family app, the risk is low. For anything
+              public, fix it.
+            </p>
+          </div>
+        </li>
+
+        <li>
+          <h3>Replace the placeholder — auth middleware</h3>
+
+          <p>
+            This is the piece that removes <code>CURRENT_FAMILY_ID</code>. An
+            <strong>auth middleware</strong> intercepts every request, checks the session,
+            and either forwards the request (authenticated) or rejects it (unauthenticated).
+            When authenticated, it attaches the user's info to <code>req.user</code> so
+            downstream code never needs to touch the session again.
+          </p>
+
+          <div class="file">
+            <span class="file-path">server/src/middlewares/auth.ts</span>
+            <pre><code>import type { RequestHandler } from "express";
+
+interface SessionWithUser extends Express.MutatedSession {
+  userId?: string;
+  familyId?: string;
+}
+
+/** Attach user info from the session, reject if absent. */
+export const requireAuth: RequestHandler = (req, _res, next) =&gt; {
+  const session = req.session as unknown as SessionWithUser;
+  if (!session.userId || !session.familyId) {
+    req.next(new Error("Authentication required"));
+    return;
+  }
+
+  req.authenticatedUserId = session.userId;
+  req.authenticatedFamilyId = session.familyId;
+  next();
+};</code></pre>
+          </div>
+
+          <p>
+            The middleware reads from the session once, then puts values on
+            <code>req</code> for downstream code to use. This is intentional: controllers and
+            services should read from <code>req.authenticatedFamilyId</code>, not from
+            <code>req.session</code>. <strong>That is dependency direction in action</strong>:
+            the service depends on the request wrapper, not on session internals.
+          </p>
+
+          <div class="file">
+            <span class="file-path">server/src/controllers/people.controller.ts</span>
+            <pre><code>import type { NextFunction, Request, Response } from "express";
+import type { ApiResponse, PersonResource } from "../contracts.js";
+import { listPeople } from "../services/people.service.js";
+import { toPersonResource } from "../views/person.view.js";
+
+interface RequestWithAuth extends Request {
+  authenticatedUserId: string;
+  authenticatedFamilyId: string;
+}
+
+export async function getPeople(
+  req: RequestWithAuth,
+  res: Response,
+  next: NextFunction,
+): Promise&lt;void&gt; {
+  try {
+    const people = await listPeople(req.authenticatedFamilyId);
+    const body: ApiResponse&lt;PersonResource[]&gt; = {
+      data: people.map(toPersonResource),
+    };
+
+    res.status(200).json(body);
+  } catch (error) {
+    next(error);
+  }
+}</code></pre>
+          </div>
+
+          <div class="file">
+            <span class="file-path">server/src/services/people.service.ts</span>
+            <pre><code>import * as personModel from "../models/person.model.js";
+import type { Person } from "../models/person.model.js";
+
+/** Forward the call through to the model. The model enforces scoping. */
+export async function listPeople(familyId: string): Promise&lt;Person[]&gt; {
+  return personModel.findByFamily(familyId);
+}</code></pre>
+          </div>
+
+          <p>
+            The controller now reads <code>req.authenticatedFamilyId</code> (set by middleware)
+            instead of a magic constant. The service passes it straight to the model. The model
+            filters the query. Three layers, one value, no gaps.
+          </p>
+
+          <div class="file">
+            <span class="file-path">server/src/routes/index.ts</span>
+            <pre><code>import { Router } from "express";
+import type { ApiResponse } from "../contracts.js";
+import { authRouter } from "./auth.routes.js";
+import { peopleRouter } from "./people.routes.js";
+import { requireAuth } from "../middlewares/auth.js";
+
+export const apiRouter = Router();
+
+apiRouter.get("/health", (_req, res) =&gt; {
+  const body: ApiResponse&lt;{ status: "ok" }&gt; = { data: { status: "ok" } };
+  res.status(200).json(body);
+});
+
+apiRouter.use("/auth", authRouter);
+apiRouter.use("/people", requireAuth, peopleRouter);</code></pre>
+          </div>
+
+          <p>
+            Notice <code>requireAuth</code> runs <em>before</em> <code>peopleRouter</code>. It
+            is part of the routing chain, not applied inside individual route handlers. This is
+            the pattern: apply auth at the route group level, not manually in every handler.
+          </p>
+        </li>
+
+        <li>
+          <h3>Verify end-to-end</h3>
+          <pre><code># Step 1: see the endpoint reject without auth
+curl -s http://localhost:4000/api/people | json_pp
+
+# Step 2: register
+curl -s -X POST http://localhost:4000/api/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"email":"test@example.com","password":"correcthorsebatterystaple"}' | json_pp
+
+# Step 3: login (extract the Set-Cookie header)
+curl -si -X POST http://localhost:4000/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"test@example.com","password":"correcthorsebatterystaple"}' > /tmp/login.txt 2>&1
+grep -i 'set-cookie' /tmp/login.txt
+
+# Step 4: make a protected request WITH the cookie
+curl -s -b '/tmp/login.txt' http://localhost:4000/api/people | json_pp
+
+# Step 5: verify the other family's data is invisible
+docker compose exec mysql mysql -ukinlink -pkinlink kinlink \
+  -e "SELECT display_name FROM people WHERE family_id != (SELECT family_id FROM users WHERE email='test@example.com');" 
+curl -s -b '/tmp/login.txt' http://localhost:4000/api/people | grep displayName
+
+# Step 6: logout clears the session
+curl -s -X POST http://localhost:4000/api/auth/logout -b '/tmp/login.txt' -v
+curl -s http://localhost:4000/api/people | json_pp # should fail now</code></pre>
+
+          <p>
+            Step 1 should return <code>{"message": "Authentication required"}</code>. Steps 2–6
+            should demonstrate register → login → access → isolation → logout → reject. If any
+            step fails, the error message is your teacher. Read it, understand it, fix it.
+          </p>
+
+          <p>
+            The front end (React) currently calls <code>/api/people</code> with no cookie. It
+            will continue to receive a 401 until the client sends the session cookie. That's the
+            next natural step — connecting the React UI to the authenticated API. You will
+            handle that in lesson 05 (React + TanStack Query + Zustand), where the client learns
+            about auth state and the fetch interceptor that attaches cookies.
+          </p>
+        </li>
+
+        <li>
+          <h3>Commit</h3>
+          <pre><code>git add -A
+git commit -m "Add authentication: session cookies, bcrypt, scoped family queries"</code></pre>
+        </li>
+      </ol>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Verify</h2>
+
+      <ul class="checklist">
+        <li>Without a session cookie, <code>GET /api/people</code> returns <code>{"message": "Authentication required"}</code>.</li>
+        <li>Register creates a user, hashes the password, and sets <code>req.session.userId</code>.</li>
+        <li>Login finds the user, verifies with <code>bcrypt.compare()</code>, and reuses the existing session.</li>
+        <li><code>POST /auth/logout</code> destroys the session, clears the cookie, and subsequent requests are rejected.</li>
+        <li>Two users in different families cannot see each other's data through the API.</li>
+      </ul>
+
+      <h2>Break it on purpose</h2>
+
+      <ol>
+        <li>
+          Remove <code>req.session.httpOnly = true</code> (which doesn't exist — that's a
+          compiler error, good). Instead, remove <code>httpOnly: true</code> from the cookie
+          config, then try to read <code>document.cookie</code> in the browser console. If
+          you see <code>kinlink.sid=...</code>, the cookie was exposed. Fix it. Then ask:
+          if someone steals a cookie like this, what can they do? (Answer: everything your
+          user can do.)
+        </li>
+        <li>
+          Delete <code>requireAuth</code> from <code>apiRouter.use("/people", ...)</code>. Now
+          call <code>/api/people</code> without logging in. Isolation is gone. The bug is
+          invisible in the controller code — the fix lives one line above it in the router.
+          How do you make that harder to forget?
+        </li>
+        <li>
+          Register with the same email twice. What happens? Now delete the <code>resave</code>
+          config option. How does behaviour change? Write down what <code>resave</code> and
+          <code>saveUninitialized</code> actually do in one sentence each.
+        </li>
+        <li>
+          Try <code>bcrypt.compare(wrongPassword, validHash)</code> vs
+          <code>bcrypt.compare(wrongPassword, nonexistentHash)</code>. Measure the response
+          times. The difference is sub-millisecond and indistinguishable at human scale, but
+          it exists. Does preventing this matter for a private family app? For a public SaaS?
+          Answer for both.
+        </li>
+      </ol>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Retrieval practice</h2>
+
+      <p>No scrolling back. Answer first, then check.</p>
+
+      <div class="quiz" data-quiz>
+        <script type="application/json">
+          [
+            {
+              "q": "Why choose sessions over JWTs for a private family app?",
+              "options": [
+                "Sessions avoid XSS when cookies are httpOnly and secure",
+                "JWTs are faster for single-domain applications",
+                "Sessions require no server-side state",
+                "JWTs cannot store family relationships"
+              ],
+              "answer": 0,
+              "why": "When cookies are httpOnly and secure, JavaScript cannot read them, making XSS less damaging than localStorage-based JWTs. Sessions also simplify revocation (delete the record) and are adequate for a single-domain setup."
+            },
+            {
+              "q": "What does resave: false actually do?",
+              "options": [
+                "It skips saving unchanged sessions back to storage on each request",
+                "It prevents sessions from being modified after creation",
+                "It drops old sessions without warning",
+                "It shares sessions across different servers automatically"
+              ],
+              "answer": 0,
+              "why": "Without resave: false, every request writes the session back to storage even if nothing changed, wasting I/O and increasing race conditions. Setting it to false ensures storage is only updated when the session object actually changed."
+            },
+            {
+              "q": "Why store passwordHash, not password?",
+              "options": [
+                "Because hashing is irreversible, so exposure of the hash is still safe-ish",
+                "Because databases refuse to store plaintext by default",
+                "Because bcrypt is required by law for privacy regulation",
+                "Because hashing reduces storage space for passwords"
+              ],
+              "answer": 0,
+              "why": "bcrypt uses a work factor to make brute-force expensive, and salts prevent rainbow-table attacks. A leaked hash is not directly usable as a password, unlike plaintext. This is defence-in-depth, not invulnerability."
+            },
+            {
+              "q": "Where does the familyId come from after authentication?",
+              "options": [
+                "From the session, via middleware onto req, never from URL or body",
+                "From the JWT payload decoded in the controller",
+                "From the user's selected family in a dropdown menu",
+                "From a hidden input in the frontend form"
+              ],
+              "answer": 0,
+              "why": "Authenticated requests carry no tenant identifiers from the client. The server derives familyId from proven session state, passes it through the middleware onto the request, and the model enforces the filter. Client-supplied ids can be edited."
+            },
+            {
+              "q": "What breaks when you delete requireAuth from the people router?",
+              "options": [
+                "Everyone can read everyone's data; the regression hides in the route config",
+                "The controller throws a runtime TypeError",
+                "TypeScript compiles but curl returns HTML instead of JSON",
+                "bcrypt starts failing with malformed hashes"
+              ],
+              "answer": 0,
+              "why": "Without the middleware, requests reach the controller unauthenticated. The error is not in the business logic — it's in the route definition one line above. Make it obvious by applying auth at the router group level, documented clearly."
+            }
+          ]
+        </script>
+      </div>
+
+      <h2>Primary source</h2>
+
+      <div class="callout win">
+        <span class="callout-title">Read this next</span>
+        <p>
+          <a href="https://www.passportjs.org/concepts/session-strategy">Passport.js — session strategy documentation</a>.
+          Passport is optional here, but its concepts explain session middleware deeply. Also:
+          <a href="https://github.com/scottcorgan/express-session-express-session-api/blob/master/README.md">express-session source docs</a>.
+        </p>
+        <p>
+          For bcrypt:
+          <a href="https://github.com/kelektiv/node.bcrypt.js">bcrypt.js README on GitHub</a>
+          explains cost factors and why you never compare raw hashes.
+        </p>
+      </div>
+
+      <div class="prompt">
+        <span class="prompt-title">Ask your teacher</span>
+        <p>
+          Ask me why we use <code>saltRounds: 12</code> specifically, what Redis-based session
+          storage looks like when you need horizontal scaling, how CSRF protection works with
+          <code>sameSite: "lax"</code>, or why <code>bcrypt.compare()</code> is constant-time
+          while <code>==</code> is not. And bring me your answers to the exercise about removing
+          <code>requireAuth</code> — how to make that mistake harder to repeat.
+        </p>
+      </div>
+
+      <footer class="lesson-footer">
+        <p class="next-up">
+          <strong>Next:</strong> Lesson 05 — React + TanStack Query + Zustand. The client
+          learns about auth state, fetches <code>/api/people</code> with the session cookie
+          attached, and displays the authenticated family tree.
+        </p>
+        <p>
+          <a href="../MISSION.md">MISSION.md</a> ·
+          <a href="../ROADMAP.md">ROADMAP.md</a> ·
+          <a href="../GLOSSARY.md">GLOSSARY.md</a> ·
+          <a href="../PROGRESS.md">PROGRESS.md</a>
+        </p>
+      </footer>
+    </div>
+
+    <script src="../assets/quiz.js"></script>
+  </body>
+</html>

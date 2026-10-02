@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Reference 04 — Ids, pools and tenancy</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="lesson-header">
+        <p class="eyebrow">Reference 04 · the three answers worth memorising</p>
+        <h1>Ids, pools and tenancy</h1>
+        <p class="lede">
+          Compressed answers to the questions that come up in every system design
+          interview: how big should the pool be, should ids be guessable, and where does
+          a tenant id come from?
+        </p>
+        <div class="meta-row">
+          <span>Used by: <a href="../lessons/0003-ten-requests-one-pool-two-families.html">Lesson 03</a></span>
+          <span>Vocabulary: <a href="../GLOSSARY.md">GLOSSARY.md</a></span>
+        </div>
+      </header>
+
+      <h2>1. The connection pool</h2>
+
+      <p>
+        <code>connectionLimit</code> is the maximum number of database connections this
+        process holds open. It is a doorway, not a speed limit: excess requests
+        <strong>queue</strong>, they do not fail.
+      </p>
+
+      <pre><code>10 queries, pool of 5, 400ms each
+───────────────��──────────────────────
+req 0-4   ~487ms   ran immediately
+req 5-9   ~890ms   queued behind them
+wall      898ms</code></pre>
+
+      <h3>Choosing the number</h3>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Input</th>
+            <th>Question to answer</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>MySQL ceiling</td>
+            <td>
+              <code>max_connections</code> (default 151). Pool × instances must stay
+              under it.
+            </td>
+          </tr>
+          <tr>
+            <td>Blocking behaviour</td>
+            <td>
+              Database calls are I/O, so the process idles. Pool &gt; thread count is fine.
+            </td>
+          </tr>
+          <tr>
+            <td>Little's Law</td>
+            <td>
+              Concurrency ≈ throughput × latency. 100 req/s × 50ms ≈ 5 connections.
+            </td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p>
+        Derive it, then measure it. A pool that is too small degrades gracefully; a pool
+        that is too large turns a queue inside your app into a queue inside MySQL and
+        lets a bad query do far more damage at once.
+      </p>
+
+      <h3>One client, one pool</h3>
+
+      <p>
+        Construct <code>PrismaClient</code> exactly once, at module scope. A
+        <code>new PrismaClient()</code> inside a request handler opens a fresh pool per
+        request until MySQL refuses connections.
+      </p>
+
+      <h2>2. Ids</h2>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Choice</th>
+            <th>Wins on</th>
+            <th>Costs you</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Auto-increment</td>
+            <td>Insert speed, compact index, short URLs, dense index</td>
+            <td>Enumeration — <code>/people/47</code> reveals volume</td>
+          </tr>
+          <tr>
+            <td>UUID v4</td>
+            <td>Opacity, no coordination, safe to generate client-side</td>
+            <td>16 bytes, index fragmentation, 36-char URLs</td>
+          </tr>
+          <tr>
+            <td><strong>UUID v7</strong></td>
+            <td>Opacity <em>and</em> time-ordered, so the index stays dense</td>
+            <td>Must be generated in app code, not as a DB default</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="callout warn">
+        <span class="callout-title">The rule that matters most</span>
+        <p>
+          An opaque id is <strong>defence in depth, never authorisation</strong>. It
+          makes guessing expensive; it does nothing about a caller who legitimately has
+          an id. Every endpoint still checks membership. UUIDs buy a little for free —
+          they are not the answer to access control.
+        </p>
+      </div>
+
+      <p>
+        RFC 9562 §5 covers v4 vs v7:
+        <a href="https://datatracker.ietf.org/doc/html/rfc9562">datatracker.ietf.org</a>.
+      </p>
+
+      <h2>3. Tenancy: where the tenant id comes from</h2>
+
+      <pre><code>BROKEN   GET /api/people?familyId=...        client picks whose data
+BROKEN   fetchAll().filter(p =&gt; ...)          correct result, wrong cost
+CORRECT  session.familyId → where:{ familyId }  server decides, DB filters</code></pre>
+
+      <h3>The rule</h3>
+
+      <p>
+        <strong>The tenant id is derived from an authenticated session and never appears
+        in a request the client controls.</strong> Not in the path, not in the query
+        string, not in the body — unless the caller genuinely belongs to more than one
+        tenant, in which case the membership check must be explicit.
+      </p>
+
+      <h3>Make it structurally impossible</h3>
+
+      <pre><code>// Bad: callable in a way that leaks
+export async function findAll(): Promise&lt;Person[]&gt;
+
+// Good: the scoping argument cannot be omitted
+export async function findByFamily(familyId: string): Promise&lt;Person[]&gt; {
+  return prisma.person.findMany({ where: { familyId }, orderBy: { createdAt: "asc" } });
+}</code></pre>
+
+      <p>
+        A required parameter turns "did I remember to scope this?" from a code-review
+        question into a compiler question.
+      </p>
+
+      <h3>Which layer decides</h3>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Layer</th>
+            <th>Answers</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Model</td>
+            <td>"Which rows match this familyId?" — a <strong>fact</strong></td>
+          </tr>
+          <tr>
+            <td>Service</td>
+            <td>"Which family is this caller allowed to see?" — a <strong>policy</strong></td>
+          </tr>
+          <tr>
+            <td>Controller</td>
+            <td>Neither. It does not name a family at all.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p>
+        Separation of concerns is nearby and worth mentioning. The sharper answer, if
+        pressed, is <strong>dependency direction</strong>: the model must not depend on
+        the request. That sentence survives a follow-up question; an acronym does not.
+      </p>
+
+      <h2>4. Errors: log, don't leak</h2>
+
+      <pre><code>if (!isProduction) console.error(error);
+
+const body = isProduction
+  ? { message: "Internal server error" }
+  : { message: error instanceof Error ? error.message : "Unexpected error" };</code></pre>
+
+      <p>
+        A database error message can carry the host, the username and the failing query.
+        The user learns their request failed. They do not learn your topology.
+      </p>
+
+      <div class="callout win">
+        <span class="callout-title">Primary sources</span>
+        <p>
+          <a
+            href="https://www.prisma.io/docs/orm/v7/prisma-client/setup-and-configuration/databases-connections"
+            >Prisma — Database connection management</a
+          > ·
+          <a href="https://datatracker.ietf.org/doc/html/rfc9562">RFC 9562 — UUID</a>
+        </p>
+      </div>
+
+      <footer class="lesson-footer">
+        <p>Reference docs are meant to be argued with. If a rule here is wrong, say so.</p>
+      </footer>
+    </div>
+  </body>
+</html>

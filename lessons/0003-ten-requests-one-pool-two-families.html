@@ -1,0 +1,592 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lesson 03 — Ten requests, one pool, two families</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="lesson-header">
+        <p class="eyebrow">Lesson 03 · Week 3 · about two hours</p>
+        <h1>Ten requests, one pool, two families</h1>
+        <p class="lede">
+          Three boundaries that only reveal themselves under pressure: what happens when
+          ten requests meet a pool of five, what your ids leak, and what stops one family
+          from reading another's history.
+        </p>
+        <div class="meta-row">
+          <span>Mission: ship KinLink</span>
+          <span>Reference: <a href="../reference/0004-ids-and-tenancy.html">Ids &amp; tenancy</a></span>
+          <span>Requires: <a href="0002-make-the-model-real.html">Lesson 02</a></span>
+        </div>
+      </header>
+
+      <div class="callout win">
+        <span class="callout-title">The win</span>
+        <p>
+          You will stop treating <code>connectionLimit: 5</code> as a magic number and
+          start treating it as a queue with a doorway. You will be able to argue both
+          sides of the UUID question and pick one on evidence. And
+          <code>/api/people</code> will stop leaking every family in the database —
+          the fix being <strong>where the <code>familyId</code> comes from</strong>,
+          not merely that a filter exists.
+        </p>
+      </div>
+
+      <h2>Part one — the doorway: what <code>connectionLimit</code> really does</h2>
+
+      <p>
+        You asked what <code>connectionLimit: 5</code> does when ten requests arrive at
+        once. Rather than describe it, we measured it — ten concurrent queries, each
+        deliberately slow (<code>SLEEP(0.4)</code>), against your pool of five:
+      </p>
+
+      <pre><code>Firing 10 concurrent queries against a pool of 5...
+
+  req 0: waited 487ms
+  req 1: waited 487ms
+  req 2: waited 487ms
+  req 3: waited 493ms
+  req 4: waited 497ms
+  req 5: waited 890ms      ← waited for a free connection
+  req 6: waited 890ms
+  req 7: waited 890ms
+  req 8: waited 896ms
+  req 9: waited 898ms
+
+Wall clock: 898ms
+(400ms of work each, pool of 5)</code></pre>
+
+      <p>
+        That table is the whole lesson. Requests 0–4 each waited about 487ms — their own
+        400ms of work plus the ~87ms of connection overhead. Requests 5–9 waited about
+        890ms: <strong>400ms of their own work, plus 400ms of queueing behind
+        someone else's</strong>.
+      </p>
+
+      <p>
+        The pool is a doorway with five doors. Ten people arrive. Five walk through.
+        The other five stand in the rain until a door opens. Nobody is rejected — the
+        requests <em>queue</em>. That is why nothing threw an error, and why the wall
+        clock came in at 898ms instead of 400ms.
+      </p>
+
+      <div class="callout">
+        <span class="callout-title">Why this is your problem and not an abstraction detail</span>
+        <p>
+          Ten concurrent requests to a family tree is <em>normal</em> — the tree page
+          wants people, relationships, and generations at once. A user on hotel wifi is
+          not an edge case. If your pool is too small, <strong>every user gets slower
+          when the server gets busier</strong>, which is the exact opposite of what a
+          server is supposed to do.
+        </p>
+      </div>
+
+      <h3>Choosing the number</h3>
+
+      <p>Three inputs, and you should be able to name all three in an interview:</p>
+
+      <ol>
+        <li>
+          <strong>MySQL's ceiling.</strong> The default <code>max_connections</code> is
+          typically 151. If ten app servers each open a pool of 20, that is 200 — and
+          your database refuses connections it was perfectly happy to accept yesterday.
+          Pool size × instance count must stay under the server's limit.
+        </li>
+        <li>
+          <strong>Whether work blocks.</strong> A database call is I/O: your Node
+          process is idle while waiting. That is exactly why you can hold more open
+          connections than threads and stay fine. Your measurement above is the proof —
+          five connections, ten requests, nothing crashed.
+        </li>
+        <li>
+          <strong>Little's Law, which is the honest answer.</strong> Concurrency
+          ≈ throughput × latency. At 100 requests/second, each query taking 50ms, you
+          need about 5 connections running to keep up. Five is not arbitrary here — it
+          falls straight out of the arithmetic. Pick the number you can derive, then
+          measure it.
+        </li>
+      </ol>
+
+      <div class="callout warn">
+        <span class="callout-title">Do not simply raise it</span>
+        <p>
+          A pool of 500 does not make the server faster. It converts a queue inside your
+          application into a queue inside MySQL, adds memory, and makes a bad query far
+          more damaging — because 500 slow queries now run at once. A larger pool hides
+          the problem you should be fixing.
+        </p>
+      </div>
+
+      <h2>Part two — what your ids leak</h2>
+
+      <p>
+        The other thing you asked me to argue: UUIDs versus auto-increment. You are
+        currently on <code>@default(uuid())</code>. Here is the honest case on both
+        sides, because the popular answer is only half right.
+      </p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Concern</th>
+            <th>Auto-increment</th>
+            <th>UUID</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Enumeration</td>
+            <td>
+              <strong>Leaks.</strong> <code>/api/people/47</code> confirms you have 47+
+              people and invites <code>48</code>.
+            </td>
+            <td>Opaque. Guessing a v4 UUID is hopeless.</td>
+          </tr>
+          <tr>
+            <td>Insert speed</td>
+            <td>Faster — the database hands out the next number.</td>
+            <td>Slower; some versions randomise to avoid fragmentation.</td>
+          </tr>
+          <tr>
+            <td>Index size</td>
+            <td>8 bytes, and cache-friendly.</td>
+            <td>16 bytes for the string form. Larger B-tree, more cache misses.</td>
+          </tr>
+          <tr>
+            <td>Sorting</td>
+            <td>Insertion order = id order, so the index stays dense.</td>
+            <td>Random ids fragment the index. <code>UUIDv7</code> fixes this — time-ordered.</td>
+          </tr>
+          <tr>
+            <td>URL</td>
+            <td>Short, memorable, easy to share.</td>
+            <td>Long. 36 characters in every URL.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p>
+        The security argument only applies to ids <strong>you can guess</strong>. Here is
+        the nuance almost every explanation gets wrong: <strong>UUIDs do not make an
+        endpoint safe</strong>. An unguessable id is not authorisation. If
+        <code>GET /api/people/:id</code> does not check that the caller belongs to that
+        person's family, the uuid is irrelevant — an attacker who gets hold of any valid
+        id still reads it. Guessing becomes hard; <em>asking</em> is untouched.
+      </p>
+
+      <p>
+        So the real argument is: a UUID buys you a little, for free, and it costs you
+        index size and URL length. Take it, and then do the real work — which is the
+        next section.
+      </p>
+
+      <div class="callout">
+        <span class="callout-title">The upgrade to know about</span>
+        <p>
+          <strong>UUIDv7</strong> is time-ordered: the first bits are a timestamp, so
+          new ids sort sequentially and the index stays as dense as an auto-increment's,
+          while remaining unguessable. You have the best of both. Note Prisma generates
+          <code>uuid()</code> as <strong>v4</strong> — switching to v7 means generating
+          ids in application code rather than asking the database for a default.
+        </p>
+      </div>
+
+      <h2>Part three — the bug you found</h2>
+
+      <p>
+        You wrote: <em>"The fix is to list down the people in one family only, not all the
+        person."</em> That is the right destination. It is not yet a fix, because it
+        doesn't say <strong>where the family id comes from</strong> — and that is the
+        entire security property.
+      </p>
+
+      <h3>Three ways to scope a query, two of them broken</h3>
+
+      <pre><code>// BROKEN — the client chooses whose data to read
+GET /api/people?familyId=18321796-bfab-4c2a-9959-b17c4b0acb65
+
+// BROKEN — authenticated, but reads the whole table and filters after
+const all = await personModel.findAll();
+return all.filter(p =&gt; p.familyId === req.user.familyId);
+
+// CORRECT — the family comes from the session, and the database does the filtering
+GET /api/people
+const familyId = req.user.familyId;          // from the session, never the URL
+await prisma.person.findMany({ where: { familyId } })</code></pre>
+
+      <p>
+        The first lets anyone read anyone by changing a query string. The second works
+        but is worse than useless: it pulls every family's rows across the wire and
+        throws most away, so it scales inversely — it gets slower as the product
+        succeeds. The third is the only one that is both secure and fast.
+      </p>
+
+      <div class="callout">
+        <span class="callout-title">Why the id must come from the session</span>
+        <p>
+          If the client can name the family, the client controls the query — and you
+          have moved your authorisation decision somewhere the attacker can edit. The
+          family has to be derived from <em>"who is this person, proven at login"</em>.
+          Once auth exists, there is no <code>familyId</code> in any URL. Ever.
+        </p>
+      </div>
+
+      <h3>On your SOLID answer — you're close, and I'd correct one word</h3>
+
+      <p>
+        You wrote that putting the decision in the service <em>"is the OOP Design
+        Pattern, which apply SOLID and Isolated code."</em> Separation of concerns is
+        genuinely part of what you hit, so you weren't wrong. But the precise reason is
+        <strong>dependency direction</strong>, and it matters that you get it right —
+        because this is the question interviewers ask when they want to know whether you
+        understand layers or have just memorised five acronyms.
+      </p>
+
+      <p>
+        It is not that the model "shouldn't know about families". The model already knows
+        deeply — it knows the table name, the index, the column mapping. The problem is
+        <strong>which question the model is allowed to answer</strong>:
+      </p>
+
+      <pre><code>MODEL   answers: "which rows match this familyId?"      ← a fact
+SERVICE answers: "which family is this request allowed to see?"   ← a policy</code></pre>
+
+      <p>
+        A model that decides policy is a model you cannot reuse safely — from a socket
+        handler, from a nightly job, from an admin tool that has different rules. And a
+        model whose signature is <code>findAll()</code> with no arguments has no way to be
+        scoped, so <em>the bug becomes structurally impossible to write correctly</em>
+        once the signature requires the familyId.
+      </p>
+
+      <p>
+        SOLID is a useful vocabulary, and single-responsibility really is nearby. Reach
+        for it when it's accurate. Don't reach for it when the sharper answer is "the
+        model must not depend on the request" — because that sentence survives a follow-up
+        question and the acronym doesn't.
+      </p>
+
+      <h2>Build it</h2>
+
+      <ol class="steps">
+        <li>
+          <h3>Scope the query at the database</h3>
+          <div class="file">
+            <span class="file-path">server/src/models/person.model.ts</span>
+            <pre><code>import { prisma } from "../config/database.js";
+import type { Person as PrismaPerson } from "../../generated/prisma/client.js";
+
+export type Person = PrismaPerson;
+
+// familyId is now a required argument. There is no way to call this
+// function without saying whose rows you want, which is what makes the
+// isolation bug impossible to introduce by accident.
+export async function findByFamily(familyId: string): Promise&lt;Person[]&gt; {
+  return prisma.person.findMany({
+    where: { familyId },
+    orderBy: { createdAt: "asc" },
+  });
+}</code></pre>
+          </div>
+
+          <div class="file">
+            <span class="file-path">server/src/services/people.service.ts</span>
+            <pre><code>import * as personModel from "../models/person.model.js";
+import type { Person } from "../models/person.model.js";
+
+// NOTE: this is a placeholder. Lesson 04 (authentication) replaces this with
+// a value read from the session cookie, so the family id comes from proven
+// identity rather than a hardcoded constant. Until then, the endpoint is
+// effectively unauthenticated — which is fine for development, and wrong for
+// production. Do not deploy with this constant in place.
+const CURRENT_FAMILY_ID = "18321796-bfab-4c2a-9959-b17c4b0acb65";
+
+export async function listPeople(familyId: string): Promise&lt;Person[]&gt; {
+  return personModel.findByFamily(familyId);
+}
+
+export async function listPeopleForCurrentFamily(): Promise&lt;Person[]&gt; {
+  return listPeople(CURRENT_FAMILY_ID);
+}</code></pre>
+          </div>
+
+          <div class="file">
+            <span class="file-path">server/src/controllers/people.controller.ts</span>
+            <pre><code>import type { NextFunction, Request, Response } from "express";
+import type { ApiResponse, PersonResource } from "../contracts.js";
+import { listPeopleForCurrentFamily } from "../services/people.service.js";
+import { toPersonResource } from "../views/person.view.js";
+
+export async function getPeople(
+  _req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise&lt;void&gt; {
+  try {
+    const people = await listPeopleForCurrentFamily();
+    const body: ApiResponse&lt;PersonResource[]&gt; = {
+      data: people.map(toPersonResource),
+    };
+
+    res.status(200).json(body);
+  } catch (error) {
+    next(error);
+  }
+}</code></pre>
+          </div>
+
+          <p>
+            The controller never names a family. Neither does the view. Only the service
+            does, because only the service knows who is asking.
+          </p>
+        </li>
+
+        <li>
+          <h3>Prove it, with a second family</h3>
+          <p>
+            A single-family database cannot demonstrate isolation — there is nothing to
+            leak. Add a rival family, then show it cannot be seen.
+          </p>
+
+          <pre><code>docker compose exec mysql mysql -ukinlink -pkinlink kinlink -e "
+INSERT INTO families (id, slug, name) VALUES
+  ('ffffffff-0000-4000-8000-000000000001', 'tran', 'Trần');
+INSERT INTO people (id, family_id, display_name, gender) VALUES
+  ('ffffffff-0000-4000-8000-000000000002',
+   'ffffffff-0000-4000-8000-000000000001', 'Trần Văn Cường', 'male');"</code></pre>
+
+          <pre><code>curl -s http://localhost:4000/api/people</code></pre>
+
+          <p>
+            Two names, not three. The Nguyễn family cannot see the Trần family's man.
+            Now the real test — try to reach him anyway:
+          </p>
+
+          <pre><code>curl -s "http://localhost:4000/api/people?familyId=ffffffff-0000-4000-8000-000000000001"</code></pre>
+          <p>
+            Ignored entirely, because the controller never reads a query string. A
+            feature that ignores you is far better than a feature that can be talked into
+            misbehaving.
+          </p>
+        </li>
+
+        <li>
+          <h3>Stop leaking internal errors</h3>
+          <p>
+            Your <code>errorHandler.ts</code> currently returns
+            <code>error.message</code> to the browser unconditionally. Break the database
+            password and you will send the driver, the host, the user and the port
+            straight to whoever caused the error.
+          </p>
+
+          <div class="file">
+            <span class="file-path">server/src/middlewares/errorHandler.ts</span>
+            <pre><code>import type { ErrorRequestHandler } from "express";
+import type { ApiErrorBody } from "../contracts.js";
+
+const isProduction = process.env.NODE_ENV === "production";
+
+export const errorHandler: ErrorRequestHandler = (error, _req, res, _next) =&gt; {
+  // Never in production: a database error message can contain the host,
+  // the username and the query. Log it for you; never send it to them.
+  if (!isProduction) console.error(error);
+
+  const body: ApiErrorBody = isProduction
+    ? { message: "Internal server error" }
+    : { message: error instanceof Error ? error.message : "Unexpected error" };
+
+  res.status(500).json(body);
+};</code></pre>
+          </div>
+
+          <p>
+            The rule generalises: <strong>log it, don't leak it.</strong> A user needs
+            to know their request failed; they do not need your infrastructure's topology.
+          </p>
+        </li>
+
+        <li>
+          <h3>Commit</h3>
+          <pre><code>git add -A
+git commit -m "Scope person queries to a single family; stop leaking errors in production"</code></pre>
+        </li>
+      </ol>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Verify</h2>
+
+      <ul class="checklist">
+        <li>With two families seeded, <code>/api/people</code> returns exactly two names.</li>
+        <li>Passing <code>?familyId=</code> for the other family changes nothing.</li>
+        <li><code>grep -rn "findAll" server/src</code> finds no unscoped person query.</li>
+        <li>With a wrong <code>DATABASE_PASSWORD</code>, production mode returns only <code>Internal server error</code>.</li>
+      </ul>
+
+      <h2>Break it on purpose</h2>
+
+      <ol>
+        <li>
+          Give the model a default: <code>findByFamily(familyId: string = "")</code>. Now
+          grep for calls with no argument. What does the signature now permit that it
+          previously made impossible?
+        </li>
+        <li>
+          Lower <code>connectionLimit</code> to 2 and re-run the concurrency script from
+          the top of this lesson. Predict the new wait times <em>before</em> running it.
+          Then try 50 connections with the same ten queries — what changes, and what does
+          it cost MySQL?
+        </li>
+        <li>
+          Write the two contrasting calls side by side: one that filters in the database,
+          one that fetches everything and filters in JavaScript. Time both against a
+          table with 50,000 people in ten families. Which one is correct, and which is
+          faster? Notice they are not the same question.
+        </li>
+        <li>
+          Change <code>findByFamily</code> to accept a <code>Person</code>'s id instead of
+          a family id. It typechecks. Now ask: which callers would silently break?
+        </li>
+      </ol>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Retrieval practice</h2>
+
+      <p>No scrolling back. Answer first, then check.</p>
+
+      <div class="quiz" data-quiz>
+        <script type="application/json">
+          [
+            {
+              "q": "Ten queries hit a pool of five connections. What happens?",
+              "options": [
+                "Five run, five queue until a connection frees",
+                "Five run, five fail with a timeout error",
+                "All ten run on the same five connections",
+                "The pool grows itself to match demand"
+              ],
+              "answer": 0,
+              "why": "Measured: requests 0-4 waited ~487ms, requests 5-9 waited ~890ms. The pool queues rather than rejecting, which is why total time grew instead of anyone erroring."
+            },
+            {
+              "q": "Why does a database call justify a pool larger than thread count?",
+              "options": [
+                "Because it is IO, so the process is idle while waiting",
+                "Because MySQL handles extra connections with no cost",
+                "Because Node runs each query on its own thread",
+                "Because small pools always cause memory leaks"
+              ],
+              "answer": 0,
+              "why": "The thread sits idle during the round trip. If it were CPU-bound work, adding connections would only add context switching. That is why I/O and CPU workloads get different pool sizes."
+            },
+            {
+              "q": "What is Little's Law used for here?",
+              "options": [
+                "Deriving needed concurrency from throughput and latency",
+                "Proving that a UUID cannot be guessed by an attacker",
+                "Checking whether a query filtered rows before returning",
+                "Calculating the exact wait time of queued requests"
+              ],
+              "answer": 0,
+              "why": "Concurrency ≈ throughput × latency. At 100 requests per second and 50ms latency you need about 5 running connections. The number is derived from measured load, then validated by measurement."
+            },
+            {
+              "q": "Why is a UUID not a substitute for an authorisation check?",
+              "options": [
+                "Because it only blocks guessing, not direct requests",
+                "Because UUIDs can be reversed into their timestamp",
+                "Because the database cannot index a string id",
+                "Because UUIDs expire and break existing links"
+              ],
+              "answer": 0,
+              "why": "It raises the cost of guessing, which is real but partial. Anyone who legitimately obtains an id still reads the record unless the endpoint checks membership. Opaque ids are defence in depth, never the authorisation itself."
+            },
+            {
+              "q": "Why must familyId come from the session, not the URL?",
+              "options": [
+                "So the client cannot choose whose data to read",
+                "So the database query runs faster in production",
+                "So the frontend can cache responses by family name",
+                "So Express refuses to parse query string parameters"
+              ],
+              "answer": 0,
+              "why": "A client-supplied id moves the authorisation decision to the attacker, who can edit it. Deriving it from a proven session means the server chooses whose data is read, and the filtering happens in the database rather than after a full fetch."
+            },
+            {
+              "q": "What is the precise reason the service picks the family?",
+              "options": [
+                "It answers policy, while the model answers fact",
+                "It keeps the model free of the single responsibility",
+                "It lets the controller skip reading the session",
+                "It satisfies the dependency inversion principle exactly"
+              ],
+              "answer": 0,
+              "why": "Separation of concerns is nearby, but the sharper answer is that the model answers which rows match, and the service answers which family is permitted. That keeps the model reusable from jobs and sockets, and makes an unscoped query structurally impossible."
+            }
+          ]
+        </script>
+      </div>
+
+      <h2>Primary source</h2>
+
+      <div class="callout win">
+        <span class="callout-title">Read this next</span>
+        <p>
+          <a
+            href="https://www.prisma.io/docs/orm/v7/prisma-client/setup-and-configuration/databases-connections"
+            >Prisma — Database connection management</a
+          >
+          for how connection pooling is meant to work with the client you are using. Then
+          read the
+          <a
+            href="https://www.prisma.io/docs/orm/v7/prisma-client/queries/advanced/query-optimization-performance"
+            >query optimisation page</a
+          >
+          — the N+1 problem in week four will be the next thing you need it for.
+        </p>
+        <p>
+          On ids, the canonical reference is
+          <a href="https://datatracker.ietf.org/doc/html/rfc9562">RFC 9562 (UUID)</a>:
+          section 5 explains v4 versus v7 in about a paragraph.
+        </p>
+        <p>
+          On MySQL connection management:
+          <a href="https://dev.mysql.com/doc/refman/8.0/en/system-variables.html#sysvar_max_connections">MySQL 8.0 — max_connections</a>.
+        </p>
+      </div>
+
+      <div class="prompt">
+        <span class="prompt-title">Ask your teacher</span>
+        <p>
+          Ask me why a larger pool can make a slow query worse, what MySQL's
+          <code>max_connections</code> default is and how to check yours, how UUIDv7 would
+          change the schema, or what happens to the argument above once real sessions
+          exist and a user belongs to two families. And tell me if the
+          <code>CURRENT_FAMILY_ID</code> placeholder bothers you — it should, and that
+          discomfort is what the next lesson removes.
+        </p>
+      </div>
+
+      <footer class="lesson-footer">
+        <p class="next-up">
+          <strong>Next:</strong> Lesson 04 — authentication. The placeholder constant gets
+          replaced by a real session, and from that moment <code>familyId</code> is
+          something the server knows rather than something anyone can send.
+        </p>
+        <p>
+          <a href="../MISSION.md">MISSION.md</a> ·
+          <a href="../ROADMAP.md">ROADMAP.md</a> ·
+          <a href="../GLOSSARY.md">GLOSSARY.md</a> ·
+          <a href="../PROGRESS.md">PROGRESS.md</a> ·
+          <a href="../reference/0004-ids-and-tenancy.html">Reference 04</a>
+        </p>
+      </footer>
+    </div>
+
+    <script src="../assets/quiz.js"></script>
+  </body>
+</html>

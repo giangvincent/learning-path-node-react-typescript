@@ -10,3 +10,13 @@
 - Prefers monolithic single-folder project structure over modular/package-based setups. Explicitly rejected a pnpm monorepo approach ("I see you are misleading me to packages divided") and insisted on one website project folder with client/server intertwined. Strong opinion — do not reintroduce packages or workspaces. Confidence: 0.95
 - Treats stated architecture as fixed constraints, not suggestions open for re-architecture. Gave a specific stack (React+TS, Node+Express+TS MVC, MySQL) and expects it followed as-is; deviation triggered a firm correction. Confidence: 0.95
 - Wants system design concepts woven into building features, not delivered as separate theory tracks. Prefers learning architecture through constructing real things and defending decisions, not lectures. Confidence: 0.85
+- Rejects placeholders and hardcoded stand-ins in code: called out `CURRENT_FAMILY_ID` as "not good for the project" and demanded identity derived from login/session instead. Expects each step to be production-correct, not merely temporarily workable. Confidence: 0.9
+- Wants to be argued with, not simply told: asked for the two-sided case ("to argue about UUIDs versus auto-increment") and accepts a correction when their own reasoning is imprecise. Confidence: 0.85
+- Expects a detailed review of the code they actually wrote after a build, not generic advice. Asks explicitly for "detail review what I done". Confidence: 0.9
+- Diagnoses and fixes build problems independently, then reports the diagnosis unprompted (Prisma `--output` path resolution, npm audit overrides). Wants those fixes verified rather than re-explained. Confidence: 0.9
+- Wants explicit, ordered next actions with checkpoints and verification steps, then follows the sequence. Confidence: 0.85
+- Gives blunt, specific pushback when the approach is wrong, and expects the correction honoured permanently — do not drift back toward a rejected pattern. Confidence: 0.9
+- Replies to a lesson's "Ask your teacher" prompts by quoting the questions back verbatim with their own answers attached; open-ended invitation prompts reliably get an engaged response. Confidence: 0.85
+- Describes architecture decisions in OOP/SOLID design-pattern vocabulary (separation of concerns, single responsibility) and is open to sharper framings such as dependency direction. Confidence: 0.8
+- Wants tooling to measure their own progress — asked which apps or sites to use for tracking learning time. Confidence: 0.7
+- Works in a Vietnam-first domain context and expects it handled properly: Vietnamese diacritics, name variants and lunar-calendar events (lễ giỗ) are requirements, not edge cases. Confidence: 0.85
