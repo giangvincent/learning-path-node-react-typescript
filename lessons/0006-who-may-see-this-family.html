@@ -1,0 +1,976 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lesson 06 — Who may see this family?</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="lesson-header">
+        <p class="eyebrow">Lesson 06 · Week 4 · about two hours</p>
+        <h1>Who may see this family?</h1>
+        <p class="lede">
+          Lesson 04 taught the server <em>who</em> you are. Now it has to answer the
+          harder question: may <em>you</em> see <em>this</em> family? That needs a
+          relationship rather than a column — and it needs three different status codes,
+          because "no such family" and "not your family" must be indistinguishable.
+        </p>
+        <div class="meta-row">
+          <span>Mission: ship KinLink</span>
+          <span>Reference: <a href="../reference/0006-authorisation-chains.html">Authorisation</a></span>
+          <span>Requires: <a href="0005-finish-the-auth-contract.html">Lesson 05</a></span>
+        </div>
+      </header>
+
+      <div class="callout win">
+        <span class="callout-title">The win</span>
+        <p>
+          <code>User.familyId</code> — one family per user, a placeholder since lesson 04
+          — is replaced by a <strong><code>family_members</code> relationship with a
+          role</strong>, backfilled by a migration that does not lose a single link. The
+          session stops carrying authorisation data at all. And
+          <code>GET /api/families/:slug/people</code> answers
+          <strong>200</strong> for a member, <strong>404</strong> for a non-member, and
+          <strong>401</strong> with no session — where the 404 is a deliberate lie, and
+          the most important line of code in the lesson.
+        </p>
+      </div>
+
+      <h2>Why <code>User.familyId</code> has to go</h2>
+
+      <p>
+        Lesson 03 established the rule: the tenant id comes from the session and never
+        from the request. That rule was correct <em>for the model you had</em> — a user
+        belonging to exactly one family, so the session could remember it and no family
+        needed naming. Three things break it:
+      </p>
+
+      <ol>
+        <li>
+          <strong>A relative will belong to two families.</strong> Your mother is in her
+          birth family and the family she married into. One <code>familyId</code> column
+          cannot hold that, and "the current family" stops being a property of the person.
+        </li>
+        <li>
+          <strong>The role has nowhere to live.</strong> "Owner" is not a property of a
+          person and it is not a property of a family — it is a property of the
+          <em>relationship</em> between them. The same user is an owner here, a member
+          there.
+        </li>
+        <li>
+          <strong>The URL has to name a family.</strong> With two families there is no
+          implicit one, so the request must say which. Which means the old rule needs
+          sharpening rather than abandoning — more on that below.
+        </li>
+      </ol>
+
+      <div class="callout">
+        <span class="callout-title">This is ReBAC, and you should know the word</span>
+        <p>
+          Access derived from a relationship between a subject and a resource is
+          <em>relationship</em>-based access control, and OWASP's
+          <a href="https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html"
+            >Authorization Cheat Sheet</a
+          >
+          now recommends it over plain RBAC, precisely because roles are "poorly suited"
+          to object-level questions like ours. KinLink is a ReBAC product: everything
+          hangs off <em>this user's relationship to this family</em>. The role is one
+          attribute of that relationship, not a separate system.
+        </p>
+      </div>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Build it</h2>
+
+      <ol class="steps">
+        <li>
+          <h3>The relationship, and the constraint that makes it a fact</h3>
+
+          <div class="file">
+            <span class="file-path">prisma/schema.prisma (changes)</span>
+            <pre><code>enum FamilyRole {
+  owner
+  admin
+  member
+}
+
+model Family {
+  id        String   @id @default(uuid())
+  slug      String   @unique
+  name      String
+  createdAt DateTime @default(now()) @map("created_at")
+
+  people      Person[]
+  memberships FamilyMember[]
+
+  @@map("families")
+}
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique @map("email")
+  passwordHash String   @map("password_hash")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  memberships FamilyMember[]
+
+  @@map("users")
+}
+
+model FamilyMember {
+  id        String     @id @default(uuid())
+  userId    String     @map("user_id")
+  familyId  String     @map("family_id")
+  role      FamilyRole @default(member)
+  createdAt DateTime   @default(now()) @map("created_at")
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  family Family @relation(fields: [familyId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, familyId])
+  @@index([familyId])
+  @@map("family_members")
+}</code></pre>
+          </div>
+
+          <p>
+            Note what <code>User</code> lost: <code>familyId</code>. And what
+            <code>Family</code> gained: <code>memberships</code>, not <code>users</code>.
+            The join table is the domain concept, and both sides point at it.
+          </p>
+
+          <p>
+            <strong><code>@@unique([userId, familyId])</code> is the load-bearing
+            line.</strong> Without it a user can accumulate three membership rows for the
+            same family, two of them stale, and "what is my role" becomes a query with an
+            arbitrary answer. With it, membership is a fact the database enforces — not a
+            convention your service layer remembers.
+          </p>
+
+          <div class="callout warn">
+            <span class="callout-title">Spotted while you were in here</span>
+            <p>
+              <code>Person.updatedAt</code> is
+              <code>@default(now())</code>, not <code>@updatedAt</code>. So it is set once
+              at creation and then never changes — a field called "updated" that does not
+              update. One word to fix, and it deserves its own migration
+              (<code>--name fix_person_updated_at</code>) rather than a ride along with
+              this one, because a migration should do one thing. Your call; noted either
+              way.
+            </p>
+          </div>
+        </li>
+
+        <li>
+          <h3>The migration that must not drop your data</h3>
+
+          <p>
+            Here is the trap. The schema change above <em>removes</em> a column that
+            currently holds the only link between a user and their family. Run
+            <code>migrate dev</code> and Prisma will faithfully do what you asked:
+            create the new table, then <strong>drop <code>users.family_id</code></strong
+            >, orphaning every existing user. Nothing errors. The users simply stop
+            belonging to anyone.
+          </p>
+
+          <p>
+            So you generate the migration <em>without</em> applying it, put the backfill
+            in the middle, and then apply it:
+          </p>
+
+          <pre><code>npx prisma migrate dev --create-only --name add_family_members</code></pre>
+
+          <p>
+            Open <code>prisma/migrations/&lt;timestamp&gt;_add_family_members/migration.sql</code>
+            and insert the <code>INSERT … SELECT</code> between the table creation and the
+            drop:
+          </p>
+
+          <div class="file">
+            <span class="file-path">prisma/migrations/&lt;ts&gt;_add_family_members/migration.sql</span>
+            <pre><code>-- CreateTable
+CREATE TABLE `family_members` (
+    `id` VARCHAR(191) NOT NULL,
+    `user_id` VARCHAR(191) NOT NULL,
+    `family_id` VARCHAR(191) NOT NULL,
+    `role` ENUM('owner', 'admin', 'member') NOT NULL DEFAULT 'member',
+    `created_at` DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    UNIQUE INDEX `family_members_user_id_family_id_key`(`user_id`, `family_id`),
+    INDEX `family_members_family_id_idx`(`family_id`),
+    PRIMARY KEY (`id`)
+) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+-- Backfill BEFORE the column disappears. Every existing user becomes the owner of
+-- the family they were previously attached to; without this, the DROP below
+-- silently orphans every account.
+INSERT INTO `family_members` (`id`, `user_id`, `family_id`, `role`, `created_at`)
+SELECT UUID(), `id`, `family_id`, 'owner', NOW(3) FROM `users`;
+
+-- DropForeignKey / DropColumn
+ALTER TABLE `users` DROP FOREIGN KEY `users_family_id_fkey`;
+ALTER TABLE `users` DROP COLUMN `family_id`;</code></pre>
+          </div>
+
+          <pre><code>npx prisma migrate dev</code></pre>
+
+          <p>
+            Now prove the backfill landed, because a migration that "succeeded" is not
+            evidence that it preserved anything:
+          </p>
+
+          <pre><code>docker compose exec mysql mysql -ukinlink -pkinlink kinlink -e "
+SELECT (SELECT COUNT(*) FROM users)         AS users,
+       (SELECT COUNT(*) FROM family_members) AS memberships;"</code></pre>
+
+          <p>
+            Those two numbers must be equal. If they are not, you have just discovered why
+            <code>--create-only</code> exists — and it is cheaper to discover here than in
+            production, where the same mistake is called an incident.
+          </p>
+        </li>
+
+        <li>
+          <h3>The session stops guessing</h3>
+
+          <p>
+            <code>familyId</code> must come out of the session too, and noticing
+            <em>why</em> is the point of this step. A value belongs in the session only if
+            it is stable for the life of the session. Authorisation context is not: it
+            depends on which resource you named, and it changes request to request.
+            Keeping it there was a mirror of the old model, and the mirror was already
+            lying.
+          </p>
+
+          <div class="file">
+            <span class="file-path">server/src/types/express.d.ts</span>
+            <pre><code>import "express-session";
+import type { Family, FamilyMember } from "../models/membership.model.js";
+
+declare module "express-session" {
+  interface SessionData {
+    // Identity only. WHICH family, and what you may do there, is per-request
+    // context resolved in loadFamily -- never remembered across requests.
+    userId?: string;
+  }
+}
+
+declare global {
+  namespace Express {
+    interface Request {
+      authenticatedUserId?: string;
+      family?: Family;
+      membership?: FamilyMember;
+    }
+  }
+}
+
+export {};</code></pre>
+          </div>
+
+          <div class="file">
+            <span class="file-path">server/src/middlewares/auth.ts</span>
+            <pre><code>import type { Request, RequestHandler } from "express";
+import type { ApiErrorBody } from "../contracts.js";
+
+/** Reject unauthenticated requests. 401, not 500: nothing failed on the server. */
+export const requireAuth: RequestHandler = (req, res, next) =&gt; {
+  const { userId } = req.session;
+
+  if (!userId) {
+    const body: ApiErrorBody = { message: "Authentication required" };
+    res.status(401).json(body);
+    return;
+  }
+
+  req.authenticatedUserId = userId;
+  next();
+};
+
+/** Identity, refusing to guess. Throws only if the chain is wired wrong. */
+export function authContext(req: Request): { userId: string } {
+  const { authenticatedUserId } = req;
+
+  if (!authenticatedUserId) {
+    throw new Error("Route is missing requireAuth");
+  }
+
+  return { userId: authenticatedUserId };
+}</code></pre>
+          </div>
+        </li>
+
+        <li>
+          <h3>The one query that cannot forget the membership</h3>
+
+          <div class="file">
+            <span class="file-path">server/src/models/membership.model.ts</span>
+            <pre><code>import { prisma } from "../config/database.js";
+import type {
+  Family,
+  FamilyMember,
+  FamilyRole,
+} from "../../generated/prisma/client.js";
+
+// The model layer re-exports the ORM's types so nothing above it imports Prisma.
+export type { Family, FamilyMember };
+export type Role = FamilyRole;
+
+/**
+ * The single query that answers "may this user act on this family?".
+ *
+ * The membership is part of the WHERE clause, so there is no version of this
+ * function that returns a family the caller has no relationship with. The
+ * tempting alternative -- findFamilyBySlug() then findMembership() -- is two
+ * facts, and then the security property rests on somebody remembering to compare
+ * them. Make the unsafe version unrepresentable instead.
+ */
+export async function findMembershipWithFamily(
+  userId: string,
+  slug: string,
+): Promise&lt;(FamilyMember &amp; { family: Family }) | null&gt; {
+  return prisma.familyMember.findFirst({
+    where: { userId, family: { slug } },
+    include: { family: true },
+  });
+}</code></pre>
+          </div>
+
+          <div class="file">
+            <span class="file-path">server/src/services/membership.service.ts</span>
+            <pre><code>import * as membershipModel from "../models/membership.model.js";
+import type { Family, FamilyMember } from "../models/membership.model.js";
+
+export interface FamilyAccess {
+  family: Family;
+  membership: FamilyMember;
+}
+
+/**
+ * Policy: which family is this caller allowed to act on?
+ *
+ * Returns null for BOTH "no such family" and "not a member of it". That collapse
+ * happens HERE, on purpose, so the middleware that turns null into a response has
+ * no difference left to leak. One return value, one status code, no oracle.
+ */
+export async function findFamilyAccess(
+  userId: string,
+  slug: string,
+): Promise&lt;FamilyAccess | null&gt; {
+  const row = await membershipModel.findMembershipWithFamily(userId, slug);
+  if (row === null) return null;
+
+  return { family: row.family, membership: row };
+}</code></pre>
+          </div>
+
+          <p>
+            Three layers, three questions, exactly as lesson 03 set up: the
+            <strong>model</strong> answers the fact ("which membership row joins this user
+            to this slug"), the <strong>service</strong> answers the policy ("which family
+            may this caller act on"), and the middleware is about to answer the HTTP
+            question ("what status code does that deserve").
+          </p>
+        </li>
+
+        <li>
+          <h3>The middleware that deliberately lies</h3>
+
+          <div class="file">
+            <span class="file-path">server/src/middlewares/family.ts</span>
+            <pre><code>import type { Request, RequestHandler } from "express";
+import type { ApiErrorBody } from "../contracts.js";
+import type { Family, FamilyMember } from "../models/membership.model.js";
+import { findFamilyAccess } from "../services/membership.service.js";
+import { authContext } from "./auth.js";
+
+/**
+ * Resolve :slug to a family this caller belongs to, or answer 404.
+ *
+ * Both "no such family" and "not a member of it" answer 404 with the same body,
+ * because a 403 would confirm the family exists and turn this endpoint into a
+ * directory of every family in KinLink.
+ *
+ * Async middleware: Express 5 forwards a rejection to the error handler, so a
+ * database failure becomes a 500 without a try/catch here.
+ */
+export const loadFamily: RequestHandler = async (req, res, next) =&gt; {
+  const { userId } = authContext(req);
+  const { slug } = req.params;
+
+  if (typeof slug !== "string" || slug.length === 0) {
+    const body: ApiErrorBody = { message: "Family not found" };
+    res.status(404).json(body);
+    return;
+  }
+
+  const access = await findFamilyAccess(userId, slug);
+  if (access === null) {
+    const body: ApiErrorBody = { message: "Family not found" };
+    res.status(404).json(body);
+    return;
+  }
+
+  req.family = access.family;
+  req.membership = access.membership;
+  next();
+};
+
+/**
+ * The authorisation context, read from the request rather than re-derived.
+ * Throws only when the chain is wired wrong -- an assertion, not a response.
+ */
+export function familyContext(req: Request): {
+  userId: string;
+  family: Family;
+  membership: FamilyMember;
+} {
+  const { authenticatedUserId, family, membership } = req;
+
+  if (!authenticatedUserId || !family || !membership) {
+    throw new Error("Route is missing requireAuth/loadFamily");
+  }
+
+  return {
+    userId: authenticatedUserId,
+    family,
+    membership,
+  };
+}</code></pre>
+          </div>
+
+          <p>
+            Read the two <code>404</code> branches again. They are identical, and that is
+            not duplication to be tidied away — a reviewer who "DRYs" those into one
+            branch per failure reason would reintroduce the oracle. The <em>reason</em> a
+            404 happened must never reach the client.
+          </p>
+        </li>
+
+        <li>
+          <h3>Re-point the route, and retire the old one</h3>
+
+          <div class="file">
+            <span class="file-path">server/src/routes/family.routes.ts (new; delete people.routes.ts)</span>
+            <pre><code>import { Router } from "express";
+import { getFamilyPeople } from "../controllers/people.controller.js";
+
+// Note: no `mergeParams` and no reading of :slug. loadFamily already resolved the
+// family and put it on the request; re-reading the parameter down here would mean
+// a second lookup and a second chance to trust a string.
+export const familyRouter = Router();
+
+familyRouter.get("/people", getFamilyPeople);</code></pre>
+          </div>
+
+          <div class="file">
+            <span class="file-path">server/src/routes/index.ts</span>
+            <pre><code>import { Router } from "express";
+import type { ApiResponse } from "../contracts.js";
+import { requireAuth } from "../middlewares/auth.js";
+import { loadFamily } from "../middlewares/family.js";
+import { authRouter } from "./auth.routes.js";
+import { familyRouter } from "./family.routes.js";
+
+export const apiRouter = Router();
+
+// ---------------------------------------------------------------- public ----
+apiRouter.get("/health", (_req, res) =&gt; {
+  const body: ApiResponse&lt;{ status: "ok" }&gt; = { data: { status: "ok" } };
+  res.status(200).json(body);
+});
+
+apiRouter.use("/auth", authRouter);
+
+// ----------------------------------------------------------------- guard ----
+apiRouter.use(requireAuth);
+
+// ------------------------------------------------------------- protected ----
+// :slug NAMES a family. Naming is not authorising: loadFamily proves the caller
+// belongs to it, or answers 404 as if it did not exist.
+apiRouter.use("/families/:slug", loadFamily, familyRouter);</code></pre>
+          </div>
+
+          <div class="file">
+            <span class="file-path">server/src/controllers/people.controller.ts</span>
+            <pre><code>import type { NextFunction, Request, Response } from "express";
+import type { ApiResponse, PersonResource } from "../contracts.js";
+import { familyContext } from "../middlewares/family.js";
+import { listPeople } from "../services/people.service.js";
+import { toPersonResource } from "../views/person.view.js";
+
+export async function getFamilyPeople(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise&lt;void&gt; {
+  try {
+    // The controller does not name a family and does not read the session. It asks
+    // for the family the request was authorised against -- already proven.
+    const { family } = familyContext(req);
+    const people = await listPeople(family.id);
+
+    const body: ApiResponse&lt;PersonResource[]&gt; = {
+      data: people.map(toPersonResource),
+    };
+
+    res.status(200).json(body);
+  } catch (error) {
+    next(error);
+  }
+}</code></pre>
+          </div>
+
+          <p>
+            <strong>Delete <code>server/src/routes/people.routes.ts</code>.</strong> Two
+            URLs for one collection is two code paths to secure, two to test and two to
+            remember. Once a family is nameable, the session-implied version is
+            redundant, and redundant routes are how audits rot.
+          </p>
+        </li>
+
+        <li>
+          <h3>Registration stops joining a hardcoded family</h3>
+
+          <p>
+            Lesson 04's <code>register</code> looked up the family with
+            <code>slug: "nguyen"</code> — a placeholder that also has a security shape
+            worth naming: if registering into a family were driven by a slug the caller
+            supplied, anybody who guessed a slug could join a family. Registering should
+            therefore create <em>your own</em> family, with you as its owner; joining
+            someone else's family is an invitation problem, and invitations are a later
+            feature.
+          </p>
+
+          <p>
+            That is three inserts that must all succeed or none: a half-created account is
+            worse than a failed request, because a user row with no family can never log
+            in and retrying the same email does not repair it.
+          </p>
+
+          <div class="file">
+            <span class="file-path">server/src/models/user.model.ts</span>
+            <pre><code>import { randomUUID } from "node:crypto";
+import { prisma } from "../config/database.js";
+import type { User as PrismaUser } from "../../generated/prisma/client.js";
+
+export type User = PrismaUser;
+
+export async function findByEmail(email: string): Promise&lt;User | null&gt; {
+  return prisma.user.findUnique({ where: { email } });
+}
+
+export async function findById(
+  id: string,
+): Promise&lt;{ id: string; email: string } | null&gt; {
+  return prisma.user.findUnique({
+    where: { id },
+    select: { id: true, email: true },
+  });
+}
+
+/**
+ * A new account: the user, the family they own, and the membership linking them.
+ *
+ * One transaction, because those three rows are one fact. It lives in the model
+ * rather than the service because a transaction boundary is a data-integrity
+ * boundary and queries belong to this layer -- and because it is currently the
+ * only operation that needs a Prisma transaction handle. When a second one
+ * appears, extract a `Db` type and thread it through the model functions instead
+ * of growing this pattern by hand.
+ */
+export async function createWithOwnedFamily(input: {
+  email: string;
+  passwordHash: string;
+}): Promise&lt;{ user: User; familyId: string }&gt; {
+  const local = input.email.split("@")[0] ?? "family";
+  const base =
+    local.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") ||
+    "family";
+
+  return prisma.$transaction(async (tx) =&gt; {
+    const family = await tx.family.create({
+      data: {
+        // A short random suffix makes the slug unique without a retry loop.
+        slug: `${base}-${randomUUID().slice(0, 6)}`,
+        name: `${local}'s family`,
+      },
+    });
+
+    const user = await tx.user.create({
+      data: { email: input.email, passwordHash: input.passwordHash },
+    });
+
+    await tx.familyMember.create({
+      data: { userId: user.id, familyId: family.id, role: "owner" },
+    });
+
+    return { user, familyId: family.id };
+  });
+}</code></pre>
+          </div>
+
+          <div class="callout">
+            <span class="callout-title">While you are in there: a layering slip to fix</span>
+            <p>
+              Lesson 04's <code>register</code> and <code>login</code> call
+              <code>prisma.user.findUnique</code> directly from the <em>controller</em>,
+              which breaks the rule this project has been holding since lesson 02: the
+              model is the only layer allowed to know how data is stored. Moving those
+              lookups to <code>user.model.ts</code> is not busywork — it is what makes
+              "where do I change a query?" answerable, and it is why
+              <code>findByEmail</code> and <code>findById</code> appeared above.
+            </p>
+          </div>
+
+          <div class="file">
+            <span class="file-path">server/src/controllers/auth.controller.ts (register, new shape)</span>
+            <pre><code>export async function register(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise&lt;void&gt; {
+  try {
+    const { email, password }: { email: string; password: string } = req.body;
+
+    const existing = await userModel.findByEmail(email);
+    if (existing) {
+      res.status(409).json({ message: "Email already registered" });
+      return;
+    }
+
+    const passwordHash = await bcrypt.hash(password, SALT_ROUNDS);
+    const { user } = await userModel.createWithOwnedFamily({ email, passwordHash });
+
+    // Identity only. Which family, and what you may do there, is per request.
+    req.session.userId = user.id;
+
+    res.status(201).json({
+      data: { userId: user.id, email: user.email } satisfies AuthResponse,
+    });
+  } catch (error) {
+    next(error);
+  }
+}</code></pre>
+          </div>
+
+          <p>
+            And in <code>login</code> / <code>whoami</code>: delete every
+            <code>req.session.familyId = …</code> line, and drop <code>familyId</code>
+            from <code>AuthResponse</code> in <code>shared/contracts/auth.ts</code>. A
+            field that no longer has one truthful value cannot be left in the contract,
+            and the client is not built yet, so now is the cheapest moment it will ever
+            be.
+          </p>
+
+          <p>
+            Two smaller consequences of the same change: pull
+            <code>const SALT_ROUNDS = 12;</code> out of the function body, since
+            <code>register</code> and the seed script now both need it, and route
+            <code>login</code> through <code>userModel.findByEmail</code> so no controller
+            touches <code>prisma</code> directly.
+          </p>
+        </li>
+
+        <li>
+          <h3>Seed two families, so the lie is testable</h3>
+
+          <p>
+            You cannot demonstrate "a non-member gets 404" with one family and one user.
+            Add a rival family and a user who belongs only to it.
+          </p>
+
+          <div class="file">
+            <span class="file-path">server/src/scripts/seed.ts (additions)</span>
+            <pre><code>import bcrypt from "bcrypt";
+
+const SALT_ROUNDS = 12;
+const PASSWORD = "correcthorsebatterystaple";
+const passwordHash = await bcrypt.hash(PASSWORD, SALT_ROUNDS);
+
+const nguyen = await prisma.family.upsert({
+  where: { slug: "nguyen" },
+  update: {},
+  create: { slug: "nguyen", name: "Nguyễn" },
+});
+const tran = await prisma.family.upsert({
+  where: { slug: "tran" },
+  update: {},
+  create: { slug: "tran", name: "Trần" },
+});
+
+for (const [email, familyId, role] of [
+  ["an@example.com", nguyen.id, "owner"],
+  ["binh@example.com", tran.id, "member"],
+] as const) {
+  const user = await prisma.user.upsert({
+    where: { email },
+    update: {},
+    create: { email, passwordHash },
+  });
+  await prisma.familyMember.upsert({
+    where: { userId_familyId: { userId: user.id, familyId } },
+    update: { role },
+    create: { userId: user.id, familyId, role },
+  });
+}
+
+console.log(`seeded; every seeded user's password is "${PASSWORD}"`);</code></pre>
+          </div>
+
+          <p>
+            <code>upsert</code> on the composite key keeps the script safe to run twice,
+            which it must be — a seed you are afraid to re-run is a seed nobody trusts.
+          </p>
+        </li>
+
+        <li>
+          <h3>Update the guard check, and watch it earn its keep</h3>
+
+          <div class="file">
+            <span class="file-path">server/src/scripts/checkGuards.ts (excerpt)</span>
+            <pre><code>// A parameterised path cannot be fetched literally. The placeholder works
+// precisely because requireAuth rejects BEFORE the slug is ever used, so the 401
+// does not depend on its value.
+const PROTECTED = ["/api/families/__probe__/people"];</code></pre>
+          </div>
+
+          <p>
+            Run it before you update the list, and notice what happens: the check
+            <strong>fails loudly</strong>, because <code>/api/people</code> now answers
+            <code>404</code> and the check expected <code>401</code>. That is the honest
+            verdict on a hand-written list — brittle, but failing in the safe direction.
+            It is the topic of
+            <a href="../reference/0006-authorisation-chains.html">Reference 06 §6</a>,
+            which answers your question about deriving the list from the router: you
+            cannot, in Express 5, and the measurement is in there.
+          </p>
+        </li>
+
+        <li>
+          <h3>Commit</h3>
+          <pre><code>npm run typecheck &amp;&amp; npm run check:guards
+git add -A
+git commit -m "Replace User.familyId with a family_members relationship; scope /families/:slug"</code></pre>
+        </li>
+      </ol>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Verify</h2>
+
+      <ul class="checklist">
+        <li><code>npm run typecheck</code> exits 0 — the session change ripples into four files.</li>
+        <li>The migration's backfill left <code>COUNT(users) = COUNT(family_members)</code>.</li>
+        <li><code>npm run check:guards</code> prints <code>ok   /api/families/__probe__/people -&gt; 401</code>.</li>
+        <li><code>grep -rn "session.familyId\|familyId: family" server/src</code> returns nothing.</li>
+        <li><code>grep -rn "prisma\." server/src/controllers</code> returns nothing.</li>
+        <li><code>grep -rn "/api/people" server/src</code> returns nothing.</li>
+      </ul>
+
+          <pre><code># 1. No session at all
+curl -si localhost:4000/api/families/nguyen/people | head -1     # 401
+
+# 2. Log in as an owner of nguyen
+curl -si -X POST localhost:4000/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"an@example.com","password":"correcthorsebatterystaple"}' \
+  -c /tmp/an.txt | head -1                                       # 200
+
+curl -s -b /tmp/an.txt localhost:4000/api/families/nguyen/people  # 200 + the Nguyễn people
+
+# 3. Same user, the OTHER family's slug -- and the response must not tell you who exists
+curl -si -b /tmp/an.txt localhost:4000/api/families/tran/people | head -1      # 404
+curl -si -b /tmp/an.txt localhost:4000/api/families/nope/people | head -1      # 404
+# Compare the two bodies. They must be identical. That is the security property.
+
+# 4. Log in as a member of tran and confirm the mirror image
+curl -si -X POST localhost:4000/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"binh@example.com","password":"correcthorsebatterystaple"}' \
+  -c /tmp/binh.txt | head -1                                     # 200
+curl -si -b /tmp/binh.txt localhost:4000/api/families/tran/people   | head -1  # 200
+curl -si -b /tmp/binh.txt localhost:4000/api/families/nguyen/people | head -1  # 404</code></pre>
+
+      <div class="callout win">
+        <span class="callout-title">Steps 3 and 4 are the whole lesson</span>
+        <p>
+          A member gets their own family. A non-member gets the <em>same response</em> as
+          someone asking for a family that does not exist. Your server has stopped
+          answering "does this family exist?" for people it has not authenticated — which
+          is the property no amount of UUIDs or obscurity could have given you.
+        </p>
+      </div>
+
+      <h2>Break it on purpose</h2>
+
+      <ol>
+        <li>
+          Change the not-a-member branch in <code>loadFamily</code> from
+          <code>404</code> to <code>403</code>, restart, and re-run steps 3 and 4. The
+          two responses now differ — and you have built an endpoint that maps every family
+          in KinLink for anyone who holds any account. Revert it, then explain out loud
+          why <code>403</code> is correct for a <em>role</em> failure and wrong for a
+          <em>membership</em> failure.
+        </li>
+        <li>
+          Make the leak real. In <code>membership.service.ts</code>, replace the service
+          call with a family lookup that ignores the membership —
+          <code>prisma.family.findUnique({ where: { slug } })</code> — and return it with a
+          fabricated membership. Predict the response before you run step 3, then run it.
+          You should now receive <strong>another family's people</strong>. This is the
+          exact bug that <code>findMembershipWithFamily</code>'s single
+          <code>where</code> clause makes impossible, and it is worth seeing once, in
+          development, in your own code.
+        </li>
+        <li>
+          Move <code>apiRouter.use("/families/:slug", …)</code> above
+          <code>apiRouter.use(requireAuth)</code>. Predict, then run
+          <code>npm run check:guards</code>. You get a 500 whose message is
+          <code>Route is missing requireAuth</code> — the tripwire from lesson 05, still
+          doing its job one layer down. Now delete the
+          <code>authContext(req)</code> call so the throw cannot fire, and observe what
+          happens to an anonymous request. Which of the two failures would you rather read
+          about in a log?
+        </li>
+        <li>
+          In <code>family.routes.ts</code>, make the handler read
+          <code>req.params.slug</code> directly and log it. It is <code>undefined</code>.
+          Now create the router as <code>Router({ mergeParams: true })</code> and it
+          appears. Explain why you are <em>not</em> going to do that, and what a child
+          router would have to re-do (and re-check) if it read the slug itself.
+        </li>
+        <li>
+          Write down, without looking: why can a <code>404</code> from
+          <code>loadFamily</code> not be replaced by a <code>401</code>? They are both
+          "you cannot have this", and the client would behave almost identically. The
+          answer is about what the two codes tell an attacker, not about the caller's
+          experience.
+        </li>
+      </ol>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Retrieval practice</h2>
+
+      <p>No scrolling back. Answer first, then check.</p>
+
+      <div class="quiz" data-quiz>
+        <script type="application/json">
+          [
+            {
+              "q": "Why must a non-member receive 404 rather than 403?",
+              "options": [
+                "Because a 403 confirms that the family already exists",
+                "Because a 403 is reserved for unauthenticated callers",
+                "Because a 404 prevents the query from reaching the model",
+                "Because a 403 would expose the caller's own family role"
+              ],
+              "answer": 0,
+              "why": "403 says 'this exists and you may not have it', which is true and therefore an enumeration oracle: walking slugs distinguishes existing families from missing ones. A 404 for both cases tells an attacker nothing, and the collapse happens in the service so the middleware cannot leak it."
+            },
+            {
+              "q": "What does the @@unique([userId, familyId]) constraint actually protect?",
+              "options": [
+                "It makes membership one fact instead of several rows",
+                "It stops a user from ever joining more than one family",
+                "It guarantees that a family always keeps one owner role",
+                "It indexes the join table so lookups stay fast enough"
+              ],
+              "answer": 0,
+              "why": "Without it a user accumulates duplicate membership rows and 'what is my role' has an arbitrary answer. A user renting two families is fine and expected; representing the same membership twice is not. The index is a separate line, and ownership is not enforced by a constraint at all."
+            },
+            {
+              "q": "Why does the session now hold only the user id?",
+              "options": [
+                "Because authorisation context depends on the resource named",
+                "Because express-session cannot serialise two string values",
+                "Because the cookie grows past a browser size limit quickly",
+                "Because the family id is no longer unique across the tables"
+              ],
+              "answer": 0,
+              "why": "A value belongs in the session only if it is stable for the session's life. Which family you are acting on changes request to request, so it must be derived each time. Keeping it in the session was a mirror of the old one-family-per-user model."
+            },
+            {
+              "q": "What is loadFamily's async rejection turned into, and by what?",
+              "options": [
+                "A 500, forwarded to the error handler by Express 5 itself",
+                "A 404, because the middleware catches its own failures",
+                "A 503, returned by the Prisma adapter on connection loss",
+                "Nothing, because async middleware needs an explicit catch"
+              ],
+              "answer": 0,
+              "why": "Express 5 forwards a rejected promise from middleware or a handler to the error middleware as if next(err) had been called, so no try/catch is needed. A database failure is a server fault, so 500 is correct; RequestHandler returns unknown, which is why the async signature typechecks at all."
+            },
+            {
+              "q": "Why can findMembershipWithFamily not return an authorised-looking stranger?",
+              "options": [
+                "Because the membership is part of the query's own filter",
+                "Because the service checks the role before returning anything",
+                "Because the slug is a UUID and therefore cannot be guessed",
+                "Because the middleware re-validates the membership afterwards"
+              ],
+              "answer": 0,
+              "why": "There is no code path that fetches a family without the membership condition, so an unjoined family is unrepresentable. Two separate lookups would be two facts, and the security would then depend on somebody remembering to compare them later. The slug being opaque is irrelevant to authorisation."
+            }
+          ]
+        </script>
+      </div>
+
+      <h2>Primary source</h2>
+
+      <div class="callout win">
+        <span class="callout-title">Read this next</span>
+        <p>
+          <a href="https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html"
+            >OWASP — Authorization Cheat Sheet</a
+          >. Read the sections "Deny by Default", "Validate the Permissions on Every
+          Request", "Ensure Lookup IDs are Not Accessible Even When Guessed" and "Prefer
+          Attribute and Relationship Based Access Control over RBAC". It is the document
+          this lesson is a worked example of, and it will tell you which parts of KinLink
+          you have not secured yet.
+        </p>
+        <p>
+          For the status-code semantics, four sentences each:
+          <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-401-unauthorized">RFC 9110 §15.5.2 (401)</a>
+          and <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-403-forbidden">§15.5.4 (403)</a>.
+        </p>
+      </div>
+
+      <div class="prompt">
+        <span class="prompt-title">Ask your teacher</span>
+        <p>
+          Ask me when a 404 becomes the wrong answer too — there is a real argument that
+          for an authenticated member asking about a family they are not in, the honest
+          answer is 403 and the enumeration worry is misplaced. Ask how invitations change
+          registration now that joining someone else's family needs a token. Ask where the
+          last-owner rule goes and what happens when someone tries to leave. And ask me to
+          argue the other side of keeping <code>findMembershipWithFamily</code> as one
+          query: when is two queries actually the better design?
+        </p>
+      </div>
+
+      <footer class="lesson-footer">
+        <p class="next-up">
+          <strong>Next:</strong> Lesson 07 — roles. <code>requireRole</code>, a rank
+          instead of string equality, the 403 that is finally honest, and the last-owner
+          invariant that stops a family from being locked out of itself. Then the client,
+          which finally has a settled API to consume.
+        </p>
+        <p>
+          <a href="../MISSION.md">MISSION.md</a> ·
+          <a href="../ROADMAP.md">ROADMAP.md</a> ·
+          <a href="../GLOSSARY.md">GLOSSARY.md</a> ·
+          <a href="../PROGRESS.md">PROGRESS.md</a> ·
+          <a href="../reference/0006-authorisation-chains.html">Reference 06</a> ·
+          <a href="../reference/0005-auth-mechanics.html">Reference 05</a>
+        </p>
+      </footer>
+    </div>
+
+    <script src="../assets/quiz.js"></script>
+  </body>
+</html>

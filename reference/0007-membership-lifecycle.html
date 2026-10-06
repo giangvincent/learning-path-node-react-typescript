@@ -1,0 +1,439 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Reference 07 — The membership lifecycle</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="lesson-header">
+        <p class="eyebrow">Reference 07 · the four questions lesson 06 raised</p>
+        <h1>Joining, leaving, and the last owner</h1>
+        <p class="lede">
+          Membership looks like a row. It behaves like a lifecycle: people join by
+          invitation, leave by choice, and change what they may do — and every one of
+          those transitions has a state the system must never reach.
+        </p>
+        <div class="meta-row">
+          <span>Used by: <a href="../lessons/0007-roles-and-the-last-owner.html">Lesson 07</a></span>
+          <span>Requires: <a href="../reference/0006-authorisation-chains.html">Reference 06</a></span>
+          <span>Vocabulary: <a href="../GLOSSARY.md">GLOSSARY.md</a></span>
+        </div>
+      </header>
+
+      <h2>1. When <code>404</code> becomes the wrong answer</h2>
+
+      <p>
+        Reference 06 said: a non-member gets <code>404</code>, never <code>403</code>,
+        because a 403 confirms the family exists. That rule is not a law — it is a
+        <strong>decision about who is entitled to know a resource exists</strong>. It
+        becomes the wrong answer in six recognisable situations.
+      </p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Situation</th>
+            <th>Right answer</th>
+            <th>Why 404 is wrong</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>No session at all</td>
+            <td><code>401</code></td>
+            <td>A 404 tells the client "gone" instead of "log in". Different action.</td>
+          </tr>
+          <tr>
+            <td>Inside the family, but not allowed to do <em>this</em></td>
+            <td><code>403</code></td>
+            <td>
+              You already know it exists. Hiding it is a lie that costs you a
+              debuggable error.
+            </td>
+          </tr>
+          <tr>
+            <td>Allowed, but the request conflicts with current state</td>
+            <td><code>409</code></td>
+            <td>
+              "Last owner cannot leave" is not a permission failure. Retrying after
+              adding an owner will succeed.
+            </td>
+          </tr>
+          <tr>
+            <td>Existence is already public</td>
+            <td>Honest status</td>
+            <td>
+              Hiding a public family tree's existence protects nothing and confuses
+              everyone.
+            </td>
+          </tr>
+          <tr>
+            <td>A <em>collection</em> that is legitimately empty</td>
+            <td><code>200</code> + <code>[]</code></td>
+            <td>
+              A family with no people is not a missing family. This is the most common
+              404 bug in REST APIs.
+            </td>
+          </tr>
+          <tr>
+            <td>Yours to debug</td>
+            <td>Distinguish in the log</td>
+            <td>
+              The collapse is for the <em>client</em>. Your server must still record
+              which branch it took.
+            </td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="callout win">
+        <span class="callout-title">The rule underneath all six</span>
+        <p>
+          <strong>Collapse on the wire, distinguish in the logs.</strong> One status
+          code and one body go to the caller; the server logs
+          <code>family_missing</code> versus <code>not_a_member</code>. The security
+          property lives in the response, not in your observability — and a 404 that is
+          also your only signal for a broken slug is a 404 you will spend an afternoon
+          on.
+        </p>
+      </div>
+
+      <p>
+        There is also a genuine argument the other way, worth knowing because an
+        interviewer will raise it: <em>for an authenticated caller</em>, 403 is arguably
+        more honest, and the enumeration risk is smaller than it looks — an attacker
+        needs a valid account, and the family slug is not a secret you can enumerate
+        cheaply if it is not sequential. KinLink chose uniform 404 for
+        <code>:slug</code>. The thing to be able to say is which you chose, why, and
+        that you applied it consistently — not that one is correct.
+      </p>
+
+      <h2>2. Invitations: the token that stands in for membership</h2>
+
+      <p>
+        Lesson 06 closed the join-by-slug hole by making registration create
+        <em>your own</em> family. That leaves exactly one legitimate way into someone
+        else's: a token the family issued to you. An invitation is
+        <strong>a bearer credential for a membership that does not exist yet</strong>,
+        which is why it is designed like a password reset, not like a URL.
+      </p>
+
+      <pre><code>model Invitation {
+  id        String    @id @default(uuid())
+  familyId  String    @map("family_id")
+  role      FamilyRole @default(member)   // never above the inviter's own
+  email     String?                        // set = targeted; null = shareable link
+  tokenHash String    @unique @map("token_hash")  // store the HASH, like a password
+  expiresAt DateTime  @map("expires_at")
+  usedAt    DateTime? @map("used_at")
+  createdBy String    @map("created_by")
+
+  family Family @relation(fields: [familyId], references: [id], onDelete: Cascade)
+
+  @@index([familyId])
+  @@map("invitations")
+}</code></pre>
+
+      <div class="callout warn">
+        <span class="callout-title">Store the hash, not the token</span>
+        <p>
+          The token appears in a URL, which means it lands in browser history, in the
+          email provider's logs, and in any <code>Referer</code> header the destination
+          site sends. Treat it exactly like a password: the server keeps only a hash, so
+          a database leak does not hand over live invitations. The
+          <a href="https://cheatsheetseries.owasp.org/cheatsheets/Forgot_Password_Cheat_Sheet.html"
+            >OWASP Forgot Password Cheat Sheet</a
+          >
+          is the right template — same credential, same rules: "generated using a
+          cryptographically secure random number generator… long enough to protect
+          against brute-force attacks… linked to an individual user… invalidated after
+          they have been used… stored in a secure manner."
+        </p>
+        <p>
+          Two more from the same sheet, both about <em>links</em>: add
+          <code>Referrer-Policy: no-referrer</code> on the page the token lands on (or
+          the token leaks to any third-party asset on that page), and never build the
+          invite URL from the <code>Host</code> header (host-header injection).
+        </p>
+      </div>
+
+      <h3>How it changes registration</h3>
+
+      <p>
+        The important design move is to <strong>not</strong> put the token in the
+        register call. Keep two endpoints:
+      </p>
+
+      <pre><code>POST /api/invitations/:token/accept     // authenticated. Joins the family.
+POST /api/auth/register                 // unchanged: creates your own family</code></pre>
+
+      <p>
+        Why the split matters: the invitee is often <strong>already a user</strong>.
+        Your aunt has an account; she is joining a second family. If accepting an invite
+        were part of registration, the feature would only work for brand-new accounts —
+        the single most common way this gets built wrong. Accept is also where the
+        "you're already in this family" (<code>409</code>) case lives.
+      </p>
+
+      <h3>The part that is genuinely hard: consuming the token once</h3>
+
+      <pre><code>// WRONG: check then write. Two clicks, two memberships.
+const invite = await findInvite(token);
+if (invite.usedAt) return 409;
+await createMembership(...);
+await markUsed(invite.id);
+
+// RIGHT: one conditional write decides. The database arbitrates.
+const claimed = await tx.invitation.updateMany({
+  where: { tokenHash, usedAt: null, expiresAt: { gt: new Date() } },
+  data: { usedAt: new Date() },
+});
+if (claimed.count !== 1) return 409;      // someone else won, or it expired
+
+const membership = await tx.familyMember.create({            // same transaction
+  data: { userId, familyId: invite.familyId, role: invite.role },
+});</code></pre>
+
+      <p>
+        <code>updateMany</code> with <code>usedAt: null</code> in the
+        <code>where</code> is a compare-and-set: MySQL returns the number of rows it
+        actually changed, and <code>count !== 1</code> means you lost the race. Note it
+        also folds the expiry check into the same statement, so an expired invite is
+        indistinguishable from a used one — which is the right amount of information to
+        give a stranger holding a stale link. Both writes share one transaction, so a
+        failure cannot consume the token without creating the membership.
+      </p>
+
+      <h3>Two authorisation rules for invitations</h3>
+
+      <ul>
+        <li>
+          <strong>You cannot mint authority you do not have.</strong> If an
+          <code>admin</code> can create an invite with <code>role: "owner"</code>, the
+          role system is decorative — they promote themselves by proxy. The granted role
+          must be <code>&le;</code> the inviter's rank.
+        </li>
+        <li>
+          <strong>The acceptor's identity comes from the session, never the body.</strong>
+          <code>userId</code> is never a parameter. An invite that names the user it
+          creates is a privilege-escalation gadget.
+        </li>
+      </ul>
+
+      <p>
+        And the reason a targeted invite is <em>allowed</em> to leak existence: the
+        whole point is that the invitee must learn "this family exists and wants you".
+        That is the exception Reference 06 §1 predicted — and it is safe only because
+        the token is what proves the entitlement, not the family's name.
+      </p>
+
+      <h2>3. Leaving, and the last owner</h2>
+
+      <h3>Where the rule goes</h3>
+
+      <p>
+        "A family always has at least one owner" is a <strong>policy about a
+        transition</strong>, so it belongs in the <em>service</em>, checked and written
+        inside <strong>one transaction</strong>. Not the middleware (that is HTTP), not
+        the model (that is facts), and not a database <code>CHECK</code> — MySQL cannot
+        express "at least one row of this kind" as a constraint, and Prisma has no
+        deferred constraints to lean on either.
+      </p>
+
+      <div class="callout warn">
+        <span class="callout-title">Why a transaction is not enough on its own</span>
+        <p>
+          The MySQL manual, on exactly this shape of problem: <em>"If you query data and
+          then insert or update related data within the same transaction, the regular
+          <code>SELECT</code> statement does not give enough protection. Other
+          transactions can update or delete the same rows you just queried."</em> Two
+          owners demoting each other both read <code>count = 2</code>, both write, and
+          the family is left with <strong>zero</strong> owners. Counting is a read; you
+          need the write to be serialised behind it:
+        </p>
+        <pre><code>await tx.$queryRaw`SELECT id FROM families WHERE id = ${familyId} FOR UPDATE`;
+// ...only now is it safe to count owners and then write</code></pre>
+        <p>
+          <code>FOR UPDATE</code> "locks the rows and any associated index entries, the
+          same as if you issued an <code>UPDATE</code> statement for those rows", and the
+          locks release on commit. The second transaction waits, then re-reads a world
+          where only one owner remains, and refuses.
+          (<a href="https://dev.mysql.com/doc/refman/8.0/en/innodb-locking-reads.html">MySQL 8.0 — Locking Reads</a>.)
+        </p>
+      </div>
+
+      <h3>The transitions, and their codes</h3>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Transition</th>
+            <th>Who may</th>
+            <th>Refusal</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Change someone's role</td>
+            <td>Owner</td>
+            <td><code>403</code> if not owner; <code>409</code> if it would remove the last owner</td>
+          </tr>
+          <tr>
+            <td>Demote yourself</td>
+            <td>Owner, if another owner exists</td>
+            <td><code>409</code> — the request is allowed, the state forbids it</td>
+          </tr>
+          <tr>
+            <td>Leave</td>
+            <td>Any member</td>
+            <td><code>409</code> for the last owner, with "transfer ownership first"</td>
+          </tr>
+          <tr>
+            <td>Remove someone else</td>
+            <td>Owner</td>
+            <td><code>409</code> if they are the last owner</td>
+          </tr>
+          <tr>
+            <td>Delete the family</td>
+            <td>Owner, and it cascades</td>
+            <td>—</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p>
+        <strong><code>409</code> and not <code>403</code></strong>, in every "last owner"
+        row. RFC 9110's 409 is the code for a request that "could not be completed due
+        to a conflict with the current state of the target resource"
+        (<a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-409-conflict">§15.5.10</a>).
+        The caller in these rows <em>is</em> permitted — the state is not ready. That is
+        the difference between "you may never" and "not like this, not now", and it is
+        the difference between a client that shows an error and one that offers to
+        transfer ownership.
+      </p>
+
+      <h3>What happens to the data when someone leaves</h3>
+
+      <p>
+        The membership row is deleted; the person's <em>content</em> is not. That is not
+        an oversight — it falls out of the data model:
+      </p>
+
+      <ul>
+        <li>
+          <strong><code>Person.familyId</code> has no <code>createdBy</code>.</strong> A
+          genealogy record belongs to the family, not to the account that typed it. So
+          there is nothing to reassign and no orphan to chase. If you later add
+          <code>createdBy</code> for attribution, you inherit a policy question that this
+          schema currently cannot ask.
+        </li>
+        <li>
+          <strong>The session is already safe.</strong> It holds only
+          <code>userId</code>, so there is no cached <code>familyId</code> to invalidate.
+          This is lesson 06's "identity in the session, authorisation per request"
+          paying off — the leave is a one-row delete with no session surgery.
+        </li>
+        <li>
+          <strong>Make leave idempotent.</strong> Deleting a membership that is already
+          gone should answer <code>204</code>, not <code>404</code>: the caller's intent
+          ("I am not in this family") is satisfied either way. After that, any further
+          request to <code>/families/:slug/…</code> answers <code>404</code> because
+          <code>loadFamily</code> no longer finds a membership — consistent, and no
+          special case.
+        </li>
+        <li>
+          <strong>An empty family is a policy question.</strong> If the last non-owner
+          leaves, the family is unreachable but intact. Deleting it destroys
+          <code>Person</code> rows through the cascade — which for a genealogy product is
+          data loss, not cleanup. Leave it dormant.
+        </li>
+      </ul>
+
+      <h2>4. When two queries beat one</h2>
+
+      <p>
+        <code>findMembershipWithFamily</code> is one query on purpose: it makes an
+        unauthorised family <em>unrepresentable</em>. But that is a specific goal, not a
+        universal virtue. It is the wrong shape when:
+      </p>
+
+      <ul>
+        <li>
+          <strong>You need to tell the two failures apart.</strong> This is the direct
+          inversion, and it is legitimate: an admin console must report "no such family"
+          versus "you are not a member", because the operator is entitled to know and the
+          leak is not a leak. Two queries — or one query plus a typed reason — is
+          correct there. The collapse in Reference 06 is a <em>client-facing</em>
+          decision; it is not a property of the database.
+        </li>
+        <li>
+          <strong>The two facts have different lifetimes.</strong> A family's name
+          changes yearly; a membership changes rarely; a person's profile changes daily.
+          One join forces one cache entry with the shortest TTL. Split queries let you
+          cache the expensive, stable parts (and skip the membership round trip entirely
+          for a minute) while the hot data stays uncached.
+        </li>
+        <li>
+          <strong>You are reading many families, not one.</strong> "One query" is not the
+          rule — <strong>a number of queries proportional to the page, not to the
+          rows</strong> is. A dashboard showing 20 families should be one
+          <code>findMany({ where: { userId, familyId: { in: ids } } })</code>, not 20
+          joins. That is how you avoid N+1 without contorting the shape.
+        </li>
+        <li>
+          <strong>You are about to write.</strong> The read-only join is the wrong tool
+          once you need the row <em>locked</em>. You fetch the membership, lock the
+          family, re-read, then act — deliberately several statements, because each has a
+          different job.
+        </li>
+        <li>
+          <strong>The join has no natural key.</strong> Joining through
+          <code>family.slug</code> costs an extra join or subquery. If the URL carried a
+          <code>familyId</code> (or a cached slug→id map), two lookups would be cheaper
+          and simpler.
+        </li>
+      </ul>
+
+      <div class="callout">
+        <span class="callout-title">What the one query really buys</span>
+        <p>
+          <strong>Unrepresentability, not speed.</strong> It is worth its cost only
+          because this codebase has <em>no other enforcement point</em> — nothing else
+          guarantees that a family is fetched together with its membership. Add a scoped
+          repository, a Postgres row-level-security policy, or a lint rule that forbids
+          exporting a family-fetching function from anywhere but
+          <code>membership.model.ts</code>, and two queries become perfectly fine. The
+          invariant is "there is exactly one door to a family, and it needs the
+          membership" — the single query is just today's cheapest way to build that door.
+        </p>
+      </div>
+
+      <div class="callout win">
+        <span class="callout-title">Primary sources</span>
+        <p>
+          <a href="https://dev.mysql.com/doc/refman/8.0/en/innodb-locking-reads.html"
+            >MySQL 8.0 — Locking Reads</a
+          >
+          (read the counter example: it is the last-owner problem word for word) ·
+          <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-409-conflict">RFC 9110 §15.5.10 — 409 Conflict</a>
+        </p>
+        <p>
+          <a href="https://cheatsheetseries.owasp.org/cheatsheets/Forgot_Password_Cheat_Sheet.html"
+            >OWASP — Forgot Password</a
+          >
+          (the token rules and the no-referrer / host-header warnings) ·
+          <a href="https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html"
+            >OWASP — Authorization</a
+          >
+        </p>
+      </div>
+
+      <footer class="lesson-footer">
+        <p>Reference docs are meant to be argued with. If a rule here is wrong, say so.</p>
+      </footer>
+    </div>
+  </body>
+</html>

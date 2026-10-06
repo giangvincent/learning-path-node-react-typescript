@@ -1,0 +1,467 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Reference 06 — Authorisation</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="lesson-header">
+        <p class="eyebrow">Reference 06 · the questions lessons 06–07 answer</p>
+        <h1>Chains, codes and roles</h1>
+        <p class="lede">
+          Authentication asks <em>who are you</em>. Authorisation asks <em
+            >what may you do to this particular thing</em
+          >
+          — and the second question has three distinct wrong answers, each with its own
+          status code. This is the compressed version of the four questions asked at the
+          end of lesson 05.
+        </p>
+        <div class="meta-row">
+          <span>Used by: <a href="../lessons/0006-who-may-see-this-family.html">Lesson 06</a></span>
+          <span>Requires: <a href="../reference/0005-auth-mechanics.html">Reference 05</a></span>
+          <span>Vocabulary: <a href="../GLOSSARY.md">GLOSSARY.md</a></span>
+        </div>
+      </header>
+
+      <h2>1. 401, 403, 404 — one code per question</h2>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Question the server asked</th>
+            <th>Answer</th>
+            <th>Whose fault</th>
+            <th>Client does</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>"Who are you?" — and there was no answer</td>
+            <td><code>401</code></td>
+            <td>Caller's</td>
+            <td>Show the login form</td>
+          </tr>
+          <tr>
+            <td>"Who are you?" — answered, and there is no such family</td>
+            <td><code>404</code></td>
+            <td>Caller's</td>
+            <td>Show "not found"</td>
+          </tr>
+          <tr>
+            <td>"Who are you?" — answered, family exists, you are not in it</td>
+            <td><strong><code>404</code></strong></td>
+            <td>Caller's</td>
+            <td>Show "not found"</td>
+          </tr>
+          <tr>
+            <td>Member, but not allowed to do <em>this</em></td>
+            <td><code>403</code></td>
+            <td>Caller's</td>
+            <td>Show "no permission" — <em>do not</em> log out</td>
+          </tr>
+          <tr>
+            <td>"This should be impossible"</td>
+            <td><code>500</code></td>
+            <td><strong>Ours</strong></td>
+            <td>Page an engineer</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="callout warn">
+        <span class="callout-title">Why "not a member" is a 404 and not a 403</span>
+        <p>
+          A <code>403</code> says <em>"this exists, and you may not have it"</em>. That is
+          a true sentence, and it is an <strong>enumeration oracle</strong>: an attacker
+          walking <code>/api/families/nguyen</code>, <code>/api/families/tran</code>,
+          <code>/api/families/phan</code> can tell "exists but not mine" (403) from
+          "doesn't exist" (404) and map your customer list without ever being let in.
+        </p>
+        <p>
+          OWASP's
+          <a href="https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html"
+            >Authorization Cheat Sheet</a
+          >
+          asks the question directly: for a rejected lookup, "will the failure simply be
+          the result of the account not existing, or will it be due to a failed access
+          control check?" If a stranger can tell those apart, you have leaked.
+        </p>
+      </div>
+
+      <p>
+        So the third row and the second row are <strong>deliberately identical</strong> —
+        same status, same body, same timing shape. That is not sloppiness; it is the
+        entire security property. The way to guarantee it is to make the two cases
+        <em>indistinguishable in code</em>, so nobody can accidentally separate them
+        later:
+      </p>
+
+      <pre><code>// The WRONG shape: two facts, and someone must remember to compare them.
+const family = await findFamilyBySlug(slug);        // returns a family it should not have
+const membership = await findMembership(userId, family.id);
+if (!membership) return res.sendStatus(403);        // ← and now the leak is a typo away
+
+// The RIGHT shape: one query that cannot answer without the membership.
+const membership = await prisma.familyMember.findFirst({
+  where: { userId, family: { slug } },              // the join IS the authorisation
+  include: { family: true },
+});
+if (membership === null) return null;               // "no such family" and "not yours"
+                                                    // are the same return value</code></pre>
+
+      <p>
+        The second version collapses both failures into one <code>null</code> inside the
+        <em>service</em>, so the middleware that turns <code>null</code> into a response
+        has nothing left to leak. You cannot tell the difference because the difference no
+        longer exists in your program. This is the same move as lesson 03's required
+        <code>familyId</code> argument: make the insecure version unrepresentable rather
+        than remembered.
+      </p>
+
+      <h3>Order is a security property</h3>
+
+      <p>
+        The checks must run <strong>most-general first</strong>: session → family exists →
+        membership → role. Swap membership and role and a non-member with an unprivileged
+        role receives a <code>403</code> — which is exactly the oracle above. A chain is
+        not a bag of guards; its <em>order</em> carries meaning.
+      </p>
+
+      <h2>2. Deny by default, and what the chain looks like</h2>
+
+      <p>
+        OWASP: "one should not rely entirely on explicitly defined rules for matching all
+        possible requests. For security purposes an application should be configured to
+        deny access by default", and permission checks should "allow for global,
+        application-wide configuration rather than needing to be applied individually to
+        every method or class." That is lesson 05's guard line, extended to a chain:
+      </p>
+
+      <pre><code>apiRouter.use("/auth", authRouter);        // public, on purpose
+
+apiRouter.use(requireAuth);                // identity from here down
+
+apiRouter.use(
+  "/families/:slug",
+  loadFamily,                              // slug → req.family + req.membership, or 404
+  familyRouter,                            // GET /people
+);
+
+// later, inside familyRouter, where a role is genuinely needed:
+familyRouter.patch("/", requireRole("admin"), renameFamily);</code></pre>
+
+      <h3>Resolve once, at the boundary</h3>
+
+      <p>
+        <code>loadFamily</code> reads <code>req.params.slug</code> <em>once</em> and leaves
+        <code>req.family</code> and <code>req.membership</code> behind. Nothing downstream
+        re-reads the raw parameter, so nothing downstream needs a second database query,
+        and nothing downstream can be tempted to trust the string.
+      </p>
+
+      <div class="callout">
+        <span class="callout-title">The <code>mergeParams</code> trap (measured)</span>
+        <p>
+          A parameter on a mount path is visible to middleware on that mount, but
+          <strong>not</strong> to the mounted router unless you opt in:
+        </p>
+        <pre><code>api.use("/families/:slug", mw, familyRouter)
+
+mw saw slug = "nguyen"                    // ✓ mount middleware sees it
+familyRouter.get("/people", …)            // ✗ req.params.slug === undefined
+express.Router({ mergeParams: true })     // ✓ then it is "nguyen"</code></pre>
+        <p>
+          Verified against Express 5.2.1. It is a real trap — but the better answer is not
+          <code>mergeParams</code>, it is to read <code>req.family</code>. A child router
+          that re-reads the slug is duplicating the lookup, not improving the design.
+        </p>
+      </div>
+
+      <h2>3. What belongs in the session: identity, not authorisation</h2>
+
+      <p>
+        Lesson 04 put <code>familyId</code> in the session alongside <code>userId</code>.
+        That was a mirror of the old data model, where a user had exactly one family — and
+        it silently became a bug the moment a user could have two.
+      </p>
+
+      <pre><code>// Session: WHO you are. Stable for the life of the session.
+req.session.userId = user.id;
+
+// Per request: WHAT you may do. Derived from the resource you named.
+req.authenticatedUserId
+req.family          // resolved from :slug + membership
+req.membership      // includes .role</code></pre>
+
+      <p>
+        The test is simple: <strong>if a value depends on which resource is being
+        requested, it cannot live in the session.</strong> Authorisation context belongs
+        to the request, because it changes from request to request — the same logged-in
+        person may be an owner of one family and a plain member of another. Put identity
+        in the session, derive authorisation every time.
+      </p>
+
+      <h2>4. Roles: 403 arrives</h2>
+
+      <p>
+        <code>403</code> only becomes available once the caller is known to be inside the
+        boundary. Then a role check is honest and actionable: <em>"you are in this family,
+        and this action is not yours."</em>
+      </p>
+
+      <pre><code>export const ROLE_RANK = { member: 1, admin: 2, owner: 3 } as const;
+export type Role = keyof typeof ROLE_RANK;
+
+/** "admin" means admin or above — never a list you can forget to extend. */
+export const requireRole = (min: Role): RequestHandler = (req, res, next) =&gt; {
+  const { membership } = familyContext(req);
+  if (ROLE_RANK[membership.role] &lt; ROLE_RANK[min]) {
+    res.status(403).json({ message: "Insufficient role" } satisfies ApiErrorBody);
+    return;
+  }
+  next();
+};</code></pre>
+
+      <div class="callout">
+        <span class="callout-title">Rank, not string equality</span>
+        <p>
+          <code>membership.role === "owner"</code> forces every call site to enumerate the
+          roles above it, and someone will write
+          <code>["owner", "admin"]</code> and forget <code>admin</code> when a new role
+          lands between them. A rank map makes "or above" a comparison, so adding a role
+          cannot silently narrow or widen an existing check.
+        </p>
+      </div>
+
+      <h3>Where the role lives, and why</h3>
+
+      <p>
+        The role belongs to the <strong>relationship</strong>, not to the user and not to
+        the family: <code>family_members(user_id, family_id, role)</code>. Same person,
+        owner here and member there. This is exactly the model OWASP now recommends over
+        plain RBAC — <em>relationship</em>-based access control, where access derives from
+        the relationship between a subject and a resource and "role" is merely one
+        attribute of that relationship. KinLink is a ReBAC product wearing an RBAC
+        costume; say it that way in an interview.
+      </p>
+
+      <p>Two constraints do the real work:</p>
+
+      <ul>
+        <li>
+          <strong><code>@@unique([userId, familyId])</code></strong> — membership is one
+          fact, not a set of rows. Without it, a user acquires three memberships, two of
+          them stale, and "what is my role" becomes a query with an arbitrary answer.
+        </li>
+        <li>
+          <strong>The last-owner invariant</strong> — you must not be able to demote or
+          remove the final owner, or the family becomes permanently unmanageable. That is
+          a business rule enforced inside a transaction (count owners, refuse if one),
+          not a hope. It is also the answer to "where do transactions matter here?"
+        </li>
+      </ul>
+
+      <p>
+        And the rule that never changes: <strong>the client never sends its own role, and
+        never sends a <code>familyId</code> it expects to be trusted.</strong> The URL may
+        <em>name</em> a family; only the membership row may <em>authorise</em> it.
+      </p>
+
+      <h2>5. When the exception case is a bug: throw or respond?</h2>
+
+      <p>
+        This is the question that is hardest to answer by intuition, so state it as a rule:
+      </p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Situation</th>
+            <th>Nature</th>
+            <th>Do</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>No session cookie</td>
+            <td>Expected. Users log out, cookies expire.</td>
+            <td><code>401</code>, written deliberately in <code>requireAuth</code></td>
+          </tr>
+          <tr>
+            <td>Not a member of the named family</td>
+            <td>Expected. Also a possible attack.</td>
+            <td><code>404</code>, written deliberately in <code>loadFamily</code></td>
+          </tr>
+          <tr>
+            <td>A protected route reached a controller with no auth context</td>
+            <td><strong>Impossible if the wiring is right. It is our bug.</strong></td>
+            <td><code>throw</code> — an assertion, not a response</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <pre><code>export function familyContext(req: Request): { userId: string; family: Family; membership: FamilyMember } {
+  const { authenticatedUserId, family, membership } = req;
+  if (!authenticatedUserId || !family || !membership) {
+    // Unreachable when the chain is correct. It is a tripwire for a wiring bug,
+    // which is why it is a 500 and not a 401: 401 would blame the caller and hide
+    // the defect, and defaulting to some family would serve the wrong rows quietly.
+    throw new Error("Route is missing requireAuth/loadFamily");
+  }
+  return { userId: authenticatedUserId, family, membership };
+}</code></pre>
+
+      <p>
+        You have already written this exact pattern once, in
+        <code>client/src/main.tsx</code>: <code>if (!container) throw new Error("Missing #root
+        element")</code>. An impossible state made loud is not defensive programming — it
+        is <strong>documentation that runs</strong>. The refinement in Express is knowing
+        where the throw lands:
+      </p>
+
+      <ul>
+        <li>
+          A <strong>synchronous</strong> throw inside a handler or middleware is caught by
+          Express and forwarded as <code>next(err)</code>.
+        </li>
+        <li>
+          A <strong>rejected promise</strong> from an <code>async</code> middleware is
+          also forwarded automatically in Express 5 — "those errors will be passed to the
+          error handler as if calling <code>next(err)</code>"
+          (<a href="https://expressjs.com/en/guide/migrating-5.html">Express 5 migration guide</a>).
+          No <code>try/catch</code> wrapper needed, and
+          <code>RequestHandler</code> returns <code>unknown</code>, so an
+          <code>async</code> middleware typechecks.
+        </li>
+        <li>
+          Either way it meets <code>errorHandler</code>, which answers
+          <code>500</code> — with a precise message in development and a generic one in
+          production. Loud where you can act, silent where you cannot. That is the right
+          split, and it is the reason <code>errorHandler</code> gates on
+          <code>NODE_ENV</code>.
+        </li>
+      </ul>
+
+      <div class="callout win">
+        <span class="callout-title">The one-line version</span>
+        <p>
+          <strong>Expected outcomes get a status code. Impossible states get an
+          exception.</strong> A <code>401</code> hides a wiring bug behind a login form; a
+          <code>throw</code> turns it into a 500 with your own message in it. And if you
+          are ever tempted to "just pick a family" instead — that is the data leak, wearing
+          a helpful face.
+        </p>
+      </div>
+
+      <h2>6. Deriving the guard list from the router — the honest answer</h2>
+
+      <p>
+        You asked how to derive <code>checkGuards.ts</code>'s <code>PROTECTED</code> array
+        from the router instead of maintaining it by hand. The instinct is right, the
+        mechanism does not exist in Express 5 — and this was measured, not assumed:
+      </p>
+
+      <pre><code>$ npx tsx probe.ts          # express 5.2.1, one nested router
+
+route   /health  [get]
+router  path=undefined
+   route   /login  [post]
+mw      name="requireAuth"
+router  path=undefined
+   route   /  [get]
+
+# and the layer itself:
+own keys : handle, keys, name, params, path, slash, matchers, route
+path     : undefined          ← for routes AND for mounts
+keys     : []
+regexp   : undefined          ← Express 4 had this; 5 does not</code></pre>
+
+      <p>
+        <code>layer.route.path</code> is recoverable for a declared route, so you can
+        enumerate a <em>router's own</em> routes. The <strong>mount path is not</strong>:
+        it now lives in an opaque <code>matchers</code> structure. Which means you can
+        list <code>/people</code> and <code>/login</code>, but you cannot reconstruct
+        <code>/api/families/:slug/people</code> — and the guards you care about are mounted
+        in a <em>different</em> router (<code>routes/index.ts</code>) from the routes
+        themselves (<code>routes/family.routes.ts</code>), so "which guards apply here"
+        requires exactly the flattening you cannot do. Libraries that offer this feature
+        read the same internals and inherit the same fragility.
+      </p>
+
+      <p>So make the route table the source of truth instead:</p>
+
+      <pre><code>export interface RouteDefinition {
+  method: "get" | "post" | "patch" | "delete";
+  path: string;                 // full path: "/families/:slug/people"
+  isPublic?: boolean;           // absent ⇒ protected. Deny by default.
+  guards?: RequestHandler[];    // extra guards, after requireAuth
+  handler: RequestHandler;
+}
+
+// one loop mounts them, and the same array answers the audit question
+export const ROUTES: RouteDefinition[] = [ /* … */ ];
+
+for (const route of ROUTES) {
+  const chain = route.isPublic ? [] : [requireAuth, ...(route.guards ?? [])];
+  apiRouter[route.method](route.path, ...chain, route.handler);
+}</code></pre>
+
+      <p>
+        Then the checker iterates <code>ROUTES</code> — the same list that built the app —
+        and asserts the invariant that actually matters:
+        <strong
+          >every route without <code>isPublic</code> answers <code>401</code> to an
+          unauthenticated request.</strong
+        >
+        A newly added route is covered automatically, so the list cannot go stale. That
+        is the real gain: not cleverness, <em>coverage</em>.
+      </p>
+
+      <div class="callout">
+        <span class="callout-title">Two honest caveats</span>
+        <p>
+          <strong>Parameterised paths cannot be fetched literally.</strong> You cannot
+          request <code>/families/:slug/people</code>. Substitute a placeholder —
+          <code>/families/__probe__/people</code> — which works precisely because
+          <code>requireAuth</code> rejects <em>before</em> the slug is ever used, so the
+          401 does not depend on the parameter's value. The moment you need to assert
+          something deeper than 401, you need a real fixture, and the route table alone is
+          no longer enough.
+        </p>
+        <p>
+          <strong>A hand-written list is not dangerous, only annoying.</strong> When
+          <code>/api/people</code> was retired, the stale entry made the check fail loudly
+          (404 ≠ 401) rather than pass silently. Safety comes from deny-by-default and the
+          tripwire; the table buys convenience and coverage. Know which of the two you are
+          buying before you pay for it — with three routes it is not worth it yet; with
+          fifteen it is.
+        </p>
+      </div>
+
+      <div class="callout win">
+        <span class="callout-title">Primary sources</span>
+        <p>
+          <a href="https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html"
+            >OWASP — Authorization Cheat Sheet</a
+          >
+          (deny by default; validate on every request; lookup ids and enumeration; ReBAC
+          over RBAC; test the logic) ·
+          <a href="https://owasp.org/Top10/A01_2021-Broken_Access_Control/">OWASP Top 10 A01 — Broken Access Control</a>
+        </p>
+        <p>
+          <a href="https://expressjs.com/en/guide/migrating-5.html">Express 5 — migration guide</a>
+          (rejected promises; <code>req.params</code> changes) ·
+          <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-403-forbidden">RFC 9110 §15.5.4 — 403</a> ·
+          <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-401-unauthorized">§15.5.2 — 401</a>
+        </p>
+      </div>
+
+      <footer class="lesson-footer">
+        <p>Reference docs are meant to be argued with. If a rule here is wrong, say so.</p>
+      </footer>
+    </div>
+  </body>
+</html>

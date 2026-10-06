@@ -1,0 +1,582 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Reference 08 — Races, locks, and refusals a client can act on</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="lesson-header">
+        <p class="eyebrow">Reference 08 · the five questions lesson 07 raised</p>
+        <h1>Races, locks, and refusals a client can act on</h1>
+        <p class="lede">
+          All five questions are one question seen from five sides:
+          <strong>when two requests collide, who decides?</strong> The scheduler,
+          the database, the API shape, the data model, or the client. Each answer
+          below says who decides, and why the alternatives decide worse.
+        </p>
+        <div class="meta-row">
+          <span>Used by: <a href="../lessons/0008-transfer-ownership-and-the-race-window.html">Lesson 08</a></span>
+          <span>Requires: <a href="../reference/0007-membership-lifecycle.html">Reference 07</a></span>
+          <span>Vocabulary: <a href="../GLOSSARY.md">GLOSSARY.md</a></span>
+        </div>
+      </header>
+
+      <h2>1. Fire the race on demand, don't wait for it</h2>
+
+      <p>
+        A <strong>race window</strong> is the gap between reading a fact your
+        decision depends on and writing the decision: <em>count the owners</em>
+        → <em>write the demotion</em>. If another transaction can change that
+        fact inside the gap, your decision can be made on a world that no longer
+        exists. That is a <strong>lost update</strong>, and it is invisible until
+        two requests happen to collide inside the window.
+      </p>
+
+      <p>
+        Lesson 07's check fired both demotions with <code>Promise.all</code> and
+        hoped the scheduler would land them in the window. The industry name for
+        that is sampling: every run rolls the dice on thread timing. The
+        alternative is to <strong>construct the losing interleaving</strong> so
+        the bug's precondition is guaranteed, not lucky. Arkency's write-up of
+        exactly this problem states the acceptance rule in one line:
+        <em>"Write a test that FAILS without the lock and PASSES with it."</em>
+        And its warning against the obvious fix is worth quoting too:
+        <em>"Adding sleep statements makes it worse — slower and flaky."</em>
+      </p>
+
+      <h3>The two pieces: a seam and a gate</h3>
+
+      <p>
+        Michael Feathers' definition, as quoted in the same post: <em>"A seam is
+        a place where you can alter behavior in your program without editing in
+        that place."</em> You need one at the race window — between the count and
+        the write — and a <strong>gate</strong> to park inside it. A gate is two
+        promises: one reports arrival, one releases:
+      </p>
+
+      <pre><code>function gate() {
+  let arrive!: () =&gt; void;
+  let open!: () =&gt; void;
+  const arrived = new Promise&lt;void&gt;((resolve) =&gt; (arrive = resolve));
+  const opened = new Promise&lt;void&gt;((resolve) =&gt; (open = resolve));
+  return {
+    afterCount: async () =&gt; {
+      arrive();
+      await opened;
+    },
+    arrived,
+    open: () =&gt; open(),
+  };
+}</code></pre>
+
+      <p>
+        Then the test plays the collision like a score, and the order is always
+        the same:
+      </p>
+
+      <ol>
+        <li>t1 runs to the seam — it has <em>counted</em> but not written — and parks.</li>
+        <li>t2 runs toward the same seam. If it arrives, both transactions have
+          now decided on the same stale fact. This is the losing interleaving,
+          guaranteed.</li>
+        <li>Release both. Both write. Observe the damage.</li>
+        <li>With the lock in place, step 2 can never complete: t2 is blocked
+          before it can count. Assert exactly that.</li>
+      </ol>
+
+      <h3>Measured on this machine (session 8, KinLink's own service)</h3>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Choreography</th>
+            <th>Lock</th>
+            <th>t2 in window</th>
+            <th>t2 counted</th>
+            <th>Refused</th>
+            <th>Owners left</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>forced</td>
+            <td>none</td>
+            <td>yes</td>
+            <td>2</td>
+            <td>0</td>
+            <td><strong>0</strong></td>
+          </tr>
+          <tr>
+            <td>forced</td>
+            <td>first, before the reads</td>
+            <td>no</td>
+            <td>1</td>
+            <td>1</td>
+            <td>1</td>
+          </tr>
+          <tr>
+            <td>forced</td>
+            <td>late, after the count</td>
+            <td>yes</td>
+            <td>2</td>
+            <td>0</td>
+            <td><strong>0</strong></td>
+          </tr>
+          <tr>
+            <td>Promise.all × 20</td>
+            <td>none</td>
+            <td>—</td>
+            <td>—</td>
+            <td>—</td>
+            <td>bug in 20/20</td>
+          </tr>
+          <tr>
+            <td>Promise.all × 20</td>
+            <td>first</td>
+            <td>—</td>
+            <td>—</td>
+            <td>—</td>
+            <td>bug in 0/20</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="callout">
+        <span class="callout-title">What the table says about "hope"</span>
+        <p>
+          Look at the fourth row honestly: <code>Promise.all</code> caught the bug
+          20/20 here. That is <em>not</em> a defence of it. Arkency ran the same
+          technique against their race and it caught <em>nothing</em> — "it simply
+          didn't match the right timing for the race condition to take place."
+          Same technique, two machines, two answers: that is what schedule
+          dependence means. The forced rows never depend on a schedule — the bug
+          is either constructed or excluded, and the answer is the same on every
+          machine, every run. A regression test must fail for the code's sake,
+          never for the scheduler's.
+        </p>
+      </div>
+
+      <h3>The seam's price, named</h3>
+
+      <p>
+        The seam must live somewhere, and every option costs something:
+      </p>
+
+      <ul>
+        <li>
+          <strong>An explicit hook</strong> (<code>changeRole(input, window?)</code>
+          — KinLink's choice). The production signature carries one testing
+          concern; the hook is typed, visible, and inert when unused.
+        </li>
+        <li>
+          <strong>Dependency injection</strong> — Arkency's choice: the code
+          already had a seam (an injected projection), so the test stubbed it and
+          production stayed untouched: "No test hooks, no debug flags, no
+          conditional logic." Free only when a seam already exists.
+        </li>
+        <li>
+          <strong>A mutable test hook</strong> (a module-level <code>setGate()</code>).
+          No signature changes, but a hidden global that production could trip
+          over. The worst of the three for the smallest saving.
+        </li>
+      </ul>
+
+      <p>
+        The trajectory past all three is <strong>systematic concurrency
+        testing</strong>: Microsoft Research's CHESS "systematically drives the
+        test along all possible thread interleavings" of a scenario instead of
+        hand-picking one, and at the far end FoundationDB simulates whole
+        clusters deterministically because <em>"Determinism is crucial in that it
+        allows perfect repeatability of a simulated run, facilitating controlled
+        experiments to home in on issues."</em> One seam and one gate is the
+        two-dollar version of the same idea: you decide the schedule.
+      </p>
+
+      <h2>2. <code>FOR UPDATE</code> or an isolation level?</h2>
+
+      <p>
+        Both tools make check-then-write safe. They differ in scope, and the
+        scope decides this one.
+      </p>
+
+      <table>
+        <thead>
+          <tr>
+            <th></th>
+            <th><code>SELECT … FOR UPDATE</code></th>
+            <th>Isolation level <code>SERIALIZABLE</code></th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Scope</td>
+            <td>One statement, the rows it names</td>
+            <td>Every plain <code>SELECT</code> in every transaction</td>
+          </tr>
+          <tr>
+            <td>Where it lives</td>
+            <td>At the call site that needs it</td>
+            <td>Connection or server configuration</td>
+          </tr>
+          <tr>
+            <td>Failure mode when two collide</td>
+            <td>The second waits, re-reads, and <strong>refuses with 409</strong></td>
+            <td>Locks escalate; one transaction likely <strong>dies with a deadlock error</strong></td>
+          </tr>
+          <tr>
+            <td>What it costs</td>
+            <td>Wait time on one family's ownership ops</td>
+            <td>Read paths take locks too; throughput and deadlock rate move</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p>
+        The manual on what <code>SERIALIZABLE</code> actually does:
+        <em>"This level is like REPEATABLE READ, but InnoDB implicitly converts
+        all plain SELECT statements to SELECT … FOR SHARE if autocommit is
+        disabled"</em> — and when to reach for it: <em>"used mainly in specialized
+        situations, such as with XA transactions and for troubleshooting issues
+        with concurrency and deadlocks."</em> Every read in the application —
+        the people list included — would start taking shared locks. Two
+        transactions that both read and then write the same rows then hold S
+        locks and ask for X locks on the rows the other holds: the textbook
+        upgrade deadlock.
+      </p>
+
+      <div class="callout warn">
+        <span class="callout-title">A labelled prediction, offered as an exercise</span>
+        <p>
+          Run the forced check under <code>SERIALIZABLE</code> and predict the
+          output first: the invariant should <em>survive</em> (one transaction is
+          rolled back) but as a <strong>deadlock error</strong> (MySQL 1213), not
+          a 409. The lock version answers the caller; the isolation version kills
+          the request and asks you to build retries. This session did not measure
+          it — treat it as a prediction until you have looked.
+        </p>
+      </div>
+
+      <h3>The counter-case, from the manual itself</h3>
+
+      <p>
+        The same page warns against exactly the pattern lesson 07 wrote:
+        <em>"It is not recommended to mix locking statements … with non-locking
+        SELECT statements in a single REPEATABLE READ transaction, because
+        typically in such cases you want SERIALIZABLE."</em> Non-locking reads
+        see a snapshot; locking statements see the present. KinLink does
+        both — a locking read of the <code>families</code> row, then plain reads
+        of <code>family_members</code>. Why it is nonetheless sound here was
+        <strong>measured</strong>, not argued (row 2 of the table): t2's plain
+        count read <strong>1</strong>, the committed world, because the snapshot
+        is established at the transaction's first consistent read — which, with
+        the lock taken <em>before</em> it, happens only after serialization. The
+        third row is the other half of the proof: move the lock after the count
+        and the same plain reads decide on the stale world again (counted 2).
+      </p>
+
+      <div class="callout win">
+        <span class="callout-title">The rule underneath</span>
+        <p>
+          <strong>The lock protects the read, not the write.</strong> The pattern
+          is <em>lock → read → decide → write</em> and the ordering is the
+          protection: the decision must be made from a snapshot created after
+          serialization. A <code>FOR UPDATE</code> placed after the check is
+          decoration. And the pattern rests on one discipline: every writer of
+          ownership-relevant rows takes the same lock first — seed scripts and
+          future endpoints included. The moment a writer skips it, the manual's
+          warning applies and <code>SERIALIZABLE</code> becomes the honest answer.
+        </p>
+      </div>
+
+      <p>
+        So: <strong><code>FOR UPDATE</code> + the default REPEATABLE READ is the
+        right tool here</strong> — one row lock at one site, a refusal the client
+        can act on, and read paths that never block. <code>SERIALIZABLE</code> is
+        the systemic guarantee for when many sites need check-then-write and you
+        cannot trust each author to remember the locking read. For waits you
+        refuse to take, the manual's other two knobs (covered in Reference 07):
+        <code>NOWAIT</code> and <code>SKIP LOCKED</code>.
+      </p>
+
+      <h2>3. Ownership transfer: one transition, one transaction</h2>
+
+      <pre><code>POST /api/families/:slug/transfer-ownership   { "to": "&lt;membershipId&gt;", "keepRole": "member" | "admin" }</code></pre>
+
+      <p>
+        One endpoint, one transaction: lock, re-read the caller, find the target,
+        promote the target, demote the caller. The user's intent — "Minh owns
+        this family now" — is <em>one fact</em>, and one fact gets one commit.
+        Both writes land or neither does, so no committed state of the world
+        contains a half-transfer.
+      </p>
+
+      <p>
+        The honest answer to "why not two steps?" is more interesting than the
+        usual one. Two steps through KinLink's existing API — promote Minh to
+        owner, then demote yourself — <strong>cannot break the invariant</strong>,
+        because the last-owner guard makes the dangerous order unrepresentable:
+        demoting yourself first just answers 409. What two steps cost is not
+        safety; it is <strong>atomicity of intent</strong>:
+      </p>
+
+      <ul>
+        <li>
+          A crash between the steps leaves two owners and a transfer that half
+          happened. The audit trail says "Minh was promoted" and never says who
+          was supposed to stop being owner.
+        </li>
+        <li>Two round trips, two authorisation decisions, two chances for the UI to be left in a state it must reconcile.</li>
+        <li>
+          The client must sequence and retry. With one endpoint the unit is the
+          request.
+        </li>
+      </ul>
+
+      <h3>Three traps in the one endpoint</h3>
+
+      <ol>
+        <li>
+          <strong>Transfer to self.</strong> Promote-me-then-demote-me on one row
+          is a 204 that reaches zero owners. The repair operation must not be a
+          third way to break what it repairs — reject
+          <code>to === caller</code> before the writes.
+        </li>
+        <li>
+          <strong>The in-flight demotion.</strong> The route guard proved the
+          caller was an owner <em>when the request arrived</em>. By the time the
+          transaction runs, another owner may have demoted them. Re-read the
+          caller inside the lock; trusting the middleware's copy would let a
+          demoted owner promote anyone. The refusal is <strong>409
+          <code>not_owner</code></strong> — a state conflict, not a permission
+          verdict.
+        </li>
+        <li>
+          <strong>Retries.</strong> Transfer consumes the caller's authority, so
+          it is not naturally idempotent: if the 204 is lost in transit, the
+          retry arrives from a non-owner and gets a refusal for an action that
+          already succeeded. The general remedy is <em>idempotency keys</em>
+          (roadmap week 8); until then the client should re-fetch state when a
+          transfer response is lost.
+        </li>
+      </ol>
+
+      <p>
+        The counter-case, because a real product may want it: give the
+        <em>recipient</em> a say ("Minh, accept ownership?"), or allow "promote
+        to co-owner now, step down later" with no deadline. Both are legitimate
+        — and both turn one transition into a <strong>protocol with state</strong>
+        (propose → accept/expire), which is the shape of an invitation. If
+        KinLink's families want that, build it as such, not as two loose
+        endpoints.
+      </p>
+
+      <h2>4. The rank lives in code</h2>
+
+      <p>
+        A <code>role_rank</code> table promises "each family defines its own
+        roles". The promise is bigger than the table:
+      </p>
+
+      <ul>
+        <li>
+          <strong>The invariants break first.</strong> "A family keeps at least
+          one owner" keys on the <em>name</em> <code>owner</code>. With custom
+          roles, which one is the owner? Every invariant must re-key on a
+          capability ("may manage roles", or <code>rank = max(rank)</code>), and
+          "you cannot mint authority above your own" becomes a per-family
+          comparison. The table moves the <em>order</em>; it does not move the
+          <em>authority shape</em> — and the authority shape is what the rules
+          are written against.
+        </li>
+        <li>
+          <strong>A rank cannot express permissions anyway.</strong> "May edit
+          events but not people" is not a point on a total order — it is a
+          capability set. Ranks answer "or above" and nothing else. The
+          <a
+            href="https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html"
+            >OWASP Authorization Cheat Sheet</a
+          >
+          makes the same distinction: RBAC approximates; relationship- and
+          attribute-based models (ReBAC/ABAC) express.
+        </li>
+        <li>
+          <strong>Rows are unreviewed data; code is a review.</strong> The
+          <code>satisfies Record&lt;Role, number&gt;</code> map makes a new role
+          a <strong>compile error</strong> until someone decides its rank — in a
+          pull request, with the invariants beside it. In a table the same
+          decision is an <code>INSERT</code>, and a family that inserts
+          <code>superowner</code> above <code>owner</code> has silently rewritten
+          every rule that keys on the maximum.
+        </li>
+      </ul>
+
+      <p>
+        The counter-case, stated properly: a table is right when roles genuinely
+        vary per tenant, when changes must ship without a deploy, when
+        non-engineers administer them, or when there are many of them. If
+        KinLink hears that requirement from real families — twice, not once —
+        the migration is small <em>because the checks funnel through one seam</em>:
+        <code>requireRole</code> and a single <code>rankOf</code>. Move the map
+        behind the function to a query, keep an <code>isOwner</code>-style
+        capability for the invariants, and nothing above the middleware notices.
+        Until then: the closed set in code is honest, total, and checked by the
+        compiler.
+      </p>
+
+      <h2>5. A 409 the client can act on</h2>
+
+      <p>
+        "A family must keep at least one owner" is true and useless: the client
+        can only show "no". The refusal must answer three questions —
+        <strong>what happened</strong> (for a human), <strong>why</strong> (for
+        code), and <strong>what now</strong> (the next action, as data).
+        <a href="https://www.rfc-editor.org/rfc/rfc9457.html">RFC 9457</a> is the
+        standard shape for exactly this; its own motivating example is a client
+        that cannot complete a purchase and should be able to act:
+        <em>"triggering a transfer of more credit into the account"</em> — with
+        an <code>accounts</code> extension listing <em>where</em> to top up. The
+        last-owner refusal is that example re-skinned.
+      </p>
+
+      <pre><code>HTTP/1.1 409 Conflict
+Content-Type: application/problem+json
+
+{
+  "type": "/problems/last_owner",
+  "title": "A family must keep at least one owner",
+  "status": 409,
+  "code": "last_owner",
+  "detail": "Promote another member or transfer ownership, then try again.",
+  "remediation": {
+    "action": "transfer_ownership",
+    "method": "POST",
+    "href": "/api/families/nguyen/transfer-ownership",
+    "candidates": [
+      { "membershipId": "c1f0…", "email": "minh@example.com" },
+      { "membershipId": "9a3e…", "email": "lan@example.com" }
+    ]
+  }
+}</code></pre>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Member</th>
+            <th>Job</th>
+            <th>Rule</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>type</code></td>
+            <td>Names the problem category</td>
+            <td>
+              URI reference; when relative, "include the full path" — hence
+              <code>/problems/last_owner</code>, not <code>last_owner</code>
+            </td>
+          </tr>
+          <tr>
+            <td><code>title</code></td>
+            <td>Short human summary of the <em>type</em></td>
+            <td>"SHOULD NOT change from occurrence to occurrence"</td>
+          </tr>
+          <tr>
+            <td><code>status</code></td>
+            <td>Repeats the HTTP status for stored bodies</td>
+            <td>Advisory; "MUST use the same status code in the actual HTTP response"</td>
+          </tr>
+          <tr>
+            <td><code>detail</code></td>
+            <td>This occurrence, for humans</td>
+            <td>
+              "Consumers SHOULD NOT parse the <code>detail</code> member for
+              information; extensions are more suitable and less error-prone"
+            </td>
+          </tr>
+          <tr>
+            <td><code>code</code></td>
+            <td><strong>Why, for machines</strong></td>
+            <td>Extension member; the field the client branches on</td>
+          </tr>
+          <tr>
+            <td><code>remediation</code></td>
+            <td><strong>What now, for machines</strong></td>
+            <td>
+              Extension members; the RFC explicitly anticipates "typed links …
+              that machines can use to resolve the problem"
+            </td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="callout win">
+        <span class="callout-title">The contract is <code>code</code>, never the sentence</span>
+        <p>
+          Put <code>code</code> and the remediation in the shared contract as a
+          discriminated union and the client's recovery branch becomes exhaustive
+          and type-checked: <code>problem.code === "last_owner"</code> opens the
+          transfer dialog with <code>problem.remediation.candidates</code>;
+          anything new is a compile error there rather than a silent "no". Parse
+          <code>detail</code> and the contract is a sentence of English that a
+          copy edit will break without a type error. And forward compatibility is
+          the RFC's rule, not a courtesy: "Clients consuming problem details MUST
+          ignore any such extensions that they don't recognize" — so adding a
+          member later cannot break an old client.
+        </p>
+      </div>
+
+      <p>
+        Two design notes. <strong>Why the candidates ride in the body:</strong>
+        the refusal already knows who could fix it, and shipping the way out with
+        the "no" renders the dialog in one round trip. The factoring alternative —
+        a <code>GET /members</code> the dialog fetches separately — is better the
+        moment a member list gets its own screen; the model function is shared,
+        so moving is cheap. <strong>What must never ride in the body:</strong>
+        internals. RFC 9457's security section is blunt — vet every detail you
+        emit; a problem body is a great place to leak stack traces, other
+        tenants' ids, or SQL. <code>title</code>, <code>detail</code>,
+        <code>code</code>, and facts the caller is already entitled to see (their
+        own family's members) — nothing else.
+      </p>
+
+      <div class="callout win">
+        <span class="callout-title">Primary sources</span>
+        <p>
+          <a
+            href="https://blog.arkency.com/making-race-condition-tests-deterministic-with-cyclicbarrier-and-seam/"
+            >Arkency — Making race condition tests deterministic with
+            CyclicBarrier and seam</a
+          >
+          (the technique, with the Feathers seam definition) ·
+          <a href="https://www.rfc-editor.org/rfc/rfc9457.html"
+            >RFC 9457 — Problem Details for HTTP APIs</a
+          >
+          (read §3 and the out-of-credit example: it is this section's design)
+        </p>
+        <p>
+          <a
+            href="https://dev.mysql.com/doc/refman/8.0/en/innodb-transaction-isolation-levels.html"
+            >MySQL 8.0 — Transaction Isolation Levels</a
+          >
+          (the SERIALIZABLE conversion, and the mixing warning that is §2's
+          counter-case) ·
+          <a
+            href="https://www.microsoft.com/en-us/research/publication/chess-a-systematic-testing-tool-for-concurrent-software/"
+            >CHESS: A systematic testing tool for concurrent software</a
+          >
+          ·
+          <a href="https://apple.github.io/foundationdb/testing.html"
+            >FoundationDB — Simulation and Testing</a
+          >
+        </p>
+      </div>
+
+      <footer class="lesson-footer">
+        <p>Reference docs are meant to be argued with. If a rule here is wrong, say so.</p>
+      </footer>
+    </div>
+  </body>
+</html>

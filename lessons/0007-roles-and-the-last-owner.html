@@ -1,0 +1,736 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lesson 07 — Roles, and the owner who cannot leave</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="lesson-header">
+        <p class="eyebrow">Lesson 07 · Week 4 · about two hours</p>
+        <h1>Roles, and the owner who cannot leave</h1>
+        <p class="lede">
+          The <code>role</code> column has existed since lesson 06 and nothing has ever
+          read it. Today it becomes load-bearing: a rank instead of a list, the project's
+          first honest <strong>403</strong>, and an invariant that has to survive two
+          owners demoting each other at the same instant.
+        </p>
+        <div class="meta-row">
+          <span>Mission: ship KinLink</span>
+          <span>Reference: <a href="../reference/0007-membership-lifecycle.html">Membership lifecycle</a></span>
+          <span>Requires: <a href="0006-who-may-see-this-family.html">Lesson 06</a></span>
+        </div>
+      </header>
+
+      <div class="callout win">
+        <span class="callout-title">The win</span>
+        <p>
+          A plain member asking to change a role gets <strong>403</strong>; the last owner
+          trying to leave gets <strong>409</strong>, and the message tells them to
+          transfer ownership first. Behind that, a family can never reach zero owners —
+          proven by a script that has two owners demote each other <em>concurrently</em>
+          and asserts exactly one survives. Your first real use of
+          <code>SELECT … FOR UPDATE</code>, and your first codebase-level invariant.
+        </p>
+      </div>
+
+      <h2>Why a rank, and not a list</h2>
+
+      <p>
+        The tempting shape is a comparison at each call site:
+        <code>membership.role === "owner"</code>. It works, and it quietly rots. The day
+        someone adds a role between <code>admin</code> and <code>owner</code>, every one
+        of those comparisons silently means something new — too narrow in some places, too
+        wide in others, and nothing fails to tell you.
+      </p>
+
+      <p>
+        A rank makes "or above" a comparison instead of an enumeration:
+      </p>
+
+      <pre><code>const RANK = { member: 1, admin: 2, owner: 3 } as const satisfies Record&lt;Role, number&gt;;</code></pre>
+
+      <div class="callout">
+        <span class="callout-title">
+          <code>satisfies Record&lt;Role, number&gt;</code> is doing real work
+        </span>
+        <p>
+          Because the map is typed as <em>total</em> over <code>Role</code>, adding a role
+          to <code>schema.prisma</code> and regenerating the client makes this line a
+          <strong>compile error</strong> until you decide where the new role sits. That is
+          the whole point: the decision cannot be skipped, and it cannot be skipped
+          silently. A partial map would let it slide.
+        </p>
+      </div>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Build it</h2>
+
+      <ol class="steps">
+        <li>
+          <h3>The first honest 403</h3>
+
+          <div class="file">
+            <span class="file-path">server/src/middlewares/role.ts (new)</span>
+            <pre><code>import type { RequestHandler } from "express";
+import type { ApiErrorBody } from "../contracts.js";
+import type { Role } from "../models/membership.model.js";
+import { familyContext } from "./family.js";
+
+// A rank, not a list of acceptable strings. "admin" means admin or above, so
+// adding a role later cannot silently narrow or widen an existing check. Typed as
+// a total map, so a new role is a compile error until it is ranked.
+const RANK = { member: 1, admin: 2, owner: 3 } as const satisfies Record&lt;Role, number&gt;;
+
+/**
+ * 403, not 404. The caller is inside the family -- loadFamily proved it -- so its
+ * existence is not a secret from them. "You may not do this" is the honest answer,
+ * and it is actionable in a way that another 404 would not be.
+ */
+export const requireRole = (minimum: Role): RequestHandler = (req, res, next) =&gt; {
+  const { membership } = familyContext(req);
+
+  if (RANK[membership.role] &lt; RANK[minimum]) {
+    const body: ApiErrorBody = { message: "Insufficient role" };
+    res.status(403).json(body);
+    return;
+  }
+
+  next();
+};</code></pre>
+          </div>
+
+          <p>
+            Three things worth noticing. It takes <strong>no database query</strong> —
+            <code>loadFamily</code> already fetched the membership, role included, which is
+            the payoff of resolving once at the boundary. It calls
+            <code>familyContext</code>, so it inherits the tripwire and fails loudly if
+            someone mounts it without <code>loadFamily</code>. And it returns a
+            <em>function</em>, so a route can say <code>requireRole("owner")</code> and
+            read like the rule it enforces.
+          </p>
+        </li>
+
+        <li>
+          <h3>The <code>Db</code> type lesson 06 predicted</h3>
+
+          <p>
+            Read the comment you left in <code>user.model.ts</code>:
+          </p>
+
+          <blockquote>
+            <p>
+              "…because it is currently the only operation that needs a Prisma transaction
+              handle. <strong>When a second one appears, extract a <code>Db</code> type and
+              thread it through the model functions</strong> instead of growing this
+              pattern by hand."
+            </p>
+          </blockquote>
+
+          <p>
+            A second one has appeared — an owner leaving needs to lock, count, and delete
+            as one unit. Here is the extraction:
+          </p>
+
+          <div class="file">
+            <span class="file-path">server/src/models/db.ts (new)</span>
+            <pre><code>import { prisma } from "../config/database.js";
+import type { PrismaClient } from "../../generated/prisma/client.js";
+
+/**
+ * A Prisma client OR a transaction handle.
+ *
+ * Threaded through the model functions so a service can compose several writes in
+ * one transaction without the model layer knowing who is coordinating. A
+ * transaction handle is a PrismaClient without the connection/transaction
+ * lifecycle methods, so this Omit is the shape both satisfy.
+ */
+export type Db = Omit&lt;
+  PrismaClient,
+  "$connect" | "$disconnect" | "$on" | "$transaction" | "$extends" | "$use"
+&gt;;
+
+/**
+ * Run several model calls as one unit.
+ *
+ * This lives in the model layer, not the services, so a service can describe
+ * *what* must happen atomically without ever importing Prisma. Model layer owns
+ * how we talk to the database; services own what the business requires.
+ */
+export function transact&lt;T&gt;(work: (tx: Db) =&gt; Promise&lt;T&gt;): Promise&lt;T&gt; {
+  return prisma.$transaction(work);
+}</code></pre>
+          </div>
+        </li>
+
+        <li>
+          <h3>Model functions that can be composed, and one that locks</h3>
+
+          <div class="file">
+            <span class="file-path">server/src/models/membership.model.ts (additions)</span>
+            <pre><code>import { prisma } from "../config/database.js";
+import type { Db } from "./db.js";
+
+// Runtime list of the enum, so validation never hand-writes the three names twice.
+export const ROLES = ["member", "admin", "owner"] as const satisfies readonly Role[];
+
+/**
+ * Find a membership *within a family*. The familyId is in the WHERE clause, so a
+ * membership id taken from a URL can never select a row belonging to another family
+ * on its own -- the same shape as the lesson-06 guard, one level down.
+ */
+export async function findByFamily(
+  familyId: string,
+  membershipId: string,
+  database: Db = prisma,
+): Promise&lt;FamilyMember | null&gt; {
+  return database.familyMember.findFirst({
+    where: { id: membershipId, familyId },
+  });
+}
+
+export async function countOwners(
+  familyId: string,
+  database: Db = prisma,
+): Promise&lt;number&gt; {
+  return database.familyMember.count({ where: { familyId, role: "owner" } });
+}
+
+/**
+ * Serialise ownership changes for one family.
+ *
+ * MySQL's manual is explicit about this shape of problem: "If you query data and
+ * then insert or update related data within the same transaction, the regular
+ * SELECT statement does not give enough protection." Counting owners and then
+ * writing is a lost update waiting to happen -- two transactions both read
+ * "2 owners" and both write. FOR UPDATE takes an exclusive row lock, so the second
+ * waits, then re-counts a world where only one owner is left, and refuses.
+ *
+ * Locking reads require autocommit to be off, which an interactive transaction
+ * already provides.
+ */
+export async function lockFamily(
+  familyId: string,
+  database: Db = prisma,
+): Promise&lt;void&gt; {
+  await database.$queryRaw`SELECT id FROM families WHERE id = ${familyId} FOR UPDATE`;
+}
+
+export async function updateRole(
+  membershipId: string,
+  role: Role,
+  database: Db = prisma,
+): Promise&lt;void&gt; {
+  await database.familyMember.update({ where: { id: membershipId }, data: { role } });
+}
+
+export async function deleteById(
+  membershipId: string,
+  database: Db = prisma,
+): Promise&lt;void&gt; {
+  await database.familyMember.delete({ where: { id: membershipId } });
+}</code></pre>
+          </div>
+        </li>
+
+        <li>
+          <h3>The invariant, checked and written as one unit</h3>
+
+          <div class="file">
+            <span class="file-path">server/src/services/membership.service.ts (additions)</span>
+            <pre><code>import { transact } from "../models/db.js";
+
+export type RoleChange =
+  | { ok: true }
+  | { ok: false; reason: "not-found" | "last-owner" };
+
+export type Leave = { ok: true } | { ok: false; reason: "last-owner" };
+
+/**
+ * Change a member's role.
+ *
+ * "A family must keep at least one owner" is policy about a transition, so it lives
+ * in the service -- not the middleware (HTTP), not the model (facts), and not a
+ * database constraint (MySQL cannot express "at least one row like this"). It is
+ * checked and written inside one transaction, behind a family-level lock.
+ */
+export async function changeRole(input: {
+  familyId: string;
+  membershipId: string;
+  nextRole: Role;
+}): Promise&lt;RoleChange&gt; {
+  return transact(async (tx) =&gt; {
+    await membershipModel.lockFamily(input.familyId, tx);
+
+    const target = await membershipModel.findByFamily(
+      input.familyId,
+      input.membershipId,
+      tx,
+    );
+    if (target === null) return { ok: false, reason: "not-found" };
+
+    if (target.role === "owner" &amp;&amp; input.nextRole !== "owner") {
+      const owners = await membershipModel.countOwners(input.familyId, tx);
+      if (owners &lt;= 1) return { ok: false, reason: "last-owner" };
+    }
+
+    await membershipModel.updateRole(input.membershipId, input.nextRole, tx);
+    return { ok: true };
+  });
+}
+
+/**
+ * A member leaves. The last owner may not -- the family would lose its only key.
+ *
+ * Idempotent on purpose: if the membership is already gone, the caller's intent
+ * ("I am not in this family") is satisfied, so this is a success, not a 404.
+ */
+export async function leaveFamily(input: {
+  familyId: string;
+  membershipId: string;
+}): Promise&lt;Leave&gt; {
+  return transact(async (tx) =&gt; {
+    await membershipModel.lockFamily(input.familyId, tx);
+
+    const membership = await membershipModel.findByFamily(
+      input.familyId,
+      input.membershipId,
+      tx,
+    );
+    if (membership === null) return { ok: true };
+
+    if (membership.role === "owner") {
+      const owners = await membershipModel.countOwners(input.familyId, tx);
+      if (owners &lt;= 1) return { ok: false, reason: "last-owner" };
+    }
+
+    await membershipModel.deleteById(input.membershipId, tx);
+    return { ok: true };
+  });
+}</code></pre>
+          </div>
+
+          <p>
+            Note that <code>leaveFamily</code> re-reads the membership <em>inside</em> the
+            transaction rather than trusting the role the middleware saw. The request may
+            have been in flight while another owner was already demoting them. Inside the
+            lock, the truth is the truth.
+          </p>
+        </li>
+
+        <li>
+          <h3>Two doors, two different codes</h3>
+
+          <div class="file">
+            <span class="file-path">server/src/controllers/family.controller.ts (new)</span>
+            <pre><code>import type { NextFunction, Request, Response } from "express";
+import type { ApiErrorBody } from "../contracts.js";
+import { ROLES, type Role } from "../models/membership.model.js";
+import { familyContext } from "../middlewares/family.js";
+import { changeRole, leaveFamily } from "../services/membership.service.js";
+
+function isRole(value: unknown): value is Role {
+  return typeof value === "string" &amp;&amp; (ROLES as readonly string[]).includes(value);
+}
+
+export async function patchMemberRole(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise&lt;void&gt; {
+  try {
+    const { family } = familyContext(req);
+    const { membershipId } = req.params;
+    // Express 5: req.body is undefined when nothing parsed it, so read defensively.
+    const nextRole = (req.body as { role?: unknown } | undefined)?.role;
+
+    if (typeof membershipId !== "string" || !isRole(nextRole)) {
+      const body: ApiErrorBody = { message: "role must be owner, admin or member" };
+      res.status(400).json(body);
+      return;
+    }
+
+    const result = await changeRole({
+      familyId: family.id,
+      membershipId,
+      nextRole,
+    });
+
+    if (!result.ok) {
+      // "no such member in this family" -> 404; "that would orphan the family" -> 409.
+      const body: ApiErrorBody =
+        result.reason === "not-found"
+          ? { message: "Member not found" }
+          : { message: "A family must keep at least one owner" };
+      res.status(result.reason === "not-found" ? 404 : 409).json(body);
+      return;
+    }
+
+    res.status(204).end();
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function leave(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise&lt;void&gt; {
+  try {
+    const { family, membership } = familyContext(req);
+
+    const result = await leaveFamily({
+      familyId: family.id,
+      membershipId: membership.id,
+    });
+
+    if (!result.ok) {
+      const body: ApiErrorBody = { message: "A family must keep at least one owner" };
+      res.status(409).json(body);
+      return;
+    }
+
+    res.status(204).end();
+  } catch (error) {
+    next(error);
+  }
+}</code></pre>
+          </div>
+
+          <div class="file">
+            <span class="file-path">server/src/routes/family.routes.ts</span>
+            <pre><code>import { Router } from "express";
+import { leave, patchMemberRole } from "../controllers/family.controller.js";
+import { getFamilyPeople } from "../controllers/people.controller.js";
+import { requireRole } from "../middlewares/role.js";
+
+// loadFamily already ran at the mount, so requireRole needs no query of its own.
+export const familyRouter = Router();
+
+familyRouter.get("/people", getFamilyPeople);
+
+// owner-only: changing who may do what is the most dangerous operation here.
+familyRouter.patch("/members/:membershipId", requireRole("owner"), patchMemberRole);
+
+// any member may leave; the refusal case is 409, not 403.
+familyRouter.post("/leave", leave);</code></pre>
+          </div>
+
+          <p>
+            Look at the difference between the two refusals, because it is the whole point
+            of this step. A member who is not an owner gets
+            <strong><code>403</code></strong> — "you may never do this". The last owner who
+            tries to leave gets <strong><code>409</code></strong> — "you are allowed, but
+            not in this state; promote someone else and try again". RFC 9110 calls 409 the
+            code for a request that "could not be completed due to a conflict with the
+            current state of the target resource"
+            (<a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-409-conflict">§15.5.10</a>).
+          </p>
+        </li>
+
+        <li>
+          <h3>The check that proves the lock is not decoration</h3>
+
+          <p>
+            This is the interesting part, and it is testable. Two owners demote
+            themselves at the same instant. Without the lock both transactions read
+            <code>count = 2</code> and both write, leaving a family with
+            <strong>zero owners</strong> — a state that cannot be repaired through the
+            API at all.
+          </p>
+
+          <div class="file">
+            <span class="file-path">server/src/scripts/checkOwnership.ts (new)</span>
+            <pre><code>import "dotenv/config";
+import { randomUUID } from "node:crypto";
+import { prisma } from "../config/database.js";
+import { changeRole } from "../services/membership.service.js";
+
+// Two owners demote themselves simultaneously. Exactly one must be refused, and
+// exactly one owner must remain -- the invariant that no route can repair if broken.
+async function main(): Promise&lt;void&gt; {
+  const slug = `probe-${randomUUID().slice(0, 8)}`;
+  const family = await prisma.family.create({
+    data: { slug, name: "Ownership probe" },
+  });
+
+  try {
+    const owners = await Promise.all(
+      [1, 2].map(async (n) =&gt; {
+        const user = await prisma.user.create({
+          data: { email: `${slug}-${n}@probe.invalid`, passwordHash: "x" },
+        });
+        const membership = await prisma.familyMember.create({
+          data: { userId: user.id, familyId: family.id, role: "owner" },
+        });
+        return membership.id;
+      }),
+    );
+
+    const results = await Promise.all(
+      owners.map((membershipId) =&gt;
+        changeRole({ familyId: family.id, membershipId, nextRole: "member" }),
+      ),
+    );
+
+    const refused = results.filter((r) =&gt; !r.ok).length;
+    const remaining = await prisma.familyMember.count({
+      where: { familyId: family.id, role: "owner" },
+    });
+
+    console.log(`demotions refused: ${refused}`);
+    console.log(`owners remaining:  ${remaining}`);
+
+    if (remaining !== 1) {
+      throw new Error(`INVARIANT BROKEN: ${remaining} owner(s) remain, expected 1`);
+    }
+    console.log("\nownership invariant held under concurrent demotion");
+  } finally {
+    await prisma.family.delete({ where: { id: family.id } });
+    await prisma.user.deleteMany({ where: { email: { startsWith: slug } } });
+    await prisma.$disconnect();
+  }
+}
+
+main().catch((error: unknown) =&gt; {
+  console.error(error);
+  process.exitCode = 1;
+});</code></pre>
+          </div>
+
+          <div class="file">
+            <span class="file-path">package.json (scripts, excerpt)</span>
+            <pre><code>"check:ownership": "tsx server/src/scripts/checkOwnership.ts"</code></pre>
+          </div>
+
+          <pre><code>npm run check:ownership
+
+demotions refused: 1
+owners remaining:  1
+
+ownership invariant held under concurrent demotion</code></pre>
+
+          <div class="callout">
+            <span class="callout-title">Why this check exists rather than a unit test</span>
+            <p>
+              The bug this guards against is <em>a race</em>, and a race is invisible to a
+              single-threaded unit test that mocks the model layer. It only appears with
+              two real transactions against a real database — which is what this script
+              is. The full pyramid arrives in week 7; this is the smallest thing that
+              actually fails when the lock is removed, and you will need it the moment
+              anyone "simplifies" the transaction.
+            </p>
+          </div>
+        </li>
+
+        <li>
+          <h3>Commit</h3>
+          <pre><code>npm run typecheck &amp;&amp; npm run check:guards &amp;&amp; npm run check:ownership
+git add -A
+git commit -m "Add role-based authorisation and the last-owner invariant"</code></pre>
+        </li>
+      </ol>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Verify</h2>
+
+      <ul class="checklist">
+        <li><code>npm run typecheck</code> exits 0.</li>
+        <li><code>npm run check:ownership</code> prints <code>owners remaining:  1</code>.</li>
+        <li>A <code>member</code> calling <code>PATCH /members/:id</code> gets <code>403</code>.</li>
+        <li>An <code>owner</code> demoting the only other owner gets <code>409</code>.</li>
+        <li>The sole owner calling <code>POST /leave</code> gets <code>409</code>.</li>
+        <li>The same call after promoting a second owner returns <code>204</code>.</li>
+      </ul>
+
+          <pre><code># Log in as the owner of nguyen (seed: an@example.com / correcthorsebatterystaple)
+curl -s -X POST localhost:4000/api/auth/login -H 'Content-Type: application/json' \
+  -d '{"email":"an@example.com","password":"correcthorsebatterystaple"}' -c /tmp/an.txt
+
+# Who is in there, and what ids do the memberships have?
+docker exec kinlink-mysql mysql -ukinlink -pkinlink kinlink -e "
+SELECT fm.id, u.email, fm.role FROM family_members fm
+JOIN users u ON u.id = fm.user_id
+JOIN families f ON f.id = fm.family_id WHERE f.slug = 'nguyen';" 2>/dev/null
+
+# The sole owner cannot leave -- 409, and the message says what to do instead.
+curl -si -b /tmp/an.txt -X POST localhost:4000/api/families/nguyen/leave | head -1
+
+# Nor can they demote themselves.
+curl -si -b /tmp/an.txt -X PATCH localhost:4000/api/families/nguyen/members/&lt;their-membership-id&gt; \
+  -H 'Content-Type: application/json' -d '{"role":"member"}' | head -1</code></pre>
+
+      <h2>Break it on purpose</h2>
+
+      <ol>
+        <li>
+          <strong>The one that matters.</strong> Comment out the
+          <code>lockFamily</code> call in <code>changeRole</code> and run
+          <code>npm run check:ownership</code>. Predict the output first, then look.
+          You should see <code>owners remaining: 0</code> and an
+          <code>INVARIANT BROKEN</code> error — your family, permanently ownerless, with
+          no API call able to fix it. Restore the lock. Then say out loud what
+          <code>FOR UPDATE</code> did that the transaction alone did not.
+        </li>
+        <li>
+          <strong>Privilege escalation.</strong> Delete
+          <code>requireRole("owner")</code> from the <code>PATCH</code> route, log in as
+          the <code>member</code> account, and PATCH <em>your own</em> membership id with
+          <code>{"role":"owner"}</code>. It returns <code>204</code> — you have just
+          promoted yourself. This is why the guard is a route argument and not a comment,
+          and why "who may change roles" is the most dangerous rule in the file. Restore
+          it.
+        </li>
+        <li>
+          <strong>Order.</strong> Move <code>requireRole("owner")</code> in front of
+          <code>loadFamily</code> (i.e. mount it in <code>routes/index.ts</code> before the
+          <code>/families/:slug</code> mount). Predict, then call the route. It fails with
+          a <code>500</code> saying <code>Route is missing requireAuth/loadFamily</code> —
+          the tripwire, telling you the chain is out of order. A 403 here would have been
+          a lie about the caller's role.
+        </li>
+        <li>
+          <strong>Two codes, one mistake.</strong> Change the last-owner refusal from
+          <code>409</code> to <code>403</code> and think about the client: it now cannot
+          tell "you will never be allowed to leave this family" from "promote someone
+          first, then leave". Which of those two messages can a UI act on?
+        </li>
+        <li>
+          <strong>Make it non-idempotent.</strong> Change <code>leaveFamily</code> to
+          return <code>{ ok: false, reason: "not-found" }</code> when the membership is
+          already gone, and map that to <code>404</code>. Now a retried request — a
+          dropped connection, a double-click — reports failure for an action that already
+          succeeded. Explain which failure mode you prefer and why.
+        </li>
+      </ol>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Retrieval practice</h2>
+
+      <p>No scrolling back. Answer first, then check.</p>
+
+      <div class="quiz" data-quiz>
+        <script type="application/json">
+          [
+            {
+              "q": "Why is the last owner's leave a 409 and not a 403?",
+              "options": [
+                "The caller may act, but the current state refuses it",
+                "The caller is not a member of the family being changed",
+                "The caller must re-authenticate before changing roles",
+                "The caller is forbidden from ever leaving this family"
+              ],
+              "answer": 0,
+              "why": "403 means 'you may never'. Here the caller is permitted, and retrying after promoting another owner succeeds. A request that conflicts with the current state of the resource is exactly what 409 is for, and it is a message a UI can act on."
+            },
+            {
+              "q": "What does SELECT ... FOR UPDATE add inside the transaction?",
+              "options": [
+                "It makes the second transaction wait instead of reading stale counts",
+                "It stops the database from rolling back a failed transaction",
+                "It caches the row so later reads can skip the database",
+                "It turns the following write into an idempotent operation"
+              ],
+              "answer": 0,
+              "why": "Counting owners and then writing is a lost update: both transactions read count = 2 and both write. FOR UPDATE takes an exclusive lock so the second waits, then re-counts a world with one owner left and refuses. It is the manual's own counter example."
+            },
+            {
+              "q": "Why does an owner-only route answer 403 while a non-member gets 404?",
+              "options": [
+                "The owner already knows the family exists, so hiding it is pointless",
+                "A 403 tells the client that its session cookie has expired",
+                "A 404 is reserved for requests that never reach a controller",
+                "The middleware chain cannot produce a 404 once loadFamily ran"
+              ],
+              "answer": 0,
+              "why": "404 exists to hide existence from someone not entitled to know it. Inside the boundary that is moot, so the honest and actionable answer is 'you may not do this'. Both are refusals, but they answer different questions for the client."
+            },
+            {
+              "q": "Why must an invitation token be consumed by a conditional updateMany?",
+              "options": [
+                "So the database, not the application, decides who claims it",
+                "So the token can be reused when the first request times out",
+                "So the token never needs hashing before it is stored",
+                "So an expired token is reported differently from a used one"
+              ],
+              "answer": 0,
+              "why": "Check-then-write lets two clicks create two memberships. updateMany with usedAt: null in the where clause changes the token exactly once and reports how many rows it changed, so count !== 1 means you lost the race. It also folds the expiry test into the same statement."
+            },
+            {
+              "q": "When is a second query genuinely better than the one membership join?",
+              "options": [
+                "When an operator must tell 'no such family' from 'not a member'",
+                "When the family table grows larger than the membership table",
+                "When the request is unauthenticated and carries no session",
+                "When the slug is a UUID and therefore cannot be guessed"
+              ],
+              "answer": 0,
+              "why": "The one query buys unrepresentability, which only matters where nothing else enforces the rule. Collapsing the two failures is a client-facing decision, so an admin console entitled to distinguish them wants two facts — or one query plus a typed reason."
+            }
+          ]
+        </script>
+      </div>
+
+      <h2>Primary source</h2>
+
+      <div class="callout win">
+        <span class="callout-title">Read this next</span>
+        <p>
+          <a href="https://dev.mysql.com/doc/refman/8.0/en/innodb-locking-reads.html"
+            >MySQL 8.0 — Locking Reads</a
+          >
+          is about four screens long, and its worked example is a counter that two
+          sessions must not read simultaneously. Replace "counter" with "owner count" and
+          it is this lesson, written by the people who implement the lock. Read the
+          <code>NOWAIT</code> and <code>SKIP LOCKED</code> sections too — they are the two
+          escape hatches you will want the first time a lock makes you wait.
+        </p>
+        <p>
+          Then
+          <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-409-conflict">RFC 9110 §15.5.10 (409)</a>
+          next to <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-403-forbidden">§15.5.4 (403)</a>.
+          The two definitions are what separates "you may not" from "not like this, not
+          now" — the only distinction your 409 branch exists to make.
+        </p>
+      </div>
+
+      <div class="prompt">
+        <span class="prompt-title">Ask your teacher</span>
+        <p>
+          Ask me how to test a race deterministically instead of hoping it happens, whether
+          <code>FOR UPDATE</code> is the right tool or an isolation level would be better,
+          how ownership <em>transfer</em> should work (one endpoint or two steps?), and
+          whether the rank belongs in code or in a <code>role_rank</code> table so a family
+          could define its own roles. And ask what a 409 body should contain so the client
+          can offer "transfer ownership" instead of just saying "no".
+        </p>
+      </div>
+
+      <footer class="lesson-footer">
+        <p class="next-up">
+          <strong>Next:</strong> Lesson 08 — invitations. Now that joining someone else's
+          family has no legitimate path, the token becomes the only door: a credential for
+          a membership that does not exist yet, consumed exactly once, granting no more
+          than the inviter could grant. Then the client, which finally has an API worth
+          rendering.
+        </p>
+        <p>
+          <a href="../MISSION.md">MISSION.md</a> ·
+          <a href="../ROADMAP.md">ROADMAP.md</a> ·
+          <a href="../GLOSSARY.md">GLOSSARY.md</a> ·
+          <a href="../PROGRESS.md">PROGRESS.md</a> ·
+          <a href="../reference/0007-membership-lifecycle.html">Reference 07</a> ·
+          <a href="../reference/0006-authorisation-chains.html">Reference 06</a>
+        </p>
+      </footer>
+    </div>
+
+    <script src="../assets/quiz.js"></script>
+  </body>
+</html>

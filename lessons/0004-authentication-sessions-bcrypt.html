@@ -94,9 +94,11 @@ npm install -D @types/express-session @types/bcrypt</code></pre>
             both used in production apps of all sizes. No crypto shortcuts here.
           </p>
           <p>
-            Note: <code>@types/bcrypt</code> ships with bcrypt 6.x under the same package name
-            (<code>@types/bcrypt@6.0.0</code>). If you were using an older major version, you would
-            need <code>@types/bcrypt</code>. Modern bcrypt has bundled types.
+            Note: <code>bcrypt@6.0.0</code> ships <strong>no types of its own</strong> — no
+            <code>types</code> field, no <code>.d.ts</code>. <code>@types/bcrypt</code> is
+            doing real work and must stay. (An earlier version of this lesson claimed
+            otherwise; see
+            <a href="../reference/0005-auth-mechanics.html">Reference 05 §6</a>.)
           </p>
         </li>
 
@@ -191,10 +193,13 @@ export const sessionMiddleware: RequestHandler = session(sessionConfig);</code><
 
           <ol>
             <li>
-              <strong><code>sameSite: "lax"</code>.</strong> This prevents CSRF for GET requests
-              and allows normal navigation from other domains. It means POST requests from another
-              domain will fail to include the cookie — which is the correct security posture. Set
-              <code>"strict"</code> once you implement CSRF tokens for forms.
+              <strong><code>sameSite: "lax"</code>.</strong> This blocks cross-site
+              <em>unsafe</em> methods — POST, PUT, PATCH, DELETE from another site lose the
+              cookie — while still allowing a normal top-level GET navigation (clicking a
+              link to KinLink from an email). It is safe precisely because state changes
+              are POSTs; the classic way it fails is a mutating <code>GET</code>. Full
+              account, including the four limitations, in
+              <a href="../reference/0005-auth-mechanics.html">Reference 05 §3</a>.
             </li>
             <li>
               <strong><code>secure: isProd</code>.</strong> In development, cookies are sent over
@@ -391,9 +396,11 @@ export async function login(
 
     const match = await bcrypt.compare(password, user.passwordHash);
     if (!match) {
-      // Constant-time comparison on the hash, but timing still leaks that the
-      // email exists (user not found ≠ wrong password). Preventing user enumeration
-      // requires more care (rate limiting, generic messages). Acknowledge the leak.
+      // compare() may exit early, but it compares digests, so the fixed 2^cost work
+      // dominates and an early exit leaks nothing usable. The timing signal that
+      // does exist is elsewhere: a hit runs a bcrypt round and a miss does not, so
+      // "no such user" and "wrong password" are distinguishable. Keep the message
+      // generic and rate limit.
       res.status(401).json({ message: "Invalid credentials" });
       return;
     }
@@ -487,14 +494,23 @@ authRouter.get("/whoami", whoami);</code></pre>
           recomputes to check equality. Always use <code>compare</code>; never hash-and-compare.</p>
 
           <div class="callout warn">
-            <span class="callout-title">Timing attack awareness</span>
+            <span class="callout-title">Timing attack awareness — corrected</span>
             <p>
-              <code>bcrypt.compare()</code> runs in constant time, so it doesn't leak how many
-              characters matched. But the overall response time still differs slightly between
-              "user not found" and "wrong password" because finding a user takes a DB query.
-              Mitigation: use rate limiting, or return the same generic message for both cases
-              ("Invalid credentials"). For a private family app, the risk is low. For anything
-              public, fix it.
+              <code>bcrypt.compare()</code> is <strong>not</strong> constant-time; the
+              library's README says the comparison may exit early. It is nonetheless safe,
+              for a different reason: it compares <em>digests</em>, and a digest is
+              preimage-resistant, so an early exit tells an attacker nothing usable. The
+              fixed <code>2^cost</code> work dominates the timing anyway. (A previous
+              version of this lesson got the reason wrong — it matters, because it teaches
+              the right habit in the wrong place. See
+              <a href="../reference/0005-auth-mechanics.html">Reference 05 §2</a>.)
+            </p>
+            <p>
+              The side channel your code <em>does</em> have is different: a hit runs a
+              bcrypt round (~hundreds of ms) and a miss does not, so "no such user" and
+              "wrong password" are distinguishable. Mitigate with a generic message and
+              rate limiting. Low risk for a private family app; table stakes for a public
+              login.
             </p>
           </div>
         </li>
@@ -804,9 +820,13 @@ git commit -m "Add authentication: session cookies, bcrypt, scoped family querie
 
       <footer class="lesson-footer">
         <p class="next-up">
-          <strong>Next:</strong> Lesson 05 — React + TanStack Query + Zustand. The client
-          learns about auth state, fetches <code>/api/people</code> with the session cookie
-          attached, and displays the authenticated family tree.
+          <strong>Next:</strong> Lesson 05 — finish the auth contract. Lesson 04 left
+          <code>npm run typecheck</code> with ten errors and made an unauthenticated
+          request answer <code>500</code> instead of <code>401</code>; lesson 05 fixes
+          both, declares the session types properly, and makes forgetting
+          <code>requireAuth</code> structurally hard. <strong>Then</strong> lesson 06
+          brings in the client — <code>whoami</code>, a login form, and the
+          server-state-versus-client-state distinction.
         </p>
         <p>
           <a href="../MISSION.md">MISSION.md</a> ·

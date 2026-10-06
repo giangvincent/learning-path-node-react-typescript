@@ -1,0 +1,951 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lesson 08 — Transfer ownership, and fire the race on demand</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="lesson-header">
+        <p class="eyebrow">Lesson 08 · Week 4 · about two hours</p>
+        <h1>Transfer ownership, and fire the race on demand</h1>
+        <p class="lede">
+          Lesson 07's 409 ends with advice — "transfer ownership first" — and no
+          such operation exists. Today you build it as one transition, make the
+          race check <strong>deterministic</strong> instead of lucky, and give
+          the 409 a body the client can act on instead of a sentence it can only
+          display.
+        </p>
+        <div class="meta-row">
+          <span>Mission: ship KinLink</span>
+          <span>Reference: <a href="../reference/0008-races-locks-and-refusals.html">Races, locks, refusals</a></span>
+          <span>Requires: <a href="0007-roles-and-the-last-owner.html">Lesson 07</a></span>
+        </div>
+      </header>
+
+      <div class="callout win">
+        <span class="callout-title">The win</span>
+        <p>
+          <code>POST /transfer-ownership</code> moves ownership in one
+          transaction — and cannot reach zero owners even if you delete its
+          guards, because you will prove you can't with a check that
+          <strong>fails on every single run</strong> when the lock is wrong.
+          Not sometimes. Every time. Plus: the 409 now carries
+          <code>code: "last_owner"</code> and its remediation, so the client
+          offers "transfer ownership?" with a person picker instead of saying
+          "no".
+        </p>
+      </div>
+
+      <p>
+        The feature is small — one service function, one route. The lesson is in
+        the proving. Lesson 07's <code>check:ownership</code> fired two demotions
+        with <code>Promise.all</code> and <em>hoped</em> they collided; today's
+        version decides the collision itself. Read
+        <a href="../reference/0008-races-locks-and-refusals.html">Reference 08 §1</a>
+        first if you want the full argument — the build below is its skeleton.
+      </p>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Build it</h2>
+
+      <ol class="steps">
+        <li>
+          <h3>A seam at the race window</h3>
+
+          <p>
+            The <strong>race window</strong> in <code>changeRole</code> is the
+            gap between <em>counting</em> the owners and <em>writing</em> the
+            demotion. To force a collision inside it, the test needs somewhere to
+            park both transactions. That somewhere is a <strong>seam</strong>
+            (Feathers: "a place where you can alter behavior in your program
+            without editing in that place") — here, one optional hook:
+          </p>
+
+          <div class="file">
+            <span class="file-path">server/src/services/membership.service.ts (changes)</span>
+            <pre><code>/**
+ * A test seam at the race window: the gap between reading the owner count and
+ * writing the decision. checkOwnership parks here to force the losing
+ * interleaving. Callers that pass nothing are unaffected.
+ */
+export interface RaceWindow {
+  afterCount?: () =&gt; Promise&lt;void&gt;;
+}
+
+export type RoleChange =
+  | { ok: true }
+  | { ok: false; reason: "not-found" }
+  | { ok: false; reason: "last-owner"; candidates: MemberCandidate[] };
+
+export async function changeRole(
+  input: {
+    familyId: string;
+    membershipId: string;
+    nextRole: Role;
+  },
+  window: RaceWindow = {},
+): Promise&lt;RoleChange&gt; {
+  return transact(async (tx) =&gt; {
+    await membershipModel.lockFamily(input.familyId, tx);
+
+    const target = await membershipModel.findByFamily(
+      input.familyId,
+      input.membershipId,
+      tx,
+    );
+    if (target === null) return { ok: false, reason: "not-found" };
+
+    if (target.role === "owner" &amp;&amp; input.nextRole !== "owner") {
+      const owners = await membershipModel.countOwners(input.familyId, tx);
+      if (owners &lt;= 1) {
+        const candidates = await membershipModel.findOtherMembers(
+          input.familyId,
+          target.id,
+          tx,
+        );
+        return { ok: false, reason: "last-owner", candidates };
+      }
+      await window.afterCount?.();
+    }
+
+    await membershipModel.updateRole(input.membershipId, input.nextRole, tx);
+    return { ok: true };
+  });
+}</code></pre>
+          </div>
+
+          <p>
+            Two changes beyond the seam, both load-bearing later:
+            <code>RoleChange</code>'s refusal now carries
+            <code>candidates</code> (the people this owner could transfer to —
+            the service answers the question while it holds the lock, the view
+            will shape it), and the query itself is
+            <code>findOtherMembers</code>, new in the model:
+          </p>
+
+          <div class="file">
+            <span class="file-path">server/src/models/membership.model.ts (addition)</span>
+            <pre><code>export interface MemberCandidate {
+  membershipId: string;
+  email: string;
+}
+
+/**
+ * Everyone in the family except one membership -- the people a last owner could
+ * transfer to. The refusal and its way out travel together, so the client can
+ * render "transfer ownership?" in one round trip.
+ */
+export async function findOtherMembers(
+  familyId: string,
+  selfMembershipId: string,
+  database: Db = prisma,
+): Promise&lt;MemberCandidate[]&gt; {
+  const rows = await database.familyMember.findMany({
+    where: { familyId, id: { not: selfMembershipId } },
+    include: { user: { select: { id: true, email: true } } },
+  });
+  return rows.map((row) =&gt; ({ membershipId: row.id, email: row.user.email }));
+}</code></pre>
+          </div>
+        </li>
+
+        <li>
+          <h3>The check that fires the race on demand</h3>
+
+          <p>
+            A gate is two promises — one that reports arrival at the seam, one
+            that releases it. The test then plays the collision like a score: t1
+            counts and parks; t2 is sent toward the same window; if t2 arrives,
+            <em>both transactions have decided on the same stale fact</em> and
+            the damage is guaranteed, not lucky.
+          </p>
+
+          <div class="file">
+            <span class="file-path">server/src/scripts/checkOwnership.ts (rewritten)</span>
+            <pre><code>import "dotenv/config";
+import { randomUUID } from "node:crypto";
+import { prisma } from "../config/database.js";
+import { changeRole } from "../services/membership.service.js";
+
+// A gate: one promise that reports arrival at the race window, one that
+// releases it. The test -- not the scheduler -- decides the interleaving.
+function gate(): {
+  afterCount: () =&gt; Promise&lt;void&gt;;
+  arrived: Promise&lt;void&gt;;
+  open: () =&gt; void;
+} {
+  let arrive!: () =&gt; void;
+  let open!: () =&gt; void;
+  const arrived = new Promise&lt;void&gt;((resolve) =&gt; (arrive = resolve));
+  const opened = new Promise&lt;void&gt;((resolve) =&gt; (open = resolve));
+  return {
+    afterCount: async () =&gt; {
+      arrive();
+      await opened;
+    },
+    arrived,
+    open: () =&gt; open(),
+  };
+}
+
+// Two owners demote themselves in an interleaving the test chooses. t1 counts
+// and parks inside the race window; t2 must be blocked before it can count.
+// Both of those are asserted -- remove the lock and this fails every run.
+async function main(): Promise&lt;void&gt; {
+  const slug = `probe-${randomUUID().slice(0, 8)}`;
+  const family = await prisma.family.create({
+    data: { slug, name: "Ownership probe" },
+  });
+
+  try {
+    const makeOwner = async (n: number): Promise&lt;string&gt; =&gt; {
+      const user = await prisma.user.create({
+        data: { email: `${slug}-${n}@probe.invalid`, passwordHash: "x" },
+      });
+      const membership = await prisma.familyMember.create({
+        data: { userId: user.id, familyId: family.id, role: "owner" },
+      });
+      return membership.id;
+    };
+    const [ownerA, ownerB] = await Promise.all([makeOwner(1), makeOwner(2)]);
+
+    const g1 = gate();
+    const g2 = gate();
+
+    const t1 = changeRole(
+      { familyId: family.id, membershipId: ownerA, nextRole: "member" },
+      { afterCount: g1.afterCount },
+    );
+    await g1.arrived; // t1 has counted and parked; it holds the family lock
+
+    const t2 = changeRole(
+      { familyId: family.id, membershipId: ownerB, nextRole: "member" },
+      { afterCount: g2.afterCount },
+    );
+    // Did t2 reach the race window while t1 sat in it? With the lock it is
+    // blocked at lockFamily and cannot. The 400ms is only how long we listen:
+    // the invariant assertion below is what makes this check unable to pass
+    // against broken code, whatever the machine.
+    const t2InWindow = await Promise.race([
+      g2.arrived.then(() =&gt; true),
+      new Promise&lt;boolean&gt;((resolve) =&gt; setTimeout(() =&gt; resolve(false), 400)),
+    ]);
+
+    g1.open();
+    g2.open();
+    const results = await Promise.all([t1, t2]);
+
+    const refused = results.filter((r) =&gt; !r.ok).length;
+    const remaining = await prisma.familyMember.count({
+      where: { familyId: family.id, role: "owner" },
+    });
+
+    console.log(
+      `t2 entered the race window while t1 held the lock: ${t2InWindow ? "yes" : "no"}`,
+    );
+    console.log(`demotions refused: ${refused}`);
+    console.log(`owners remaining:  ${remaining}`);
+
+    if (t2InWindow) {
+      throw new Error("RACE NOT SERIALIZED: t2 counted while t1 held the lock");
+    }
+    if (remaining !== 1) {
+      throw new Error(
+        `INVARIANT BROKEN: ${remaining} owner(s) remain, expected 1`,
+      );
+    }
+    console.log("\nownership invariant held under forced interleaving");
+  } finally {
+    await prisma.family.delete({ where: { id: family.id } });
+    await prisma.user.deleteMany({ where: { email: { startsWith: slug } } });
+    await prisma.$disconnect();
+  }
+}
+
+main().catch((error: unknown) =&gt; {
+  console.error(error);
+  process.exitCode = 1;
+});</code></pre>
+          </div>
+
+          <pre><code>npm run check:ownership
+
+t2 entered the race window while t1 held the lock: no
+demotions refused: 1
+owners remaining:  1
+
+ownership invariant held under forced interleaving</code></pre>
+
+          <div class="callout">
+            <span class="callout-title">Measured, not assumed</span>
+            <p>
+              These numbers were verified against this machine's MySQL before
+              this lesson was written. The lock-free variant reported
+              <code>yes / 0 / 0</code> — the bug — on run after run. The
+              <code>Promise.all</code> version caught the same bug 20/20 here
+              and <em>0</em> on the machine in the Arkency post; that spread is
+              exactly why the forced version is the regression test and the
+              other is a coin toss with good manners. Table in
+              <a href="../reference/0008-races-locks-and-refusals.html">Reference 08 §1</a>.
+            </p>
+          </div>
+        </li>
+
+        <li>
+          <h3>One transition: <code>transferOwnership</code></h3>
+
+          <p>
+            The repair operation for the last-owner refusal, with three traps
+            closed: it is <strong>one transaction</strong> (the intent is one
+            fact), it <strong>rejects transfer-to-self</strong> (promote-me-then-demote-me
+            is a third way to reach zero owners), and it
+            <strong>re-reads the caller inside the lock</strong> (another owner
+            may have demoted them while the request was in flight).
+          </p>
+
+          <div class="file">
+            <span class="file-path">server/src/services/membership.service.ts (addition)</span>
+            <pre><code>export type Transfer =
+  | { ok: true }
+  | { ok: false; reason: "not-found" | "self" | "not-owner" };
+
+export type KeepRole = Extract&lt;Role, "member" | "admin"&gt;;
+
+/**
+ * Move ownership to another member as one transition.
+ *
+ * One transaction because the intent is one fact: "Minh owns this family now."
+ * Promote the target, demote the caller -- both writes commit or neither does.
+ * No count is needed here: the unit either commits with at least one owner or
+ * it never happened. (Transfer to *self* would be promote-then-demote of the
+ * same row, so it is rejected below.)
+ */
+export async function transferOwnership(input: {
+  familyId: string;
+  callerMembershipId: string;
+  toMembershipId: string;
+  keepRole: KeepRole;
+}): Promise&lt;Transfer&gt; {
+  return transact(async (tx) =&gt; {
+    await membershipModel.lockFamily(input.familyId, tx);
+
+    // Re-read the caller INSIDE the lock. The route guard saw their role when
+    // the request arrived; another owner may have demoted it since. Trusting
+    // the stale copy would let a demoted owner promote anyone.
+    const caller = await membershipModel.findByFamily(
+      input.familyId,
+      input.callerMembershipId,
+      tx,
+    );
+    if (caller === null || caller.role !== "owner") {
+      return { ok: false, reason: "not-owner" };
+    }
+
+    const target = await membershipModel.findByFamily(
+      input.familyId,
+      input.toMembershipId,
+      tx,
+    );
+    if (target === null) return { ok: false, reason: "not-found" };
+    if (target.id === caller.id) return { ok: false, reason: "self" };
+
+    await membershipModel.updateRole(target.id, "owner", tx);
+    await membershipModel.updateRole(caller.id, input.keepRole, tx);
+    return { ok: true };
+  });
+}</code></pre>
+          </div>
+
+          <p>
+            <code>keepRole</code> is what the outgoing owner becomes —
+            <code>member</code> by default, <code>admin</code> if the family
+            wants grandma to keep editing. That default is a
+            <strong>product decision, not a technical one</strong>: put it in
+            front of a real family and let them tell you.
+          </p>
+
+          <p>
+            And <code>leaveFamily</code> gains the same
+            <code>candidates</code> in its last-owner refusal (same
+            <code>findOtherMembers</code> call, same transaction):
+          </p>
+
+          <div class="file">
+            <span class="file-path">server/src/services/membership.service.ts (change)</span>
+            <pre><code>export type Leave =
+  | { ok: true }
+  | { ok: false; reason: "last-owner"; candidates: MemberCandidate[] };
+
+// inside leaveFamily, where it used to return { ok: false, reason: "last-owner" }:
+    if (membership.role === "owner") {
+      const owners = await membershipModel.countOwners(input.familyId, tx);
+      if (owners &lt;= 1) {
+        const candidates = await membershipModel.findOtherMembers(
+          input.familyId,
+          membership.id,
+          tx,
+        );
+        return { ok: false, reason: "last-owner", candidates };
+      }
+    }</code></pre>
+          </div>
+
+          <div class="callout">
+            <span class="callout-title">One endpoint or two steps? The honest answer</span>
+            <p>
+              Two steps through the existing API — promote Minh, then demote
+              yourself — <em>cannot</em> break the invariant: the last-owner
+              guard makes the dangerous order answer 409. What two steps cost is
+              <strong>atomicity of intent</strong> — a crash between them leaves
+              two owners and a transfer that half happened, and the audit trail
+              never records "and An stopped being owner". One endpoint makes the
+              intent the unit. The counter-case is real too (recipient should
+              accept? "step down later" without a deadline?) — but that is a
+              <em>protocol with state</em>, which is what lesson 09's
+              invitations are. Full argument:
+              <a href="../reference/0008-races-locks-and-refusals.html">Reference 08 §3</a>.
+            </p>
+          </div>
+        </li>
+
+        <li>
+          <h3>A 409 the client can act on</h3>
+
+          <p>
+            A message is prose; a client needs a contract. Three additions to the
+            shared contract — a machine <code>code</code>, a remediation the
+            client can execute, and the problem shape itself (RFC 9457):
+          </p>
+
+          <div class="file">
+            <span class="file-path">shared/contracts/api.ts (additions)</span>
+            <pre><code>/** Why the server refused -- the field the client branches on. Never parse detail. */
+export type ProblemCode = "last_owner" | "not_owner";
+
+/** The way out of a refusal, as data: what to call, and with whom. */
+export interface TransferRemediation {
+  action: "transfer_ownership";
+  method: "POST";
+  href: string;
+  candidates: { membershipId: string; email: string }[];
+}
+
+/** RFC 9457 problem details plus KinLink's extensions. Served as problem+json. */
+export interface ApiProblem {
+  type: string;
+  title: string;
+  status: number;
+  code: ProblemCode;
+  detail: string;
+  remediation?: TransferRemediation;
+}</code></pre>
+          </div>
+
+          <p>
+            Errors are output shapes, so they belong to the view layer — the
+            layer that decides what the client is allowed to see:
+          </p>
+
+          <div class="file">
+            <span class="file-path">server/src/views/problem.view.ts (new)</span>
+            <pre><code>import type {
+  ApiProblem,
+  ProblemCode,
+  TransferRemediation,
+} from "../contracts.js";
+import type { MemberCandidate } from "../models/membership.model.js";
+
+// One place that turns a refusal into its wire shape. The title belongs to the
+// problem TYPE and never changes per occurrence; `detail` is per occurrence.
+const TITLES: Record&lt;ProblemCode, string&gt; = {
+  last_owner: "A family must keep at least one owner",
+  not_owner: "Your role changed while this request was in flight",
+};
+
+export function problem(input: {
+  code: ProblemCode;
+  status: number;
+  detail: string;
+  remediation?: TransferRemediation;
+}): ApiProblem {
+  return {
+    type: `/problems/${input.code}`,
+    title: TITLES[input.code],
+    status: input.status,
+    code: input.code,
+    detail: input.detail,
+    ...(input.remediation ? { remediation: input.remediation } : {}),
+  };
+}
+
+export function lastOwnerProblem(
+  slug: string,
+  candidates: MemberCandidate[],
+): ApiProblem {
+  return problem({
+    code: "last_owner",
+    status: 409,
+    detail: "Promote another member or transfer ownership, then try again.",
+    remediation: {
+      action: "transfer_ownership",
+      method: "POST",
+      href: `/api/families/${slug}/transfer-ownership`,
+      candidates,
+    },
+  });
+}</code></pre>
+          </div>
+
+          <p>
+            The controller now answers the refusal with that body, and the
+            transfer route joins the file. Note where each status is decided —
+            the controller chooses codes, the service returns reasons:
+          </p>
+
+          <div class="file">
+            <span class="file-path">server/src/controllers/family.controller.ts (changes)</span>
+            <pre><code>import { lastOwnerProblem, problem } from "../views/problem.view.js";
+import { transferOwnership, type KeepRole } from "../services/membership.service.js";
+
+// patchMemberRole and leave: the 409 branch becomes
+    if (!result.ok) {
+      if (result.reason === "not-found") {
+        res.status(404).json({ message: "Member not found" });
+        return;
+      }
+      res
+        .status(409)
+        .type("application/problem+json")
+        .json(lastOwnerProblem(family.slug, result.candidates));
+      return;
+    }
+
+export async function transferOwner(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise&lt;void&gt; {
+  try {
+    const { family, membership } = familyContext(req);
+    // Express 5: req.body is undefined when nothing parsed it.
+    const body = (req.body ?? {}) as { to?: unknown; keepRole?: unknown };
+    const to = body.to;
+    const keepRole = body.keepRole ?? "member";
+
+    if (
+      typeof to !== "string" ||
+      (keepRole !== "member" &amp;&amp; keepRole !== "admin")
+    ) {
+      res.status(400).json({
+        message: "to must be a membership id; keepRole must be member or admin",
+      });
+      return;
+    }
+
+    const result = await transferOwnership({
+      familyId: family.id,
+      callerMembershipId: membership.id,
+      toMembershipId: to,
+      keepRole,
+    });
+
+    if (!result.ok) {
+      if (result.reason === "self") {
+        res.status(400).json({ message: "You already own this family" });
+        return;
+      }
+      if (result.reason === "not-found") {
+        res.status(404).json({ message: "Member not found" });
+        return;
+      }
+      // "not-owner": demoted mid-request. A state conflict, not a verdict on
+      // the caller -- so 409, and the client reloads and retries.
+      res
+        .status(409)
+        .type("application/problem+json")
+        .json(
+          problem({
+            code: "not_owner",
+            status: 409,
+            detail:
+              "Your role changed while this request was in flight. Reload and try again.",
+          }),
+        );
+      return;
+    }
+
+    res.status(204).end();
+  } catch (error) {
+    next(error);
+  }
+}</code></pre>
+          </div>
+
+          <div class="file">
+            <span class="file-path">server/src/routes/family.routes.ts (change)</span>
+            <pre><code>import { leave, patchMemberRole, transferOwner } from "../controllers/family.controller.js";
+
+// owner-only, and it is the operation the last-owner refusal points at.
+familyRouter.post(
+  "/transfer-ownership",
+  requireRole("owner"),
+  transferOwner,
+);</code></pre>
+          </div>
+
+          <p>
+            What the refusal looks like on the wire now — and what the client
+            does with it:
+          </p>
+
+          <pre><code>HTTP/1.1 409 Conflict
+Content-Type: application/problem+json
+
+{
+  "type": "/problems/last_owner",
+  "title": "A family must keep at least one owner",
+  "status": 409,
+  "code": "last_owner",
+  "detail": "Promote another member or transfer ownership, then try again.",
+  "remediation": {
+    "action": "transfer_ownership",
+    "method": "POST",
+    "href": "/api/families/nguyen/transfer-ownership",
+    "candidates": [
+      { "membershipId": "c1f0…", "email": "minh@example.com" },
+      { "membershipId": "9a3e…", "email": "lan@example.com" }
+    ]
+  }
+}</code></pre>
+
+          <pre><code>const problem: ApiProblem = await res.json();
+
+if (problem.code === "last_owner" &amp;&amp; problem.remediation?.action === "transfer_ownership") {
+  openTransferDialog(problem.remediation.candidates); // not: alert(problem.detail)
+}</code></pre>
+
+          <p>
+            The branch is exhaustive and type-checked because
+            <code>ProblemCode</code> is a union in the contract both sides
+            compile against. The RFC is explicit that <code>detail</code> is not
+            a protocol: "Consumers SHOULD NOT parse the <code>detail</code>
+            member for information; extensions are more suitable and less
+            error-prone" — and that clients "MUST ignore any such extensions
+            they don't recognize", so the body can grow without breaking the
+            client. Anatomy and security notes:
+            <a href="../reference/0008-races-locks-and-refusals.html">Reference 08 §5</a>.
+          </p>
+        </li>
+
+        <li>
+          <h3>Commit</h3>
+          <pre><code>npm run typecheck &amp;&amp; npm run check:guards &amp;&amp; npm run check:ownership
+git add -A
+git commit -m "Add ownership transfer with a deterministic race check and problem bodies"</code></pre>
+        </li>
+      </ol>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Defend it: why not an isolation level?</h2>
+
+      <p>
+        <code>SERIALIZABLE</code> would make check-then-write safe
+        <em>everywhere</em> — so why does this codebase reach for one
+        <code>FOR UPDATE</code> instead? Three reasons, and one counter-case you
+        should be able to say out loud (full version in
+        <a href="../reference/0008-races-locks-and-refusals.html">Reference 08 §2</a>):
+      </p>
+
+      <ul>
+        <li>
+          <strong>Scope.</strong> The manual: SERIALIZABLE "implicitly converts
+          all plain <code>SELECT</code> statements to <code>SELECT … FOR
+          SHARE</code> if autocommit is disabled" — every read in every
+          transaction, the people list included, starts taking locks.
+        </li>
+        <li>
+          <strong>Failure mode.</strong> Under SERIALIZABLE both demotions read
+          with shared locks and then write with exclusive ones: one transaction
+          dies in a deadlock error and needs retries (this session's prediction,
+          not a measurement — run it and check). Under <code>FOR UPDATE</code>
+          the second waits and <em>refuses with a 409 the client can act on</em>.
+          The lock turns a concurrency problem into a business answer.
+        </li>
+        <li>
+          <strong>Legibility.</strong> The lock sits at the exact check it
+          protects. An isolation level hides in configuration.
+        </li>
+      </ul>
+
+      <div class="callout warn">
+        <span class="callout-title">The counter-case, straight from the manual</span>
+        <p>
+          "It is not recommended to mix locking statements … with non-locking
+          <code>SELECT</code> statements in a single REPEATABLE READ
+          transaction, because typically in such cases you want
+          SERIALIZABLE." KinLink does mix them — a locking read of the family
+          row, plain reads of the memberships. It is sound because the lock is
+          taken <strong>before the first plain read</strong>, so the snapshot it
+          decides on is already a serialized world (measured: the second
+          transaction counted <code>1</code>). The rule to remember:
+          <strong>the lock protects the read, not the write</strong> —
+          <em>lock → read → decide → write</em>. Every writer of ownership rows
+          must hold it, seed scripts included, or the manual wins the argument.
+        </p>
+      </div>
+
+      <h2>Defend it: why does the rank live in code?</h2>
+
+      <p>
+        A <code>role_rank</code> table would let each family define roles. It
+        buys the <em>order</em> and breaks the <em>rules</em>: "a family keeps
+        at least one owner" keys on the name <code>owner</code>, and custom
+        roles turn every such invariant into a capability question the table
+        cannot answer. Ranks also cannot express "may edit events but not
+        people" — that is a capability set, not a position on a total order.
+        What code buys: <code>satisfies Record&lt;Role, number&gt;</code> makes a
+        new role a <strong>compile error</strong> until a human ranks it in a
+        reviewed change — while a row is an <code>INSERT</code> that can quietly
+        insert <code>superowner</code> and rewrite every rule keyed on the
+        maximum. The escape hatch stays open: all checks funnel through
+        <code>requireRole</code>, so if real families ever demand custom roles,
+        move the map behind that seam and re-key the invariants on capabilities
+        (OWASP's ReBAC section is the next read). Both sides:
+        <a href="../reference/0008-races-locks-and-refusals.html">Reference 08 §4</a>.
+      </p>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Verify</h2>
+
+      <ul class="checklist">
+        <li><code>npm run typecheck</code> exits 0.</li>
+        <li>
+          <code>npm run check:ownership</code> prints
+          <code>t2 entered the race window …: no</code> and
+          <code>owners remaining:  1</code>.
+        </li>
+        <li>The sole owner's <code>POST /leave</code> answers <code>409</code> with <code>"code": "last_owner"</code> and a <code>candidates</code> list.</li>
+        <li><code>POST /transfer-ownership</code> to your own membership id answers <code>400</code>.</li>
+        <li><code>POST /transfer-ownership</code> to a real member answers <code>204</code> — and your next <code>PATCH</code> answers <code>403</code>.</li>
+      </ul>
+
+      <pre><code># Log in as the owner of nguyen (seed: an@example.com / correcthorsebatterystaple)
+curl -s -X POST localhost:4000/api/auth/login -H 'Content-Type: application/json' \
+  -d '{"email":"an@example.com","password":"correcthorsebatterystaple"}' -c /tmp/an.txt
+
+# Who could own this family? Membership ids, one per row.
+docker exec kinlink-mysql mysql -ukinlink -pkinlink kinlink -e "
+SELECT fm.id, u.email, fm.role FROM family_members fm
+JOIN users u ON u.id = fm.user_id
+JOIN families f ON f.id = fm.family_id WHERE f.slug = 'nguyen';" 2>/dev/null
+
+# The refusal now carries its own way out -- read the body.
+curl -s -b /tmp/an.txt -X POST localhost:4000/api/families/nguyen/leave
+
+# Transfer to self must never work: it is promote-then-demote of one row.
+curl -si -b /tmp/an.txt -X POST localhost:4000/api/families/nguyen/transfer-ownership \
+  -H 'Content-Type: application/json' -d '{"to":"&lt;an-membership-id&gt;"}' | head -1
+
+# The real transfer: 204, and An is no longer owner afterwards.
+curl -si -b /tmp/an.txt -X POST localhost:4000/api/families/nguyen/transfer-ownership \
+  -H 'Content-Type: application/json' -d '{"to":"&lt;other-membership-id&gt;"}' | head -1</code></pre>
+
+      <h2>Break it on purpose</h2>
+
+      <ol>
+        <li>
+          <strong>Delete the lock, run the check ten times.</strong> Predict the
+          exact output first. You should get <code>yes / 0 / 0</code> and
+          <code>INVARIANT BROKEN</code> — <em>identical on all ten runs</em>.
+          That repetition is the lesson: last week's
+          <code>Promise.all</code> version gave you a coin flip; this one gives
+          you the bug every time it exists.
+        </li>
+        <li>
+          <strong>The lock stays in the file — move it after the count.</strong>
+          Swap the order so <code>countOwners</code> runs before
+          <code>lockFamily</code>. Predict, then run. The check fails again
+          (t2 counted <code>2</code>), because the snapshot each transaction
+          decides on is established at its first plain read: before the lock,
+          that is a world the lock never excluded.
+          <strong>The lock protects the read.</strong>
+        </li>
+        <li>
+          <strong>Transfer to yourself.</strong> Delete the
+          <code>target.id === caller.id</code> guard, then as sole owner transfer
+          to your own membership id. The repair endpoint answers
+          <code>204</code> — and the family has zero owners. The tool that fixes
+          the invariant must not be able to break it.
+        </li>
+        <li>
+          <strong>Trust the middleware.</strong> Use
+          <code>membership.role</code> from <code>familyContext</code> in
+          <code>transferOwnership</code> instead of re-reading the caller. Write
+          down the two-request interleaving (two browser tabs, one demoted
+          mid-transfer) that turns a demoted owner into someone who can promote
+          anyone. Which problem code must the demoted-in-flight request receive?
+        </li>
+        <li>
+          <strong>Erase the machine code.</strong> Remove <code>code</code> and
+          <code>remediation</code> from the 409 body and write the client branch
+          that offers "transfer ownership". Now edit
+          <code>detail</code> to say "You cannot leave yet." — the branch broke
+          and no compiler noticed. That is the difference between a contract and
+          prose.
+        </li>
+      </ol>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Retrieval practice</h2>
+
+      <p>No scrolling back. Answer first, then check.</p>
+
+      <div class="quiz" data-quiz>
+        <script type="application/json">
+          [
+            {
+              "q": "What makes the race check deterministic instead of merely lucky?",
+              "options": [
+                "A seam parks both transactions between the count and the write",
+                "A loop reruns the race until the scheduler finally loses",
+                "A sleep widens the race window until both writers overlap",
+                "A mocked model layer lets the test decide who goes first"
+              ],
+              "answer": 0,
+              "why": "The losing interleaving is constructed: both transactions decide on the same stale fact before either writes, so the bug cannot hide in the schedule. Loops and sleeps sample the scheduler instead, which is why the same technique caught the bug 20/20 on this machine and 0/20 on another."
+            },
+            {
+              "q": "Why use FOR UPDATE here instead of raising the isolation level?",
+              "options": [
+                "It locks only the family row, and the refusal stays a business answer",
+                "It raises safety for every query while leaving all the call sites alone",
+                "SERIALIZABLE cannot lock plain selects and so it leaves them wide open",
+                "SERIALIZABLE is not supported by MySQL when a driver adapter is in use"
+              ],
+              "answer": 0,
+              "why": "Scope and failure mode. SERIALIZABLE converts every plain SELECT into a locking read across the whole app, and two read-then-write transactions tend to end in a deadlock error and retries. FOR UPDATE locks one row at one site, and the second transaction waits, re-reads, and refuses with a 409 the client can act on."
+            },
+            {
+              "q": "Why is ownership transfer one endpoint and one transaction?",
+              "options": [
+                "The promote and the demote commit together, so the intent is atomic",
+                "Two steps let the demotion commit first and orphan every single owner",
+                "A single endpoint performs one authorisation check while two steps need two",
+                "A single request cannot express two writes, so the route must split"
+              ],
+              "answer": 0,
+              "why": "The intent is one fact, so it gets one commit: both writes land or neither does. Two steps through the API cannot actually orphan the family — the last-owner guard answers 409 to a demote-first order — but a crash between them leaves a half-finished transfer and an audit trail that never says who stopped being owner."
+            },
+            {
+              "q": "Why does the role rank live in code rather than a role_rank table?",
+              "options": [
+                "A compile error forces each new role's placement before anything can ship",
+                "A table cannot store integers, so ranks would need another data type",
+                "SQL cannot compare integers, so ranks must be compared inside of code",
+                "The database cannot enforce a total order over the roles of families"
+              ],
+              "answer": 0,
+              "why": "The total map makes a new role a compile error until a human ranks it in a reviewed change — and custom roles would break every invariant keyed on the name 'owner' anyway, because a rank orders roles while invariants need capabilities. If families ever demand custom roles, move the map behind requireRole and re-key on capabilities."
+            },
+            {
+              "q": "What must a 409 body carry so the client can offer a fix?",
+              "options": [
+                "A machine-readable code plus the remediation action, its endpoint and candidate list",
+                "A human message describing the problem and the precise steps to follow",
+                "The status code repeated inside the body so the client can verify it",
+                "A stack trace fragment so that the support team can find it fast"
+              ],
+              "answer": 0,
+              "why": "Three questions: what happened (title/detail, for humans), why (code, for machines), what now (remediation, as data). RFC 9457 says consumers SHOULD NOT parse detail — string matching on a sentence breaks on the next copy edit — and a stack trace in a body is an internals leak."
+            },
+            {
+              "q": "Why does the session hold userId but never a familyId?",
+              "options": [
+                "Session values must stay stable for its life, while authorisation changes per request",
+                "A family id in the session would let the client choose any other family",
+                "Sessions can only ever store one single string value at any one time",
+                "The membership table already stores that value, so storing it twice is bad"
+              ],
+              "answer": 0,
+              "why": "Interleaved from lesson 06: a value belongs in the session only if it is stable for the session's life. Identity qualifies; authorisation context changes with the resource named, so it is resolved per request — which is why leaving a family needs no session surgery at all."
+            }
+          ]
+        </script>
+      </div>
+
+      <h2>Primary source</h2>
+
+      <div class="callout win">
+        <span class="callout-title">Read this next</span>
+        <p>
+          <a
+            href="https://blog.arkency.com/making-race-condition-tests-deterministic-with-cyclicbarrier-and-seam/"
+            >Arkency — Making race condition tests deterministic with
+            CyclicBarrier and seam</a
+          >
+          is one short post and it is today's build in Ruby: the acceptance rule
+          ("a test that FAILS without the lock and PASSES with it"), the seam
+          from Feathers, the barrier at the read-then-write window, and the proof
+          by commenting out the lock. Read it and say where KinLink's version
+          differs — one place, and it is a deliberate trade-off.
+        </p>
+        <p>
+          Then
+          <a href="https://www.rfc-editor.org/rfc/rfc9457.html">RFC 9457 §3</a>
+          — its out-of-credit example is literally "here is why you were refused
+          and here is where to fix it", which is your 409. And when you want the
+          grown-up version of forcing schedules: Microsoft's
+          <a
+            href="https://www.microsoft.com/en-us/research/publication/chess-a-systematic-testing-tool-for-concurrent-software/"
+            >CHESS</a
+          >
+          enumerates <em>all</em> interleavings of a scenario; FoundationDB's
+          <a href="https://apple.github.io/foundationdb/testing.html"
+            >Simulation and Testing</a
+          >
+          explains why determinism itself is the prize.
+        </p>
+      </div>
+
+      <div class="prompt">
+        <span class="prompt-title">Ask your teacher</span>
+        <p>
+          Ask me whether the recipient should have to <em>accept</em> ownership
+          before it moves — and what that protocol would look like. Ask how
+          idempotency keys would make a retried transfer safe (week 8, early).
+          Ask whether the explicit seam should have been dependency injection
+          instead. And before you run it: predict what
+          <code>SERIALIZABLE</code> does to the forced check, line by line — then
+          tell me what you saw.
+        </p>
+      </div>
+
+      <footer class="lesson-footer">
+        <p class="next-up">
+          <strong>Next:</strong> Lesson 09 — invitations. Resequenced from 08 by
+          your five questions: the token that stands in for membership is a
+          <em>protocol with state</em> — propose, accept, expire — and this
+          lesson just built the reason one might be needed. Then the client,
+          which finally has an API worth rendering.
+        </p>
+        <p>
+          <a href="../MISSION.md">MISSION.md</a> ·
+          <a href="../ROADMAP.md">ROADMAP.md</a> ·
+          <a href="../GLOSSARY.md">GLOSSARY.md</a> ·
+          <a href="../PROGRESS.md">PROGRESS.md</a> ·
+          <a href="../reference/0008-races-locks-and-refusals.html">Reference 08</a> ·
+          <a href="../reference/0007-membership-lifecycle.html">Reference 07</a>
+        </p>
+      </footer>
+    </div>
+
+    <script src="../assets/quiz.js"></script>
+  </body>
+</html>

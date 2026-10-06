@@ -1,0 +1,651 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lesson 05 — Finish the auth contract</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="lesson-header">
+        <p class="eyebrow">Lesson 05 · Week 4 · about 90 minutes</p>
+        <h1>Finish the auth contract: types, 401, and a guard you can't forget</h1>
+        <p class="lede">
+          Lesson 04 made authentication <em>run</em>. It did not make it
+          <em>typecheck</em>, and it did not make an unauthenticated request answer
+          honestly. Both have to be true before a client can be built on top — so this
+          lesson closes the contract, and makes forgetting <code>requireAuth</code>
+          structurally hard.
+        </p>
+        <div class="meta-row">
+          <span>Mission: ship KinLink</span>
+          <span>Reference: <a href="../reference/0005-auth-mechanics.html">Auth mechanics</a></span>
+          <span>Requires: <a href="0004-authentication-sessions-bcrypt.html">Lesson 04</a></span>
+        </div>
+      </header>
+
+      <div class="callout win">
+        <span class="callout-title">The win</span>
+        <p>
+          <code>npm run typecheck</code> goes from <strong>10 errors to 0</strong>
+          without a single unsafe cast. An unauthenticated request answers
+          <code>401</code> instead of lying with a <code>500</code>. And a ninth
+          protected resource can be added with one line, because authentication becomes
+          the <em>default</em> rather than an argument you have to remember — backed by a
+          one-command guard check you wrote yourself, with no test framework and no
+          database.
+        </p>
+      </div>
+
+      <h2>Why this lesson exists</h2>
+
+      <p>
+        Two reasons, and the first one is not optional.
+      </p>
+
+      <p>
+        <strong>The compiler is already complaining.</strong> Ten errors, all in the
+        auth layer you committed last session:
+      </p>
+
+      <pre><code>$ npm run typecheck
+
+server/src/controllers/auth.controller.ts(53,17): error TS2339:
+  Property 'userId' does not exist on type 'Session &amp; Partial&lt;SessionData&gt;'.
+server/src/controllers/auth.controller.ts(54,17): error TS2339:
+  Property 'familyId' does not exist on type 'Session &amp; Partial&lt;SessionData&gt;'.
+server/src/controllers/auth.controller.ts(92,17): error TS2339: ...
+server/src/controllers/auth.controller.ts(93,17): error TS2339: ...
+server/src/controllers/auth.controller.ts(134,32): error TS2339: ...
+server/src/middlewares/auth.ts(3,43): error TS2694:
+  Namespace 'global.Express' has no exported member 'MutatedSession'.
+server/src/middlewares/auth.ts(16,5): error TS2722:
+  Cannot invoke an object which is possibly 'undefined'.
+server/src/middlewares/auth.ts(20,7): error TS2339:
+  Property 'authenticatedUserId' does not exist on ...
+server/src/middlewares/auth.ts(21,7): error TS2339:
+  Property 'authenticatedFamilyId' does not exist on ...
+server/src/routes/people.routes.ts(6,23): error TS2769:
+  No overload matches this call.</code></pre>
+
+      <p>
+        Read that list again and notice it is not ten problems. It is <strong>one</strong>
+        problem with ten symptoms: <strong>nothing has told TypeScript what you attach
+        to a request.</strong> The <code>as unknown as SessionWithUser</code> cast was
+        papering over the missing declaration, which is why the cast exists in the first
+        place — a cast is usually a type you declined to write down.
+      </p>
+
+      <div class="callout warn">
+        <span class="callout-title">Why this blocks the client</span>
+        <p>
+          <code>server/src/middlewares/auth.ts</code> calls
+          <code>req.next(new Error("Authentication required"))</code>. That error lands in
+          <code>errorHandler</code>, which answers <strong><code>500</code></strong
+          >. So today an unauthenticated request is told <em>"the server is broken"</em>
+          when the truth is <em>"you haven't told me who you are"</em>. A client cannot
+          build a login flow on that: it can never distinguish
+          <strong>401 → show the login form</strong> from
+          <strong>500 → show the crash page</strong>. The status code is part of the
+          contract, and the contract is unfinished.
+        </p>
+      </div>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Build it</h2>
+
+      <ol class="steps">
+        <li>
+          <h3>Declare what you attach — once</h3>
+
+          <p>
+            Two things get attached at runtime: <code>userId</code>/<code>familyId</code>
+            onto <code>req.session</code>, and <code>authenticatedUserId</code>/<code
+              >authenticatedFamilyId</code
+            >
+            onto <code>req</code>. Both need a declaration.
+          </p>
+
+          <div class="file">
+            <span class="file-path">server/src/types/express.d.ts</span>
+            <pre><code>import "express-session";
+
+// express-session declares SessionData inside its own `session` namespace, so
+// the merge path is the module. This is the idiom its own docs recommend.
+declare module "express-session" {
+  interface SessionData {
+    userId?: string;
+    familyId?: string;
+  }
+}
+
+// It augments Request from the *global* Express namespace, so this merge path
+// is different -- same file, same idea, two different places in the types.
+declare global {
+  namespace Express {
+    interface Request {
+      authenticatedUserId?: string;
+      authenticatedFamilyId?: string;
+    }
+  }
+}
+
+// Without this the file is a script, and `declare global` is illegal in a
+// script. One line, load-bearing.
+export {};</code></pre>
+          </div>
+
+          <div class="callout">
+            <span class="callout-title">Why two different merge styles, honestly</span>
+            <p>
+              Because the two types live in two different places. In
+              <code>@types/express-session</code>, <code>Request</code> is declared at
+              line 10 <em>inside</em> <code>declare global { namespace Express { … } }</code>,
+              while <code>SessionData</code> is declared around line 212 inside
+              <code>declare namespace session</code> — the module's own export.
+              Declaration merging has to target the namespace the interface actually
+              lives in. If you get it wrong you get "no exported member", not a silent
+              no-op, which is a mercy.
+            </p>
+          </div>
+
+          <div class="callout warn">
+            <span class="callout-title">The file must live inside the program</span>
+            <p>
+              <code>tsconfig.json</code> includes <code>["server/src", "shared"]</code>, so
+              this file has to be under one of those two. Put it anywhere else — a
+              <code>server/types/</code> folder beside <code>src</code>, the repo root — and
+              <strong>TypeScript never reads it and never says so.</strong> No error, no
+              warning: the file is simply not part of the program, so all ten errors stay
+              exactly as they were and you go looking for a bug in the wrong place.
+            </p>
+            <p>
+              Ambient declarations do not fail loudly. <strong>They fail by doing
+              nothing</strong> — which is the same trap as the missing
+              <code>requireAuth</code>, in a different costume.
+            </p>
+          </div>
+
+          <p>
+            The fields are <strong>optional</strong> on purpose, and the honesty is worth
+            the small cost: they genuinely are absent on public routes. Declaring them
+            as <code>string</code> would be a prettier lie that reintroduces exactly the
+            bug this lesson is about — a value typed as present that is
+            <code>undefined</code> at runtime.
+          </p>
+        </li>
+
+        <li>
+          <h3>The guard, with no casts and an honest status code</h3>
+
+          <div class="file">
+            <span class="file-path">server/src/middlewares/auth.ts</span>
+            <pre><code>import type { Request, RequestHandler } from "express";
+import type { ApiErrorBody } from "../contracts.js";
+
+/**
+ * Reject unauthenticated requests. 401, not 500: nothing failed on the server,
+ * the caller simply did not present credentials.
+ */
+export const requireAuth: RequestHandler = (req, res, next) =&gt; {
+  const { userId, familyId } = req.session;
+
+  if (!userId || !familyId) {
+    const body: ApiErrorBody = { message: "Authentication required" };
+    res.status(401).json(body);
+    return;
+  }
+
+  req.authenticatedUserId = userId;
+  req.authenticatedFamilyId = familyId;
+  next();
+};
+
+/**
+ * Read the auth context, refusing to guess.
+ *
+ * Anything mounted below requireAuth will have set these. If they are missing we
+ * have a wiring bug -- a route reached a controller without the guard -- and a
+ * wiring bug must fail loudly rather than quietly reading the wrong rows.
+ */
+export function authContext(req: Request): { userId: string; familyId: string } {
+  const { authenticatedUserId, authenticatedFamilyId } = req;
+
+  if (!authenticatedUserId || !authenticatedFamilyId) {
+    throw new Error("Route is missing requireAuth");
+  }
+
+  return {
+    userId: authenticatedUserId,
+    familyId: authenticatedFamilyId,
+  };
+}</code></pre>
+          </div>
+
+          <p>
+            Note what disappeared: <code>SessionWithUser</code>, and both casts. The
+            middleware is now eleven lines of obvious code, because the interesting part
+            moved into the declaration from step 1.
+          </p>
+        </li>
+
+        <li>
+          <h3>Make authentication the default</h3>
+
+          <p>
+            This is the answer to the question you asked: <em>how do you make the
+            missing-<code>requireAuth</code> mistake harder to repeat?</em> Your answer —
+            "wrap multiple routes into a group, and add new routes inside the group" — is
+            the right instinct, and Express can make it structural rather than
+            conventional. Declare the public routes, then put the guard in the middle of
+            the file and let everything below it inherit protection.
+          </p>
+
+          <div class="file">
+            <span class="file-path">server/src/routes/index.ts</span>
+            <pre><code>import { Router } from "express";
+import type { ApiResponse } from "../contracts.js";
+import { requireAuth } from "../middlewares/auth.js";
+import { authRouter } from "./auth.routes.js";
+import { peopleRouter } from "./people.routes.js";
+
+export const apiRouter = Router();
+
+// ---------------------------------------------------------------- public ----
+// Deliberately reachable without a session. Everything above the guard is a
+// decision someone made on purpose.
+apiRouter.get("/health", (_req, res) =&gt; {
+  const body: ApiResponse&lt;{ status: "ok" }&gt; = { data: { status: "ok" } };
+  res.status(200).json(body);
+});
+
+apiRouter.use("/auth", authRouter);
+
+// ----------------------------------------------------------------- guard ----
+// Everything below this line is authenticated. There is no argument to forget
+// and no per-route annotation to copy; a new router added down here is
+// protected the moment it is mounted.
+apiRouter.use(requireAuth);
+
+// ------------------------------------------------------------- protected ----
+apiRouter.use("/people", peopleRouter);</code></pre>
+          </div>
+
+          <div class="callout">
+            <span class="callout-title">The real principle: choose the failure direction</span>
+            <p>
+              Add a public route <em>below</em> the guard by mistake and it returns 401 —
+              loud, obvious, caught in seconds. Forget the guard the old way and every
+              family reads every family's data — silent, caught by a customer. Both are
+              mistakes; only one of them is survivable. Moving the guard to a single line
+              is not just DRY, it converts a
+              <strong>silent failure into a noisy one</strong>, which is the only kind of
+              failure you actually get to learn from.
+            </p>
+          </div>
+        </li>
+
+        <li>
+          <h3>The controller stops reaching into the request</h3>
+
+          <div class="file">
+            <span class="file-path">server/src/controllers/people.controller.ts</span>
+            <pre><code>import type { NextFunction, Request, Response } from "express";
+import type { ApiResponse, PersonResource } from "../contracts.js";
+import { authContext } from "../middlewares/auth.js";
+import { listPeople } from "../services/people.service.js";
+import { toPersonResource } from "../views/person.view.js";
+
+export async function getPeople(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise&lt;void&gt; {
+  try {
+    const { familyId } = authContext(req);
+    const people = await listPeople(familyId);
+
+    const body: ApiResponse&lt;PersonResource[]&gt; = {
+      data: people.map(toPersonResource),
+    };
+
+    res.status(200).json(body);
+  } catch (error) {
+    next(error);
+  }
+}</code></pre>
+          </div>
+
+          <p>
+            Delete the local <code>RequestWithAuth</code> interface — it was the thing
+            breaking <code>people.routes.ts</code>, because a handler expecting a
+            <em>narrower</em> request is not assignable where Express expects the general
+            one. With the fields declared globally, <code>req</code> is just
+            <code>Request</code>, and the overload error evaporates.
+          </p>
+
+          <p>
+            <code>authContext(req)</code> is the third layer of defence. The model
+            already makes an unscoped query impossible (lesson 03 gave
+            <code>findByFamily</code> a required argument). This makes the
+            <em>consequence</em> of a missing guard loud: a wiring bug becomes a 500 that
+            says <code>Route is missing requireAuth</code>, not an empty list or someone
+            else's family.
+          </p>
+        </li>
+
+        <li>
+          <h3>Prove it, with no framework and no database</h3>
+
+          <p>
+            A missing middleware is invisible to the compiler, so the compiler can never
+            be the answer. What catches it is a request. You do not need Vitest,
+            Supertest or a running MySQL for this — you need
+            <code>createApp()</code>, an ephemeral port, and <code>fetch</code>.
+          </p>
+
+          <div class="file">
+            <span class="file-path">server/src/scripts/checkGuards.ts</span>
+            <pre><code>import { createApp } from "../app.js";
+
+// Deliberately no cookie. requireAuth rejects before any controller runs, so
+// this script never touches the database -- MySQL does not need to be up.
+const PROTECTED = ["/api/people"];
+
+async function main(): Promise&lt;void&gt; {
+  // Port 0 asks the OS for a free port, so this never collides with `npm run dev`.
+  const server = createApp().listen(0);
+  await new Promise&lt;void&gt;((resolve, reject) =&gt; {
+    server.once("listening", resolve);
+    server.once("error", reject);
+  });
+
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("Expected a TCP address from listen(0)");
+  }
+  const base = `http://127.0.0.1:${address.port}`;
+
+  const failures: string[] = [];
+  for (const path of PROTECTED) {
+    const response = await fetch(`${base}${path}`);
+    const passed = response.status === 401;
+    console.log(`${passed ? "ok  " : "FAIL"} ${path} -&gt; ${response.status}`);
+    if (!passed) failures.push(`${path} -&gt; ${response.status}, expected 401`);
+  }
+
+  server.closeAllConnections();
+  await new Promise&lt;void&gt;((resolve) =&gt; server.close(() =&gt; resolve()));
+
+  if (failures.length &gt; 0) {
+    console.error(`\n${failures.length} guard check(s) failed`);
+    process.exitCode = 1;
+  } else {
+    console.log(`\n${PROTECTED.length} guard check(s) passed`);
+  }
+}
+
+main().catch((error: unknown) =&gt; {
+  console.error(error);
+  process.exitCode = 1;
+});</code></pre>
+          </div>
+
+          <div class="file">
+            <span class="file-path">package.json (scripts, excerpt)</span>
+            <pre><code>"check:guards": "tsx server/src/scripts/checkGuards.ts"</code></pre>
+          </div>
+
+          <pre><code>npm run check:guards
+
+ok   /api/people -> 401
+
+1 guard check(s) passed</code></pre>
+
+          <div class="callout">
+            <span class="callout-title">A note on what this is not</span>
+            <p>
+              It is a smoke check, not a test suite — the real pyramid (Vitest, unit vs
+              integration boundaries, coverage you can defend) is week 7, deliberately.
+              What it buys you today is that
+              <strong>the guard now has to be checked by doing</strong>, and the
+              <code>PROTECTED</code> list is a written-down claim about what you protect.
+              When the list is wrong, the list is wrong on purpose and visible in a diff —
+              which is far better than being wrong invisibly.
+            </p>
+          </div>
+        </li>
+
+        <li>
+          <h3>Fix the comment, not the code</h3>
+
+          <p>
+            Your <code>login</code> handler carries a comment claiming
+            <code>bcrypt.compare()</code> is "constant-time comparison". It is not, and
+            the wrongness matters — see
+            <a href="../reference/0005-auth-mechanics.html">Reference 05</a>. The
+            <em>code</em> is correct; only the claim is wrong. Comments are claims, and a
+            claim that misleads the next reader is a bug in the cheapest place to fix it.
+          </p>
+
+          <div class="file">
+            <span class="file-path">server/src/controllers/auth.controller.ts (comment only)</span>
+            <pre><code>    const match = await bcrypt.compare(password, user.passwordHash);
+    if (!match) {
+      // compare() may exit early, but it compares digests, so the fixed 2^cost
+      // work dominates and an early exit leaks nothing usable. The timing signal
+      // that does exist is elsewhere: a hit runs a bcrypt round and a miss does
+      // not, so "no such user" and "wrong password" are distinguishable. Keep the
+      // message generic and rate limit.
+      res.status(401).json({ message: "Invalid credentials" });
+      return;
+    }</code></pre>
+          </div>
+        </li>
+
+        <li>
+          <h3>Commit</h3>
+          <pre><code>npm run typecheck &amp;&amp; npm run check:guards
+git add -A
+git commit -m "Make auth the default: declare session types, answer 401, check guards"</code></pre>
+        </li>
+      </ol>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Verify</h2>
+
+      <ul class="checklist">
+        <li><code>npm run typecheck</code> exits 0 — all ten errors gone.</li>
+        <li><code>server/src/types/express.d.ts</code> sits inside <code>tsconfig.json</code>'s <code>include</code>.</li>
+        <li><code>npm run check:guards</code> prints <code>ok   /api/people -&gt; 401</code>.</li>
+        <li><code>grep -rn "as unknown as" server/src</code> returns nothing.</li>
+        <li><code>grep -rn "req.next" server/src</code> returns nothing.</li>
+        <li><code>grep -rn "requireAuth" server/src</code> shows exactly one mount, in <code>routes/index.ts</code>.</li>
+        <li>With the server running, <code>curl -i localhost:4000/api/people</code> shows <code>HTTP/1.1 401</code>.</li>
+      </ul>
+
+      <h2>Break it on purpose</h2>
+
+      <p>
+        Predict the failure before you run it. Every one of these has a specific
+        expected shape, and being wrong is more instructive than being right.
+      </p>
+
+      <ol>
+        <li>
+          In <code>routes/index.ts</code>, move
+          <code>apiRouter.use("/people", peopleRouter)</code> <em>above</em>
+          <code>apiRouter.use(requireAuth)</code>. Predict what
+          <code>npm run check:guards</code> prints, then run it. You should get
+          <code>500</code>, not a leak — and the server log should say
+          <code>Route is missing requireAuth</code>. Now say out loud why the failure was
+          <em>loud</em>: which layer caught it, and what it would have caught if
+          <code>findByFamily</code> still had no required argument? (That is lesson 03,
+          paying you back.)
+        </li>
+        <li>
+          Change <code>res.status(401)</code> in <code>requireAuth</code> to
+          <code>res.status(500)</code>. Run <code>npm run check:guards</code>. It fails —
+          and this is the lesson's actual thesis: <em>the status code is part of the
+          contract.</em> Then try reverting to the original
+          <code>req.next(new Error(...))</code> and explain why you get the same 500 with
+          a different message.
+        </li>
+        <li>
+          Add a second protected router: create <code>routes/family.routes.ts</code> with
+          one <code>GET /</code> handler that returns <code>{ data: [] }</code>, and mount
+          it below the guard. Add its path to <code>PROTECTED</code> in
+          <code>checkGuards.ts</code> and run it. Now answer the uncomfortable follow-up:
+          <strong>the <code>PROTECTED</code> list is still hand-maintained.</strong>
+          What could derive it automatically, and what would that cost you in
+          brittleness?
+        </li>
+        <li>
+          Delete <code>server/src/types/express.d.ts</code> and run
+          <code>npm run typecheck</code>. Predict the error count before you look. Then
+          restore it. The declaration file is not documentation — it is load-bearing
+          structure, and deleting it re-breaks five files.
+        </li>
+        <li>
+          Now the quieter version. Move the file up one level to
+          <code>server/types/express.d.ts</code> and run
+          <code>npm run typecheck</code>. Predict what you will see, then look. The answer
+          is <strong>nothing about the file</strong> — no warning that it is ignored, and
+          all ten errors back. Then move it to a differently-named folder that
+          <em>is</em> included, such as <code>server/src/ambient/</code>, and confirm it
+          still works. Say out loud what actually decides whether a declaration is read:
+          not the folder's name, not the extension — only whether
+          <code>include</code> reaches it.
+        </li>
+      </ol>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Retrieval practice</h2>
+
+      <p>No scrolling back. Answer first, then check.</p>
+
+      <div class="quiz" data-quiz>
+        <script type="application/json">
+          [
+            {
+              "q": "Why should requireAuth answer 401 rather than pass an Error to next()?",
+              "options": [
+                "A missing cookie is a credential problem, not a fault",
+                "Passing errors to next() is unsupported before routes run",
+                "The error handler can only format errors thrown in services",
+                "Express downgrades each unhandled error into a 404 reply"
+              ],
+              "answer": 0,
+              "why": "next(error) funnels into errorHandler, which answers 500. But nothing on the server failed: the caller simply did not prove who they are. RFC 9110 defines 401 as lacking valid authentication credentials, and the client needs that status to know to show a login form."
+            },
+            {
+              "q": "What does mounting requireAuth once, above the routers, actually buy?",
+              "options": [
+                "New routes below it are protected without naming the guard",
+                "Requests to the public routes are rejected before reaching them",
+                "The guard runs once per process instead of once per request",
+                "Route handlers can read the session without the middleware"
+              ],
+              "answer": 0,
+              "why": "It is default-deny. A router added below the guard needs no requireAuth argument, so there is nothing to forget; and a public route mistakenly added below it fails loudly with a 401 instead of quietly leaking rows."
+            },
+            {
+              "q": "Why does the guard check script need no database at all?",
+              "options": [
+                "The guard rejects before any controller or model is reached",
+                "The script only calls the health route, which stays public",
+                "Supertest swaps the Prisma client for an in-memory stub",
+                "Prisma connects lazily, so queries quietly return no rows"
+              ],
+              "answer": 0,
+              "why": "requireAuth answers 401 and returns, so the request never reaches the controller, the service or the model. That is why one fetch and an ephemeral port are enough: the unit under test is pure HTTP, and MySQL is not involved."
+            },
+            {
+              "q": "What does the declaration merge in express.d.ts actually change?",
+              "options": [
+                "The session and request types gain the fields you attach",
+                "A second Express app is created and reserved for requests",
+                "Runtime checks are added so the session fields are always set",
+                "The cookie signing secret becomes visible to the server code"
+              ],
+              "answer": 0,
+              "why": "Merging is compile-time only. SessionData lives in the express-session namespace so it is augmented through the module, while Request lives in the global Express namespace. At runtime the values still come from your own req.session.userId assignment."
+            },
+            {
+              "q": "Why does authContext throw instead of defaulting to some family?",
+              "options": [
+                "A missing guard must fail loudly rather than read wrong rows",
+                "Throwing is the only path into the central error handler",
+                "The service layer is unable to accept an undefined family",
+                "Express requires every middleware to call next with an error"
+              ],
+              "answer": 0,
+              "why": "Defaulting would hide a wiring bug behind empty or incorrect data. Throwing turns somebody forgetting the guard into a 500 carrying an unmistakable message, in development, before anyone else can see the consequence."
+            }
+          ]
+        </script>
+      </div>
+
+      <h2>Primary source</h2>
+
+      <div class="callout win">
+        <span class="callout-title">Read this next</span>
+        <p>
+          <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-401-unauthorized"
+            >RFC 9110 §15.5.2 — 401 Unauthorized</a
+          >
+          is four sentences long, and it is the authority for the decision at the centre
+          of this lesson. Read it next to
+          <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-403-forbidden">§15.5.4 on 403</a>
+          — the difference between "I do not know who you are" and "I know exactly who you
+          are and you still may not" is the next distinction KinLink will need, when a
+          member of one family tries to read another.
+        </p>
+        <p>
+          Then read the
+          <a href="https://github.com/expressjs/session">express-session README</a>
+          section on <code>store</code> and <code>resave</code>, now that you know a
+          session id is all the cookie carries.
+        </p>
+      </div>
+
+      <div class="prompt">
+        <span class="prompt-title">Ask your teacher</span>
+        <p>
+          Ask me what would have to change to derive the <code>PROTECTED</code> list from
+          the router instead of a hand-written array, whether <code>authContext</code>
+          should throw or 401 when the guard is missing, how a
+          <code>403</code>/<code>401</code> split looks once roles arrive, or how this
+          guard pattern becomes a middleware chain for a family-scoped route like
+          <code>/families/:slug/people</code>. And tell me if throwing inside
+          <code>authContext</code> feels wrong to you — that instinct is worth arguing
+          about.
+        </p>
+      </div>
+
+      <footer class="lesson-footer">
+        <p class="next-up">
+          <strong>Next:</strong> Lesson 06 — the client joins. With a real
+          <code>401</code> to react to, React can finally ask the server who it is
+          (<code>/api/auth/whoami</code>), show a login form instead of "Failed to load",
+          and render the family's people — and you will meet the distinction the whole
+          front end turns on: <strong>server state versus client state</strong>.
+        </p>
+        <p>
+          <a href="../MISSION.md">MISSION.md</a> ·
+          <a href="../ROADMAP.md">ROADMAP.md</a> ·
+          <a href="../GLOSSARY.md">GLOSSARY.md</a> ·
+          <a href="../PROGRESS.md">PROGRESS.md</a> ·
+          <a href="../reference/0005-auth-mechanics.html">Reference 05</a> ·
+          <a href="../reference/0004-ids-and-tenancy.html">Reference 04</a>
+        </p>
+      </footer>
+    </div>
+
+    <script src="../assets/quiz.js"></script>
+  </body>
+</html>

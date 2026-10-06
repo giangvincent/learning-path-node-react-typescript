@@ -1,0 +1,610 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Reference 05 — Auth mechanics</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="lesson-header">
+        <p class="eyebrow">Reference 05 · the four questions, compressed</p>
+        <h1>Cookies, cost factors and timing</h1>
+        <p class="lede">
+          The four questions that decide whether authentication merely works or is
+          actually defensible: how expensive a password hash should be, what
+          <code>SameSite=Lax</code> really blocks, where sessions live once there is
+          more than one server, and why comparing a secret with <code>==</code> is a
+          bug.
+        </p>
+        <div class="meta-row">
+          <span>Used by: <a href="../lessons/0005-finish-the-auth-contract.html">Lesson 05</a></span>
+          <span>Requires: <a href="../lessons/0004-authentication-sessions-bcrypt.html">Lesson 04</a></span>
+          <span>Vocabulary: <a href="../GLOSSARY.md">GLOSSARY.md</a></span>
+        </div>
+      </header>
+
+      <h2>1. The work factor: why 12</h2>
+
+      <p>
+        bcrypt's cost parameter is <strong>an exponent, not a count</strong>. The work
+        it performs is <code>2^cost</code> iterations of an intentionally slow key
+        schedule, so each increment <strong>doubles</strong> the time — for you
+        <em>and</em> for an attacker.
+      </p>
+
+      <pre><code>cost  2^cost   old 2GHz core (bcrypt README)   modern core, order of
+10    1024     ~10 hashes/sec                   ~60–80 ms
+11    2048     ~5 hashes/sec                    ~120–160 ms
+12    4096     ~2–3 hashes/sec                  ~250–350 ms
+13    8192     ~1 sec/hash                      ~600–700 ms</code></pre>
+
+      <div class="callout">
+        <span class="callout-title">Right rule, wrong anchor</span>
+        <p>
+          <a href="https://github.com/kelektiv/node.bcrypt.js">The bcrypt README</a>
+          gives its table for a <em>2GHz</em> core — that is a decade-old machine. The
+          numbers in the right-hand column are orders of magnitude, not measurement.
+          <strong>Run <code>time</code> on your own hardware.</strong> The number you
+          can defend is the one you measured; the number you copied is a rumour.
+        </p>
+      </div>
+
+      <p>
+        <a href="https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html"
+          >OWASP's Password Storage Cheat Sheet</a
+        >
+        is the authority, and it says three things worth memorising:
+      </p>
+
+      <ul>
+        <li>
+          <strong>A minimum work factor of 10</strong>, and "as large as verification
+          server performance will allow".
+        </li>
+        <li>
+          <strong>Calculating a hash should take less than one second</strong> — "strike
+          a balance between security and performance… there is no golden rule."
+        </li>
+        <li>
+          <strong>The work factor is stored in the hash output</strong>, which is what
+          makes upgrading possible without knowing anyone's password.
+        </li>
+      </ul>
+
+      <p>
+        So <strong>12 is not magic</strong>. It is the common, defensible 2020s default:
+        comfortably above OWASP's floor of 10, and on current hardware it lands in the
+        tens-to-hundreds of milliseconds — slow enough that offline cracking is
+        expensive, fast enough that a login feels instant. If your measured cost at 12
+        is under ~50 ms, go to 13; if login latency becomes a problem, drop to 11 and
+        write down why.
+      </p>
+
+      <div class="callout warn">
+        <span class="callout-title">The honest footnote</span>
+        <p>
+          OWASP's current text lists bcrypt under <em>"for legacy systems"</em> and
+          recommends <strong>Argon2id</strong> (19 MiB, t=2, p=1) for new applications,
+          because bcrypt is CPU-hard but not memory-hard, so GPUs like it. bcrypt is
+          still entirely respectable — it is in every language, has no native build
+          step, and is not on anyone's vulnerability list. But if you were starting
+          greenfield today and did not mind a native dependency, Argon2id is the
+          recommendation. Say that out loud in an interview and you sound current.
+        </p>
+      </div>
+
+      <h3>Upgrading a cost factor, the good way</h3>
+
+      <p>
+        Because the cost lives inside the stored string
+        (<code>$2b$12$&lt;salt&gt;&lt;hash&gt;</code>), you can re-hash on the next
+        successful login — the only moment you legitimately hold the plaintext.
+      </p>
+
+      <pre><code>import bcrypt from "bcrypt";
+const CURRENT_COST = 12;
+
+const ok = await bcrypt.compare(password, user.passwordHash);
+if (ok &amp;&amp; bcrypt.getRounds(user.passwordHash) &lt; CURRENT_COST) {
+  // Not a security fix for the existing hash; it upgrades the next one.
+  const upgraded = await bcrypt.hash(password, CURRENT_COST);
+  await prisma.user.update({
+    where: { id: user.id },
+    data: { passwordHash: upgraded },
+  });
+}</code></pre>
+
+      <p>
+        Two limits to know cold: bcrypt only uses the <strong>first 72 bytes</strong> of
+        the password (and bytes, not characters — emoji count as four each), and it
+        <strong>truncates silently</strong>. Enforce a maximum length at the boundary, or
+        a "password" and a 200-character novel are the same password.
+      </p>
+
+      <h2>2. Comparing secrets: <code>==</code>, <code>compare()</code>, <code>timingSafeEqual</code></h2>
+
+      <div class="callout warn">
+        <span class="callout-title">Correct the premise first</span>
+        <p>
+          <code>bcrypt.compare()</code> is <strong>not constant-time</strong>. The
+          library's own README says so: "the comparison function is <em>not</em> time
+          safe (constant-time), as it may exit early when a mismatch is found."
+          Believing otherwise is not a harmless simplification — it means the next
+          secret you compare will be compared wrongly, because you learned the lesson in
+          the wrong place.
+        </p>
+      </div>
+
+      <p>Here is what is actually true, and it is more interesting:</p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Comparison</th>
+            <th>Does it short-circuit?</th>
+            <th>Attacker learns</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>a === b</code> / <code>strcmp</code> on a <strong>secret</strong></td>
+            <td>Yes — stops at the first differing byte</td>
+            <td>
+              <strong>How many leading bytes were correct.</strong> Recover the secret
+              one byte at a time: ~256 guesses per byte instead of 256<sup>n</sup>.
+            </td>
+          </tr>
+          <tr>
+            <td><code>bcrypt.compare(pw, hash)</code></td>
+            <td>Yes — may exit early, per the README</td>
+            <td>
+              <strong>Nothing usable.</strong> It compares <em>digests</em>, and a
+              digest is preimage-resistant: an attacker cannot steer their input toward
+              a longer matching prefix without already knowing the answer.
+            </td>
+          </tr>
+          <tr>
+            <td><code>crypto.timingSafeEqual(a, b)</code></td>
+            <td>No — always reads both, same length</td>
+            <td>Nothing. <strong>This is the tool for raw secrets.</strong></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p>
+        There are two separate reasons <code>bcrypt.compare</code> is safe, and you
+        should be able to state both:
+      </p>
+
+      <ol>
+        <li>
+          <strong>The dominant cost is fixed.</strong> Recomputing the hash from the
+          supplied password runs the full <code>2^cost</code> key schedule. That work is
+          identical whether the password is wrong at byte 1 or byte 30, so the
+          early-exit signal is buried under hundreds of milliseconds of constant work.
+        </li>
+        <li>
+          <strong>The thing being compared is a digest.</strong> Even with perfect
+          timing resolution, learning "my computed hash shares 7 bytes with the stored
+          hash" is useless — you cannot invert or incrementally search a bcrypt output.
+          Contrast with a session token, where "your guess shares 7 bytes with the real
+          token" <em>is</em> the secret, one byte at a time.
+        </li>
+      </ol>
+
+      <pre><code>// The bug — leaks the token one byte at a time
+if (req.headers["x-api-key"] === storedToken) { /* ... */ }
+
+// The fix — for raw secrets, not for password hashes
+import { timingSafeEqual } from "node:crypto";
+
+const supplied = Buffer.from(req.headers["x-api-key"] ?? "", "utf8");
+const expected = Buffer.from(storedToken, "utf8");
+const match =
+  supplied.length === expected.length &amp;&amp; timingSafeEqual(supplied, expected);</code></pre>
+
+      <p>
+        <code>timingSafeEqual</code> throws if the buffers differ in length, so the
+        length check has to come first — and note that the comparison is only
+        constant-time <em>when the lengths match</em>. That is exactly what the
+        <code>&amp;&amp;</code> above encodes, and it is why docs insist on equal-length
+        inputs.
+        (<a href="https://nodejs.org/api/crypto.html#cryptotimingsafeequalab">Node docs — crypto.timingSafeEqual</a>.)
+      </p>
+
+      <div class="callout">
+        <span class="callout-title">The side channel your code actually has</span>
+        <p>
+          Your login handler returns in three different amounts of time: a
+          <code>findUnique</code> that misses, a <code>findUnique</code> that hits plus
+          a bcrypt compare (~250 ms), and success plus a session write. The obvious
+          leak is <strong>"this email exists"</strong>. Mitigate with a generic message,
+          rate limiting, and — if you care a lot — a dummy compare against a fixed hash
+          on the miss path. For a private family app that is optional; for a public
+          login it is table stakes.
+        </p>
+      </div>
+
+      <h2>3. CSRF and <code>SameSite=Lax</code></h2>
+
+      <p>
+        CSRF exists because <strong>browsers attach cookies automatically</strong>. If
+        <code>evil.com</code> makes the victim's browser send a request to
+        <code>kinlink.com</code>, the session cookie goes along, and the server cannot
+        tell the request was not intentional. The server becomes a confused deputy.
+        (<a
+          href="https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html"
+          >OWASP — CSRF Prevention</a
+        >.)
+      </p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Value</th>
+            <th>Cookie is sent when…</th>
+            <th>You pay</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>Strict</code></td>
+            <td>Only same-site requests. Never cross-site, not even a link click.</td>
+            <td>
+              Clicking a link to your site from an email arrives <em>logged out</em>.
+              Real UX cost, so rarely used for sessions.
+            </td>
+          </tr>
+          <tr>
+            <td><code>Lax</code></td>
+            <td>
+              Same-site requests, <em>plus</em> cross-site requests that are both a
+              <strong>top-level navigation</strong> and a <strong>safe method</strong>
+              (GET/HEAD/OPTIONS).
+            </td>
+            <td>Cross-site <code>POST</code>/<code>PUT</code>/<code>DELETE</code> lose the cookie — which is the defence.</td>
+          </tr>
+          <tr>
+            <td><code>None</code></td>
+            <td>Always. Requires <code>Secure</code>.</td>
+            <td>No CSRF protection; for genuine cross-site embeds only.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p>
+        So the mechanism, precisely: <code>Lax</code> is safe not because it blocks
+        "cross-site", but because it blocks <strong>unsafe methods</strong>. A forged
+        request that changes state has to be a POST, PUT, PATCH or DELETE — and none of
+        those carry the cookie. Meanwhile <code>fetch()</code>, <code>&lt;img&gt;</code>,
+        <code>&lt;script&gt;</code> and iframes from another site never carry it either,
+        because they are not top-level navigations.
+        (<a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Set-Cookie#samesitesamesite-value">MDN — Set-Cookie</a>.)
+      </p>
+
+      <div class="callout warn">
+        <span class="callout-title">The trap that turns Lax into a hole</span>
+        <p>
+          <strong>Lax still sends the cookie on a top-level GET.</strong> So one
+          state-changing endpoint reachable by URL — <code>GET /api/people/:id/delete</code>,
+          <code>GET /logout</code> — defeats the whole thing. An attacker only has to put
+          <code>&lt;img src="https://kinlink.com/api/people/123/delete"&gt;</code> in a
+          page. This is, per OWASP, "the single most common way SameSite-based defences
+          fail in practice."
+        </p>
+      </div>
+
+      <h3>Four limitations to have ready</h3>
+
+      <ul>
+        <li>
+          <strong>Never mutate on a safe method.</strong> All state changes are POST
+          (or PUT/PATCH/DELETE). Then Lax is genuinely load-bearing.
+        </li>
+        <li>
+          <strong><code>SameSite</code> is scoped to the registrable domain, not the
+          origin.</strong> A cookie set on <code>app.kinlink.com</code> is still
+          "same-site" for a request from <code>anything.kinlink.com</code>. One
+          compromised or dangling subdomain re-opens CSRF — which is why subdomain
+          takeover amplifies SameSite bugs.
+        </li>
+        <li>
+          <strong>It is a browser feature.</strong> Old browsers, embedded webviews and
+          non-browser clients may not enforce it. Defence in depth, not a guarantee.
+        </li>
+        <li>
+          <strong>Client-side CSRF is untouched.</strong> If your own JavaScript builds
+          a request out of attacker-controlled input (a URL fragment, a postMessage),
+          the request is same-origin and every cookie policy waves it through.
+        </li>
+      </ul>
+
+      <h3>When Lax is enough, and when it is not</h3>
+
+      <p>OWASP's "sufficient on its own" checklist is short and strict. All of it:</p>
+
+      <ol>
+        <li>You share the registrable domain with nothing you do not fully control.</li>
+        <li>No safe method changes state — no mutating GETs, audited.</li>
+        <li>
+          The cookie is <code>Strict</code>, <em>or</em> <code>Lax</code> with the
+          <code>__Host-</code> name prefix.
+        </li>
+        <li>Origin/Referer verification on state-changing endpoints, as backup.</li>
+        <li>You accept the residual risk for browsers that ignore <code>SameSite</code>.</li>
+      </ol>
+
+      <p>
+        KinLink today meets 2 and 5, and not 1, 3 or 4. That is a defensible
+        <em>"not yet, and here is the list"</em> — which is a much better answer in an
+        interview than "we set lax so we are fine".
+      </p>
+
+      <pre><code>// The __Host- prefix is the cheap one: it forbids a Domain attribute, requires
+// Path=/ and requires Secure, so only the exact host that set it can overwrite it.
+// Note it CANNOT be used in dev, because dev is http and Secure cookies are dropped.
+name: isProd ? "__Host-kinlink.sid" : "kinlink.sid",</code></pre>
+
+      <h2>4. Where sessions live when you scale</h2>
+
+      <p>
+        The cookie never holds the data. It holds <strong>one opaque id</strong>; the
+        data lives in the store. That is the whole design, and it is why sessions and
+        statelessness are compatible: the <em>server</em> is stateless, the
+        <em>store</em> is not.
+      </p>
+
+      <div class="callout warn">
+        <span class="callout-title">MemoryStore is not a store</span>
+        <p>
+          express-session's default is "purposely not designed for a production
+          environment. It will leak memory under most conditions, does not scale past a
+          single process, and is meant for debugging and developing." Two consequences:
+          a restart logs everyone out, and a second instance knows nothing about
+          sessions created on the first.
+        </p>
+        <p>(<a href="https://github.com/expressjs/session">express-session README</a>.)</p>
+      </div>
+
+      <h3>Two ways to run more than one server</h3>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Approach</th>
+            <th>How it works</th>
+            <th>Why it hurts</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Sticky sessions</strong></td>
+            <td>Load balancer pins a user to the instance that holds their session.</td>
+            <td>
+              Every deploy evicts live users; one hot instance; the pinning is
+              invisible configuration that breaks silently.
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Shared store</strong></td>
+            <td>Any instance can serve any request; they all read the same store.</td>
+            <td>
+              Adds a dependency — and that dependency is now on the critical path for
+              every authenticated request.
+            </td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p>Redis is the usual shared store because sessions are exactly key-value with a TTL:</p>
+
+      <pre><code>npm install redis connect-redis
+
+// server/src/config/session.ts
+import { createClient } from "redis";
+import { RedisStore } from "connect-redis";
+
+const redisClient = createClient({ url: process.env.REDIS_URL });
+redisClient.connect().catch(console.error);
+
+const sessionConfig: SessionOptions = {
+  store: new RedisStore({
+    client: redisClient,
+    prefix: "kinlink:sess:",   // scopes bulk ops; share one Redis safely
+  }),
+  resave: false,      // the README calls this "required" with connect-redis:
+                      // the store implements touch(), so expiry is refreshed
+                      // without rewriting the whole session
+  saveUninitialized: false,
+  secret: process.env.SESSION_SECRET,
+  cookie: { /* unchanged: httpOnly, secure, sameSite: "lax" */ },
+};</code></pre>
+
+      <p>
+        Read that <code>resave: false</code> comment carefully, because it is the
+        detail people get wrong: <strong>a store that implements <code>touch()</code>
+        is what makes <code>resave: false</code> safe.</strong> Without it, a store that
+        expires idle sessions would never learn that the user is still active.
+        <code>connect-redis</code> implements it and takes the TTL from the cookie's
+        <code>expires</code>, defaulting to one day.
+      </p>
+
+      <h3>What changes operationally</h3>
+
+      <ul>
+        <li>
+          <strong>Redis is now a hard dependency.</strong> If it is down, nobody stays
+          logged in — you have not lost data, but you have lost every session at once.
+          Persist it (AOF or RDB) or use a managed instance with a replica.
+        </li>
+        <li>
+          <strong>Keep the payload tiny.</strong> Store <code>userId</code> and
+          <code>familyId</code>, never the whole user object. Every request does a store
+          lookup; the session is not a cache.
+        </li>
+        <li>
+          <strong>Redis does not encrypt by default.</strong> The cookie is signed;
+          the session body is plain JSON in Redis. Anything in there is readable by
+          anyone with Redis access. Use TLS and auth in production, and put no secrets
+          in the session.
+        </li>
+        <li>
+          <strong><code>SESSION_SECRET</code> is for signing the id, not encrypting
+          the data.</strong> It needs ≥32 bytes of entropy. To rotate it without
+          logging everyone out, pass an array: the first signs, all of them verify.
+        </li>
+        <li>
+          <strong>Regenerate on login.</strong> <code>req.session.regenerate()</code>
+          before you write <code>userId</code>, and again on logout. Otherwise an
+          attacker who can fix a session id before login keeps using it afterwards —
+          session fixation.
+        </li>
+      </ul>
+
+      <div class="callout win">
+        <span class="callout-title">The sentence to remember</span>
+        <p>
+          A cookie-based session is <strong>stateless at the edge and stateful at the
+          store</strong>. Scaling out means moving "where is the state" from one
+          process's heap to a shared service — and paying for it with a new dependency.
+          A JWT makes the opposite trade: nothing to look up, but revocation becomes
+          guesswork. Neither is modern; they are two prices.
+        </p>
+      </div>
+
+      <h2>5. Fail-closed routing: making "forgot the guard" hard</h2>
+
+      <p>
+        A missing <code>requireAuth</code> is invisible to the type system. There is no
+        compile error, no failing test, no 500 — just every family's data, served to
+        anyone. Since the compiler cannot help, you change the <em>default</em> so that
+        the mistake is not available to make.
+      </p>
+
+      <pre><code>// Opt-in (fragile): forgetting the argument leaks data, silently.
+apiRouter.use("/people",    requireAuth, peopleRouter);
+apiRouter.use("/families",  requireAuth, familiesRouter);   // ← forget it once
+
+// Default-deny (structural): public routes are declared above the guard,
+// everything below it is authenticated without being asked.
+apiRouter.use("/auth", authRouter);          // public, deliberately
+apiRouter.get("/health", liveness);          // public, deliberately
+
+apiRouter.use(requireAuth);                  // the line that does the work
+apiRouter.use("/people",    peopleRouter);   // protected automatically
+apiRouter.use("/families",  familiesRouter); // and this one, forever</code></pre>
+
+      <p>
+        The ordering is the point, and so is the <strong>direction the failure
+        points</strong>. Add a public route below the guard and you get a loud, obvious
+        401 in development — annoying, caught in seconds. Forget the guard the old way
+        and you get a silent data leak found by a customer. Choose the direction your
+        mistakes fail in.
+      </p>
+
+      <p>
+        Two more layers, each catching what the last cannot:
+      </p>
+
+      <pre><code>// 2. Fail loud, not open. If a route reaches a controller without the guard
+//    having run, refuse — do not guess a family.
+export function authContext(req: Request): { userId: string; familyId: string } {
+  const { authenticatedUserId, authenticatedFamilyId } = req;
+  if (!authenticatedUserId || !authenticatedFamilyId) {
+    throw new Error("Route is missing requireAuth");   // a wiring bug, not a 401
+  }
+  return { userId: authenticatedUserId, familyId: authenticatedFamilyId };
+}
+
+// 3. Assert it over HTTP, where the mistake is actually visible.
+//    server/src/scripts/checkGuards.ts — no framework, no database:
+//    requireAuth rejects before the controller, so no query ever runs.
+const PROTECTED = ["/api/people"];
+for (const path of PROTECTED) {
+  const res = await fetch(`${base}${path}`);   // no cookie
+  if (res.status !== 401) throw new Error(`${path} → ${res.status}, expected 401`);
+}</code></pre>
+
+      <div class="callout">
+        <span class="callout-title">Why 401 and not 500</span>
+        <p>
+          <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-401-unauthorized">RFC 9110 §15.5.2</a>:
+          401 means "the request has not been applied because it lacks valid
+          authentication credentials". A missing cookie is a missing credential, so 401
+          is the correct, <em>machine-readable</em> answer. If your guard funnels its
+          error into a generic 500 handler you have told the client "the server is
+          broken" when you meant "tell me who you are" — and no client can build a login
+          flow on that.
+        </p>
+      </div>
+
+      <h2>6. Corrections to lesson 04</h2>
+
+      <p>Three claims in the auth lesson were wrong or imprecise. Reference docs win.</p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Said</th>
+            <th>Actually</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>"<code>bcrypt.compare()</code> runs in constant time."</td>
+            <td>
+              It may exit early — the README says it is not time-safe. It is safe for a
+              different reason: it compares preimage-resistant digests, and the fixed
+              <code>2^cost</code> work dominates. Use
+              <code>timingSafeEqual</code> for raw secrets.
+            </td>
+          </tr>
+          <tr>
+            <td>"Modern bcrypt has bundled types."</td>
+            <td>
+              <code>bcrypt@6.0.0</code> ships no <code>types</code> field and no
+              <code>.d.ts</code>. <code>@types/bcrypt</code> is doing real work — keep
+              it.
+            </td>
+          </tr>
+          <tr>
+            <td>"<code>sameSite: "lax"</code> prevents CSRF for GET requests."</td>
+            <td>
+              Inverted. Lax <em>allows</em> top-level GETs and blocks cross-site
+              <em>unsafe</em> methods. A mutating GET is the classic way this defence
+              fails.
+            </td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="callout win">
+        <span class="callout-title">Primary sources</span>
+        <p>
+          <a href="https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html"
+            >OWASP — Password Storage</a
+          >
+          ·
+          <a href="https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html"
+            >OWASP — CSRF Prevention</a
+          >
+          ·
+          <a href="https://github.com/kelektiv/node.bcrypt.js">bcrypt README</a> (see
+          "A Note on Timing Attacks")
+        </p>
+        <p>
+          <a href="https://github.com/expressjs/session">express-session README</a> ·
+          <a href="https://github.com/tj/connect-redis">connect-redis README</a> ·
+          <a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Set-Cookie">MDN — Set-Cookie</a> ·
+          <a href="https://nodejs.org/api/crypto.html#cryptotimingsafeequalab">Node — timingSafeEqual</a>
+        </p>
+      </div>
+
+      <footer class="lesson-footer">
+        <p>Reference docs are meant to be argued with. If a rule here is wrong, say so.</p>
+      </footer>
+    </div>
+  </body>
+</html>
