@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lesson 10 — Render the invitation client</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="lesson-header">
+        <p class="eyebrow">Lesson 10 · Week 4–5 · about sixty minutes</p>
+        <h1>Render the invitation client</h1>
+        <p class="lede">
+          The server API is done. The client still has no invite UI:
+          owners can't send invites, nobody sees pending invites, and
+          the accept flow only lives in curl. Make the API visible — a
+          dialog for owners, a list for members, a token-in-URL accept
+          page.
+        </p>
+        <div class="meta-row">
+          <span>Mission: ship KinLink</span>
+          <span>Requires: <a href="0009-invitations.html">Lesson 09</a></span>
+          <span>Reference: <a href="../reference/0009-invitation-protocol.html">Reference 09</a></span>
+        </div>
+      </header>
+
+      <div class="callout win">
+        <span class="callout-title">The win</span>
+        <p>
+          Three things, in one session: an owner's "send invite" dialog
+          (<code>POST /api/invitations</code>), a pending-invites list with
+          expiry, and an <code>/invite/:token</code> page that calls accept.
+        </p>
+      </div>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Build it</h2>
+
+      <ol class="steps">
+        <li>
+          <h3>Owner sees "send invite" only when their rank allows</h3>
+          <p>
+            Load the family's memberships via the existing
+            <code>/api/families/:slug/people</code> endpoint (already
+            guarded by <code>loadFamily</code> + <code>requireAuth</code>).
+            Show the dialog only if the caller's membership role is
+            <code>admin</code> or <code>owner</code>. Read the role from the
+            response — don't trust the client.
+          </p>
+          <div class="file">
+            <span class="file-path">client/src/InviteDialog.tsx (new)</span>
+            <pre><code>function InviteDialog({ familySlug }: { familySlug: string }) {
+  const [email, setEmail] = useState("");
+  const [role, setRole] = useState&lt;"member" | "admin"&gt;("member");
+  const [pending, setPending] = useState(false);
+
+  const send = async () => {
+    setPending(true);
+    const r = await fetch(`/api/invitations`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify({ email, role }),
+    });
+    setPending(false);
+    if (r.status === 403) alert("Insufficient role");
+    if (r.status === 201) alert("Invite sent — token in response");
+  };
+
+  return (
+    &lt;form onSubmit={e =&gt; { e.preventDefault(); send(); }}&gt;
+      &lt;input value={email} onChange={e =&gt; setEmail(e.target.value)}
+             placeholder="email" required /&gt;
+      &lt;select value={role} onChange={e =&gt; setRole(e.target.value as any)}&gt;
+        &lt;option value="member"&gt;member&lt;/option&gt;
+        &lt;option value="admin"&gt;admin&lt;/option&gt;
+      &lt;/select&gt;
+      &lt;button type="submit" disabled={pending}&gt;Send invite&lt;/button&gt;
+    &lt;/form&gt;
+  );
+}</code></pre>
+          </div>
+        </li>
+
+        <li>
+          <h3>Pending invites list with expiry</h3>
+          <p>
+            The server has no list endpoint yet (Prisma has no index on
+            <code>expiresAt</code> for lookups). Add one:
+          </p>
+          <div class="file">
+            <span class="file-path">server/src/controllers/invitation.controller.ts (new)</span>
+            <pre><code>import { prisma } from "../config/database.js";
+
+export async function listInvitations(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise&lt;void&gt; {
+  try {
+    const { slug } = req.params;
+    const family = await prisma.family.findUnique({ where: { slug } });
+    if (!family) { res.status(404).json({ message: "Family not found" }); return; }
+    const invites = await prisma.invitation.findMany({
+      where: { familyId: family.id, usedAt: null, expiresAt: { gt: new Date() } },
+      select: { email: true, role: true, expiresAt: true, createdBy: true },
+      orderBy: { createdAt: "desc" },
+    });
+    res.json({ data: invites });
+  } catch (e) { next(e); }
+}</code></pre>
+          </div>
+          <p>Mount at <code>GET /api/families/:slug/invitations</code> under
+          <code>loadFamily</code>. Owner-only or member-visible — your call;
+          the lesson keeps it member-visible (hides sent invites if you want
+          owner-only, change the route guard).</p>
+        </li>
+
+        <li>
+          <h3>Accept page reads the token from the URL</h3>
+          <p>
+            The accept flow lands on a page like
+            <code>/invite/&lt;token&gt;</code>. The page extracts the token
+            from the path, calls <code>POST /api/invitations/:token/accept</code>,
+            and renders the result — "joined" or "this link doesn't work".
+            No body, no custom header; the token is the only credential.
+          </p>
+          <div class="file">
+            <span class="file-path">client/src/AcceptPage.tsx (new)</span>
+            <pre><code>function AcceptPage() {
+  const { token } = useParams();
+  const [status, setStatus] = useState&lt;"idle" | "ok" | "err"&gt;("idle");
+
+  useEffect(() => {
+    fetch(`/api/invitations/${token}/accept`, {
+      method: "POST", credentials: "include",
+    }).then(r =&gt; setStatus(r.status === 204 ? "ok" : "err"));
+  }, [token]);
+
+  if (status === "ok") return &lt;p&gt;You're in — go to the family.&lt;/p&gt;;
+  if (status === "err") return &lt;p&gt;This link doesn't work.&lt;/p&gt;;
+  return &lt;p&gt;Accepting…&lt;/p&gt;;
+}</code></pre>
+          </div>
+        </li>
+      </ol>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Three questions from the design</h2>
+
+      <ol>
+        <li>
+          <strong>Shareable link or targeted?</strong> Both valid.
+          Shareable (<code>email: null</code>) — anyone with the URL joins,
+          doesn't prove the family exists. Targeted (<code>email</code> set)
+          — leaks existence by design. Accept treats both the same: session
+          <code>userId</code> is the only identity, role + rank check regardless
+          of email.
+        </li>
+        <li>
+          <strong>Expiry vs last-owner guard?</strong> Different objects.
+          The invite is a credential; the membership is the authority.
+          An expired-unaccepted invite is harmless; an accepted one keeps
+          authority after expiry. The guard operates on memberships, so
+          expiry never undermines it.
+        </li>
+        <li>
+          <strong>Idempotency keys on accept?</strong> No — the token
+          itself is the idempotency key: second <code>POST</code> consumes
+          it and returns <code>409 used</code>, no duplicate membership.
+          What needs idempotency is the <strong>mint</strong> endpoint
+          (double-submit creates two invites; the schema has no unique
+          constraint on email — add one if you want to close that door).
+        </li>
+      </ol>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Retrieval practice</h2>
+
+      <div class="quiz" data-quiz>
+        <script type="application/json">
+          [
+            {
+              "q": "What makes the accept endpoint idempotent?",
+              "options": [
+                "The token is consumed on first use; second POST returns 409",
+                "A unique constraint on the membership row rejects the duplicate",
+                "The client stores a sentinel in localStorage before POSTing",
+                "An idempotency-key header deduplicates on the server"
+              ],
+              "answer": 0,
+              "why": "The token itself is the idempotency key. updateMany with usedAt null in the WHERE clause consumes it atomically; second attempt sees count !== 1 and returns 409 used."
+            },
+            {
+              "q": "Why is a targeted invite a privacy leak by design?",
+              "options": [
+                "The invitee learns the family exists and wants them",
+                "The token appears in the invitee's browser history",
+                "The email is stored in plaintext on the invitation row",
+                "The accept endpoint reveals the inviter's identity"
+              ],
+              "answer": 0,
+              "why": "Reference 09 §6: shareable links don't leak existence; targeted invites do — the invitee must learn 'this family exists and wants you'. The token proves entitlement, not the family's name."
+            },
+            {
+              "q": "Which guard protects against a demoted owner minting invites after demotion?",
+              "options": [
+                "Re-read the caller's role inside the transaction, after the lock",
+                "The middleware blocks anyone whose role is not owner",
+                "A database CHECK constraint on the invitation row",
+                "The rank check uses the session role at request time, which is enough"
+              ],
+              "answer": 0,
+              "why": "Same pattern as transferOwnership: the middleware sees the role when the request arrives, but another owner may demote since. Re-reading inside the lock after familyContext proves membership is the defense."
+            }
+          ]
+        </script>
+      </div>
+
+      <div class="prompt">
+        <span class="prompt-title">Ask your teacher</span>
+        <p>
+          Ask how the accept page handles the case where the user is
+          already a member — should it redirect to the family or show
+          "already a member"? Ask whether the pending-invites list should
+          show email or "someone" for shareable links. Ask what happens
+          when the accept page is opened after the invite expires — should
+          the client auto-refresh or show a retry?
+        </p>
+      </div>
+
+      <h2>Primary source</h2>
+
+      <div class="callout win">
+        <span class="callout-title">Read this next</span>
+        <p>
+          <a href="../reference/0009-invitation-protocol.html">Reference 09</a>
+          — the protocol argument (C&S, rank rule, collapse on wire) and the
+          OWASP Forgot Password Cheat Sheet links (CSPRNG, hash, single-use,
+          no-referrer, host-header).
+        </p>
+      </div>
+
+      <footer class="lesson-footer">
+        <p class="next-up">
+          <strong>Next:</strong> Lesson 11 — the pending-invites list with expiry
+          and the "resend / revoke" controls for owners.
+        </p>
+        <p>
+          <a href="../MISSION.md">MISSION.md</a> ·
+          <a href="../ROADMAP.md">ROADMAP.md</a> ·
+          <a href="../GLOSSARY.md">GLOSSARY.md</a> ·
+          <a href="../PROGRESS.md">PROGRESS.md</a> ·
+          <a href="0009-invitations.html">Lesson 09</a> ·
+          <a href="0008-transfer-ownership-and-the-race-window.html">Lesson 08</a> ·
+          <a href="../reference/0007-membership-lifecycle.html">Reference 07</a>
+        </p>
+      </footer>
+    </div>
+
+    <script src="../assets/quiz.js"></script>
+  </body>
+</html>
