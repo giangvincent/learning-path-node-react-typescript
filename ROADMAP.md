@@ -74,6 +74,53 @@ draw this from memory and justify each box:
 - **Realtime** — fan-out, rooms, what happens when a socket drops.
 - **Delivery** — build, deploy, migrations in production, observability.
 
+## Lesson size, and the session cadence
+
+A lesson is a **sitting**, not a topic. When a lesson "contains a lot of knowledge and
+needs more explanation", that is a sizing bug — and this is the rule that fixes it.
+Effective now, and applied retroactively to lessons 13 and 14 (see the `NNNNa` / `NNNNb`
+splits).
+
+### The lesson-size rule
+
+- **One session = one new thing.** A lesson teaches one concept, proves it with one
+  Verify block, and ends in one commit. Two new concepts is two lessons. "New thing"
+  means a new *idea* to understand, not a new file: a model, service, view and controller
+  that all serve one read are still one thing.
+- **Budget: about 45–60 minutes of real work** — typing the code, running Verify,
+  debugging, committing. The `about N minutes` in a header must be that measured number,
+  not a wish. If it is a guess, write `≈ one session` rather than a fiction.
+- **A lesson file stays around 300 lines of HTML, not counting the listings the
+  learner types.** The code is work, not reading; the prose around it is what has to stay
+  small. Two Verify blocks or two commits in one file means it is two lessons.
+- **The build and the drills are different files.** `lessons/NNNN-….html` is the short
+  build. "Defend it", "Break it on purpose" and "Retrieval practice" move to a sibling
+  `lessons/NNNN…-practice.html`. They are spaced retrieval, done on a later day — not
+  part of the sitting.
+- **The teacher's method stays out of the lesson.** Verify-first, probe hygiene and the
+  other house rules live in `NOTES.md`; the lesson carries only what the learner does.
+- **Every lesson opens with its Verify commands** and closes with a commit.
+- **Every lesson ends with a *Log it* block** — minutes, one line of "what fought back",
+  the commit hash — pointed at this week's block in [PROGRESS.md](./PROGRESS.md). A
+  lesson that does not ask to be logged is a lesson that will not be logged; every lesson
+  so far shipped without one and the log stayed blank.
+
+When a lesson overruns its timebox by half, stop and cut it into two. Splitting is cheap;
+a learner stalled on a 1,200-line page is not.
+
+### The session cadence
+
+- **Schedule the sitting; do not wait for the mood.** A fixed block at a fixed time —
+  start with **4 × 90 minutes a week**, the same slots every week. 40 h/week is the
+  ambition; the calendar is what makes it real. (The 40 quietly becomes 12 with nothing
+  booked.)
+- **Every session runs the same shape:** a 10-minute interleaved drill from a prior
+  [reference](./reference/) doc → one lesson build → commit → a two-line log.
+- **Log after every session** in [PROGRESS.md](./PROGRESS.md): minutes in the editor
+  (WakaTime) and the three signals. Weekly, fill the week block. Two numbers, five
+  minutes — the point is to *notice* the drift, not to score it.
+- **A session that produced no commit did not happen.** Re-cut the lesson smaller.
+
 ## Interleaving (storage strength, not just fluency)
 
 Weeks build on each other, but practice must mix. From week 3 onward every session

@@ -1,0 +1,484 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Reference 12 — The map of KinLink</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="lesson-header">
+        <p class="eyebrow">Reference 12 · the project, folder by folder</p>
+        <h1>The map of KinLink</h1>
+        <p class="lede">
+          Twelve folders, two tsconfigs, one manifest. This is the document to
+          open when you have forgotten where something lives — and the one to
+          read the night before an interview, because it is also the answer to
+          "walk me through your architecture". Every file, what it exports, why
+          it exists, and what must never go in it.
+        </p>
+        <div class="meta-row">
+          <span>Used by: <a href="../lessons/0014a-the-seam-that-notices.html">Lesson 14a–14d</a></span>
+          <span>Companion: <a href="0002-express-mvc.html">Reference 02</a> (the layers) · <a href="0004-ids-and-tenancy.html">Reference 04</a> (the rules)</span>
+          <span>Vocabulary: <a href="../GLOSSARY.md">GLOSSARY.md</a></span>
+        </div>
+      </header>
+
+      <h2>1. The shape, and why it is this shape</h2>
+
+      <p>
+        KinLink is <strong>one website project</strong>: a single
+        <code>package.json</code>, a single <code>node_modules</code>, one command
+        (<code>npm run dev</code>) that starts both halves. Not a monorepo, not a
+        workspace, no <code>workspace:*</code>. The two server and client programs
+        share exactly one thing — <code>shared/contracts/</code>, a folder of
+        <em>types</em> that both tsconfigs include. There is no runtime code there
+        and no nested manifest.
+      </p>
+
+      <pre><code>kinlink/
+├── package.json          one manifest: scripts, deps, no workspaces
+├── tsconfig.json         server + shared  (NodeNext, strict)
+├── vite.config.ts        client build; proxies /api to :4000
+├── docker-compose.yml    MySQL 8.0 in a container
+├── prisma7.config.ts     Prisma: where the schema and migrations live
+├── prisma/               schema.prisma + migrations/
+├── client/               React + TypeScript      ← presentation
+├── server/               Express + TypeScript    ← data, rules, permissions
+└── shared/contracts/     types both sides compile against</code></pre>
+
+      <div class="callout">
+        <span class="callout-title">Two programs, two tsconfigs, one type system</span>
+        <p>
+          <code>tsconfig.json</code> (root) compiles <code>server/src</code> and
+          <code>shared</code> with <code>types: ["node"]</code>.
+          <code>client/tsconfig.json</code> compiles <code>client/src</code> with
+          the DOM lib and <code>types: ["vite/client"]</code> — and
+          <strong>deliberately no Node types</strong>. That asymmetry is a security
+          property, not an accident: if a component could reference
+          <code>process</code> or <code>fs</code>, someone would. See lesson 14 for
+          what it costs a client-side check script.
+        </p>
+      </div>
+
+      <h2>2. Folder by folder</h2>
+
+      <h3>Root — configuration, no application code</h3>
+
+      <table>
+        <thead><tr><th>File</th><th>What it is for</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><code>package.json</code></td>
+            <td>One manifest. Scripts: <code>dev</code>, <code>dev:server</code>, <code>dev:client</code>, <code>build</code>, <code>typecheck</code>, <code>db:up/down/migrate/studio/seed</code>, and one <code>check:*</code> per invariant.</td>
+          </tr>
+          <tr>
+            <td><code>tsconfig.json</code></td>
+            <td>Server + shared compiler options. <code>include: ["server/src", "shared"]</code> — a file outside that list is silently not compiled.</td>
+          </tr>
+          <tr>
+            <td><code>vite.config.ts</code></td>
+            <td>Client build (<code>root: "client"</code>) and the dev proxy that forwards <code>/api</code> to <code>localhost:4000</code>. The proxy is why this project has <strong>no CORS configuration at all</strong>.</td>
+          </tr>
+          <tr>
+            <td><code>docker-compose.yml</code></td>
+            <td><code>mysql:8.0</code> with a named volume, so data survives restarts. Started with <code>npm run db:up</code>.</td>
+          </tr>
+          <tr>
+            <td><code>prisma7.config.ts</code></td>
+            <td>Tells the Prisma CLI where <code>schema.prisma</code> and <code>migrations/</code> are.</td>
+          </tr>
+          <tr>
+            <td><code>.env</code></td>
+            <td>Git-ignored: <code>DATABASE_*</code>, <code>SESSION_SECRET</code>, <code>PORT</code>.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3><code>prisma/</code> — the schema and its history</h3>
+
+      <p>
+        <code>schema.prisma</code> holds four models
+        (<code>Family</code>, <code>Person</code>, <code>User</code>,
+        <code>FamilyMember</code>, <code>Invitation</code>) and two enums
+        (<code>Gender</code>, <code>FamilyRole</code>). It is the one source of
+        truth for the database's shape, and the only thing the Prisma CLI reads.
+      </p>
+
+      <p>
+        <code>migrations/</code> is append-only history. Six applied so far, in
+        order — read them top to bottom and you have the data model's biography:
+      </p>
+
+      <table>
+        <thead><tr><th>Migration</th><th>What it did</th></tr></thead>
+        <tbody>
+          <tr><td><code>add_family_and_person</code></td><td>The first two tables.</td></tr>
+          <tr><td><code>change_default_updated_at</code></td><td>Gave <code>people.updated_at</code> a default.</td></tr>
+          <tr><td><code>add_users_table</code></td><td>Accounts, with a <code>family_id</code> column we later removed.</td></tr>
+          <tr><td><code>add_family_members</code></td><td>The join table with a <code>role</code> — and the migration that <strong>dropped</strong> <code>users.family_id</code>. One user, many families.</td></tr>
+          <tr><td><code>add_invitation</code></td><td>The invite table: <code>token_hash</code>, <code>expires_at</code>, <code>used_at</code>.</td></tr>
+          <tr><td><code>add_invitation_created_at</code></td><td>The column lesson 12 was missing.</td></tr>
+        </tbody>
+      </table>
+
+      <h3><code>shared/contracts/</code> — the only shared surface</h3>
+
+      <p>
+        Five files of pure types. Both sides compile against them, so a change
+        here is a compile error on whichever side has not caught up. That is the
+        point: the contract is where the client and server agree, and the compiler
+        is the enforcement.
+      </p>
+
+      <table>
+        <thead><tr><th>File</th><th>Exports</th></tr></thead>
+        <tbody>
+          <tr><td><code>api.ts</code></td><td><code>ApiResponse&lt;T&gt;</code>, <code>ApiErrorBody</code>, <code>ProblemCode</code>, <code>TransferRemediation</code>, <code>ApiProblem</code> (RFC 9457 + <code>code</code>/<code>remediation</code>).</td></tr>
+          <tr><td><code>auth.ts</code></td><td><code>RegisterRequest</code>, <code>AuthResponse</code> — and note what <code>AuthResponse</code> does <em>not</em> carry: no <code>familyId</code>, since session 6.</td></tr>
+          <tr><td><code>person.ts</code></td><td><code>Gender</code>, <code>PersonResource</code>.</td></tr>
+          <tr><td><code>family.ts</code></td><td><code>FamilyResource</code> — <code>{ slug, name, role }</code>, no id.</td></tr>
+          <tr><td><code>invitation.ts</code></td><td><code>InvitationResource</code> — <code>email: string | null</code>, dates as ISO strings.</td></tr>
+        </tbody>
+      </table>
+
+      <h3><code>client/</code> — presentation and interaction</h3>
+
+      <table>
+        <thead><tr><th>File</th><th>Purpose</th></tr></thead>
+        <tbody>
+          <tr><td><code>index.html</code></td><td>Vite's entry. Holds <code>&lt;div id="root"&gt;</code> and nothing else worth knowing.</td></tr>
+          <tr><td><code>tsconfig.json</code></td><td>Browser program: DOM lib, <code>jsx: react-jsx</code>, <code>include: ["src"]</code>, no Node types.</td></tr>
+          <tr><td><code>src/main.tsx</code></td><td>The only <code>createRoot</code> in the project. Wraps <code>&lt;App /&gt;</code> in <code>StrictMode</code> and <code>BrowserRouter</code>.</td></tr>
+          <tr><td><code>src/App.tsx</code></td><td>The route table (<code>/invite/:token</code>, <code>/family/:slug/invites</code>, <code>/</code>) plus <code>Home</code> — the four-way session branch — and <code>FamilyList</code>.</td></tr>
+          <tr><td><code>src/LoginScreen.tsx</code></td><td>The screen for <code>anonymous</code>. Login and register share one form.</td></tr>
+          <tr><td><code>src/InvitesPage.tsx</code></td><td><code>/family/:slug/invites</code>. Fetches pending invites; owns the "Anyone with the link" label.</td></tr>
+          <tr><td><code>src/AcceptPage.tsx</code></td><td><code>/invite/:token</code>. <strong>The one component that bypasses <code>lib/api.ts</code></strong> and calls <code>fetch</code> directly.</td></tr>
+          <tr><td><code>src/InviteDialog.tsx</code></td><td><strong>Dead and broken.</strong> Imported by nothing, and it POSTs to <code>/api/invitations</code> — a path with no <code>POST /</code> handler. Delete or rebuild it.</td></tr>
+          <tr><td><code>src/contracts.ts</code></td><td>The client's window on <code>shared/contracts/</code>. Type re-exports only.</td></tr>
+          <tr><td><code>src/lib/api.ts</code></td><td>The transport. <code>ApiError</code>, one private <code>request&lt;T&gt;</code>, and the named calls: <code>getSession</code>, <code>login</code>, <code>register</code>, <code>getFamilies</code>, <code>getInvitations</code>.</td></tr>
+          <tr><td><code>src/lib/useSession.ts</code></td><td><code>SessionState</code> (four states) and <code>useSession()</code>.</td></tr>
+          <tr><td><code>src/brand/source/kinlink-logo.png</code></td><td>The raster the vector generator will read. Generator not written yet.</td></tr>
+        </tbody>
+      </table>
+
+      <p>
+        <strong>The rule for this folder:</strong> components render and ask
+        <code>lib/api.ts</code> for data. They never build a URL, never read a
+        cookie, and never decide what a status code means — that last one is why
+        lesson 14 exists.
+      </p>
+
+      <h3><code>server/src/</code> — the layers</h3>
+
+      <p>
+        This is the folder that will carry the interview. It is MVC with the
+        layers kept honest: <strong>model</strong> owns data,
+        <strong>view</strong> owns the response shape,
+        <strong>controller</strong> owns the HTTP boundary, and the
+        <strong>service</strong> owns the rules.
+      </p>
+
+      <table>
+        <thead><tr><th>File</th><th>Exports — what each one is</th></tr></thead>
+        <tbody>
+          <tr><td><code>server.ts</code></td><td>The process: <code>createApp().listen(env.port)</code>. Nothing else.</td></tr>
+          <tr><td><code>app.ts</code></td><td><code>createApp()</code>: express → json → <code>sessionMiddleware</code> → <code>/api</code> → <code>errorHandler</code>. <strong>Does not listen</strong>, which is what lets a check script run the whole stack on an ephemeral port.</td></tr>
+          <tr><td><code>config/env.ts</code></td><td><code>env</code> — a validated <code>port</code> and <code>nodeEnv</code>.</td></tr>
+          <tr><td><code>config/database.ts</code></td><td><code>prisma</code> — the one <code>PrismaClient</code> plus the MariaDB adapter.</td></tr>
+          <tr><td><code>config/session.ts</code></td><td><code>sessionMiddleware</code> — cookie name, <code>httpOnly</code>, <code>sameSite: "lax"</code>, <code>rolling</code>. <code>MemoryStore</code> in dev, which is why every save logs you out.</td></tr>
+          <tr><td><code>contracts.ts</code></td><td>The server's window on <code>shared/contracts/</code>.</td></tr>
+          <tr><td><code>types/express.d.ts</code></td><td>The two declaration merges: <code>SessionData.userId</code>, and <code>Request.{authenticatedUserId, family, membership}</code>. Without this file, ten type errors.</td></tr>
+        </tbody>
+      </table>
+
+      <p><strong><code>routes/</code> — the URL table and its order</strong></p>
+
+      <table>
+        <thead><tr><th>File</th><th>What it mounts</th></tr></thead>
+        <tbody>
+          <tr><td><code>index.ts</code></td><td><code>apiRouter</code>. Three bands, in this order: <strong>public</strong> (<code>/health</code>, <code>/auth</code>) → <strong>guard</strong> (<code>requireAuth</code>) → <strong>protected</strong> (<code>/families</code>, <code>/families/:slug</code>, <code>/families/:slug/invitations</code>, <code>/invitations</code>). A route below the guard is protected with no per-route argument; a route above it must be public on purpose.</td></tr>
+          <tr><td><code>auth.routes.ts</code></td><td><code>authRouter</code>: POST register/login/logout, GET whoami.</td></tr>
+          <tr><td><code>family.routes.ts</code></td><td><code>familyRouter</code>: GET people, PATCH members/:membershipId, POST leave, POST transfer-ownership.</td></tr>
+          <tr><td><code>invitation.routes.ts</code></td><td>Two routers. <code>invitationRouter</code> is family-scoped (POST mint, GET list); <code>acceptInvitationRouter</code> is standalone (<code>POST /:token/accept</code>) because the invitee is not yet a member.</td></tr>
+        </tbody>
+      </table>
+
+      <p><strong><code>middlewares/</code> — concerns that are not business logic</strong></p>
+
+      <table>
+        <thead><tr><th>File</th><th>Exports</th></tr></thead>
+        <tbody>
+          <tr><td><code>auth.ts</code></td><td><code>requireAuth</code> (401 if no session) and <code>authContext(req)</code> — throws <code>Route is missing requireAuth</code>, the tripwire that makes a mis-mounted route loud.</td></tr>
+          <tr><td><code>family.ts</code></td><td><code>loadFamily</code> (<code>:slug</code> → a proven family, else 404 with an identical body for both failures) and <code>familyContext(req)</code>.</td></tr>
+          <tr><td><code>role.ts</code></td><td><code>requireRole(minimum)</code> and the <code>RANK</code> map — rank, never string equality, so a new role cannot silently widen a check.</td></tr>
+          <tr><td><code>errorHandler.ts</code></td><td><code>errorHandler</code> — the 500 boundary. Leaks <code>error.message</code> in development only.</td></tr>
+        </tbody>
+      </table>
+
+      <p><strong><code>controllers/</code> — HTTP in, HTTP out</strong></p>
+
+      <table>
+        <thead><tr><th>File</th><th>Functions</th></tr></thead>
+        <tbody>
+          <tr><td><code>auth.controller.ts</code></td><td><code>register</code>, <code>login</code>, <code>logout</code>, <code>whoami</code>.</td></tr>
+          <tr><td><code>family.controller.ts</code></td><td><code>patchMemberRole</code>, <code>leave</code>, <code>transferOwner</code>, <code>getMyFamilies</code>.</td></tr>
+          <tr><td><code>people.controller.ts</code></td><td><code>getFamilyPeople</code>.</td></tr>
+          <tr><td><code>invitation.controller.ts</code></td><td><code>getFamilyInvitations</code>. (The mint and accept handlers live inline in <code>invitation.routes.ts</code> — the one place this pattern is broken.)</td></tr>
+        </tbody>
+      </table>
+
+      <p><strong><code>services/</code> — the rules, and the only place transactions live</strong></p>
+
+      <table>
+        <thead><tr><th>File</th><th>Exports</th></tr></thead>
+        <tbody>
+          <tr><td><code>membership.service.ts</code></td><td><code>findFamilyAccess</code>, <code>listMyFamilies</code>, <code>changeRole</code>, <code>leaveFamily</code>, <code>transferOwnership</code>, plus <code>RaceWindow</code> (the test seam) and the result unions <code>RoleChange</code>, <code>Leave</code>, <code>Transfer</code>, <code>KeepRole</code>.</td></tr>
+          <tr><td><code>invitation.service.ts</code></td><td><code>createInvitation</code>, <code>acceptInvitation</code> (the compare-and-set), <code>listPendingInvitations</code>, <code>InvitationResult</code>. Private helpers: <code>hashToken</code>, <code>RANK</code>.</td></tr>
+          <tr><td><code>people.service.ts</code></td><td><code>listPeople</code>.</td></tr>
+        </tbody>
+      </table>
+
+      <p><strong><code>models/</code> — the only place Prisma is touched</strong></p>
+
+      <table>
+        <thead><tr><th>File</th><th>Exports</th></tr></thead>
+        <tbody>
+          <tr><td><code>db.ts</code></td><td><code>Db</code> — a Prisma client <em>or</em> a transaction handle, threaded so services can compose writes; and <code>transact()</code>, the one <code>$transaction</code> wrapper.</td></tr>
+          <tr><td><code>user.model.ts</code></td><td><code>User</code> type, <code>findByEmail</code>, <code>findById</code>, <code>createWithOwnedFamily</code> (user + family + membership, one transaction).</td></tr>
+          <tr><td><code>membership.model.ts</code></td><td><code>ROLES</code>, types (<code>Family</code>, <code>FamilyMember</code>, <code>Role</code>), <code>findMembershipWithFamily</code>, <code>findAllForUser</code>, <code>findByFamily</code>, <code>countOwners</code>, <code>lockFamily</code>, <code>updateRole</code>, <code>deleteById</code>, <code>findOtherMembers</code>.</td></tr>
+          <tr><td><code>person.model.ts</code></td><td><code>Person</code> type, <code>findByFamily(familyId)</code> — a required argument, so an unscoped read is unrepresentable.</td></tr>
+          <tr><td><code>invitation.model.ts</code></td><td><code>Invitation</code> type, <code>findPendingByFamily</code> — <em>the</em> definition of "pending".</td></tr>
+        </tbody>
+      </table>
+
+      <p><strong><code>views/</code> — the whitelist between a row and the wire</strong></p>
+
+      <table>
+        <thead><tr><th>File</th><th>Exports</th></tr></thead>
+        <tbody>
+          <tr><td><code>person.view.ts</code></td><td><code>toPersonResource</code> — maps <code>displayName → name</code>, derives <code>living</code>.</td></tr>
+          <tr><td><code>family.view.ts</code></td><td><code>toFamilyResource</code> — drops the family id, keeps the slug.</td></tr>
+          <tr><td><code>invitation.view.ts</code></td><td><code>toInvitationResource</code> — dates to ISO strings; no field for the token hash to travel in.</td></tr>
+          <tr><td><code>problem.view.ts</code></td><td><code>problem()</code> and <code>lastOwnerProblem()</code> — RFC 9457 bodies with <code>code</code> and <code>remediation</code>.</td></tr>
+        </tbody>
+      </table>
+
+      <p><strong><code>scripts/</code> — runnable proofs, not tests</strong></p>
+
+      <p>
+        <code>seed.ts</code> fills a dev database. The <code>check*</code> files
+        are the project's evidence: each one asserts an invariant and exits
+        non-zero when it breaks. No framework, no mocking — see §6.
+      </p>
+
+      <p>
+        <code>generated/prisma/</code> is Prisma's generated client. It is
+        <strong>tracked in git</strong> (an unusual choice) and must never be
+        hand-edited; it is regenerated by <code>npm run db:migrate</code>.
+      </p>
+
+      <h2>3. One request, every layer</h2>
+
+      <p>
+        Say this out loud until it is automatic. It is the whole architecture in
+        one line, and it is what an interviewer is actually asking for when they
+        say "walk me through a request".
+      </p>
+
+      <pre><code>browser
+  │  components call named functions, never URLs
+  ▼
+client/src/lib/api.ts        request&lt;T&gt;: credentials, ApiError, one envelope
+  │  GET /api/families/nguyen/invitations
+  ▼
+vite dev proxy  ──────────▶  :4000        (so there is no CORS, ever)
+  ▼
+server/src/app.ts            express.json → session → /api → errorHandler
+  ▼
+routes/index.ts              public band → requireAuth → protected band
+  ▼
+middlewares/                 requireAuth → loadFamily → requireRole
+  │                          each leaves a PROVEN fact on the request
+  ▼
+controllers/                 read the context, call ONE service, pick a status
+  ▼
+services/                    the rules; owns transactions and locks
+  ▼
+models/                      the only Prisma in the program
+  ▼
+MySQL
+  ▲
+views/                       row → resource (a whitelist, never a query)
+  ▲
+controller: res.status(200).json({ data })
+  ▲
+client/src/lib/api.ts        unwraps { data }
+  ▲
+the screen renders</code></pre>
+
+      <h2>4. "Which folder do I touch?"</h2>
+
+      <p>The table to reach for first. If a change needs two rows of this table, it is a feature, and it goes through every layer in §3.</p>
+
+      <table>
+        <thead><tr><th>I want to…</th><th>Files, in order</th></tr></thead>
+        <tbody>
+          <tr><td>add a field to a response</td><td><code>shared/contracts/*</code> → <code>server/src/views/*</code> → the model's query if the column isn't loaded</td></tr>
+          <tr><td>add an endpoint to an existing resource</td><td><code>routes/*.routes.ts</code> → <code>controllers/*</code> → service → model → view as needed</td></tr>
+          <tr><td>add a business rule</td><td><code>services/*</code> <strong>only</strong>. If you are editing a controller, stop.</td></tr>
+          <tr><td>add or change a query</td><td><code>models/*</code> <strong>only</strong>. Controllers never import Prisma.</td></tr>
+          <tr><td>change what the client may see</td><td>the view, then the contract. The view is the security boundary.</td></tr>
+          <tr><td>add a screen</td><td><code>client/src/*.tsx</code> + a named function in <code>client/src/lib/api.ts</code></td></tr>
+          <tr><td>change something both sides must agree on</td><td><code>shared/contracts/*</code> — let the compiler find the call sites</td></tr>
+          <tr><td>change the schema</td><td><code>prisma/schema.prisma</code> → <code>npx prisma migrate dev --name …</code> → the model → the view if it crosses the wire</td></tr>
+          <tr><td>prove something still holds</td><td><code>server/src/scripts/check*.ts</code> + one line in <code>package.json</code></td></tr>
+          <tr><td>mount a new path</td><td><code>server/src/routes/index.ts</code> — and decide which band it belongs in</td></tr>
+        </tbody>
+      </table>
+
+      <h2>5. Invariants, and where each one is enforced</h2>
+
+      <p>
+        An invariant is a sentence that must stay true no matter what the client
+        sends. Each one lives in exactly one layer, and — this is the part worth
+        knowing — <strong>most of them have a runnable proof</strong>.
+      </p>
+
+      <table>
+        <thead><tr><th>Invariant</th><th>Enforced in</th><th>Proof</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>a family keeps at least one owner</td>
+            <td><code>membership.service</code>, inside <code>lockFamily</code></td>
+            <td><code>npm run check:ownership</code></td>
+          </tr>
+          <tr>
+            <td>every family read is scoped to the caller</td>
+            <td><code>membership.model</code> — <code>where: { userId }</code></td>
+            <td><code>npm run check:families</code></td>
+          </tr>
+          <tr>
+            <td>an unguarded route answers 401, never data</td>
+            <td><code>routes/index.ts</code> band order + <code>authContext</code>'s tripwire</td>
+            <td><code>npm run check:guards</code></td>
+          </tr>
+          <tr>
+            <td>"pending" means claimable, in one place</td>
+            <td><code>invitation.model.findPendingByFamily</code></td>
+            <td><code>npm run check:invites</code></td>
+          </tr>
+          <tr>
+            <td>a token is single-use under concurrency</td>
+            <td><code>invitation.service.acceptInvitation</code> — one conditional write</td>
+            <td>none yet</td>
+          </tr>
+          <tr>
+            <td>the session holds identity only</td>
+            <td><code>types/express.d.ts</code> + <code>loadFamily</code> per request</td>
+            <td>—</td>
+          </tr>
+          <tr>
+            <td><strong>one pending invite per email</strong></td>
+            <td><strong>nowhere</strong> — see the warning below</td>
+            <td><strong>none</strong></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="callout warn">
+        <span class="callout-title">Two rows the notes got wrong — verified by reading the code</span>
+        <p>
+          Session 11's notes describe a "mint hardening" with a runnable proof
+          called <code>check:mint</code>. <strong>Neither exists.</strong>
+          <code>createInvitation</code> in
+          <code>services/invitation.service.ts</code> has no transaction, no
+          <code>lockFamily</code>, and no duplicate-email refusal — it is a plain
+          <code>prisma.invitation.create</code> — and
+          <code>grep -rn "mint" package.json server/src/scripts</code> returns
+          nothing. So "one pending invite per email" is currently an
+          <em>intention</em>, not an invariant: two concurrent mints for the same
+          address both succeed. This is the honest version of the table, and
+          restoring that proof is a debt with a name.
+        </p>
+      </div>
+
+      <h2>6. The checks — what each one protects, and what it costs to run</h2>
+
+      <table>
+        <thead><tr><th>Script</th><th>Protects</th><th>Needs MySQL?</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><code>npm run check:guards</code></td>
+            <td>that a protected path answers 401 before any data is read</td>
+            <td>No — the guard rejects before the model</td>
+          </tr>
+          <tr>
+            <td><code>npm run check:ownership</code></td>
+            <td>the last-owner rule, under a <em>forced</em> interleaving (a gate parks both transactions in the race window)</td>
+            <td>Yes</td>
+          </tr>
+          <tr>
+            <td><code>npm run check:invites</code></td>
+            <td>the pending filter — a used and an expired invite are both absent; <code>email: null</code> survives as <code>null</code></td>
+            <td>Yes</td>
+          </tr>
+          <tr>
+            <td><code>npm run check:families</code></td>
+            <td>that "my families" returns the caller's and not a stranger's, and that the family id does not cross the view</td>
+            <td>Yes</td>
+          </tr>
+          <tr>
+            <td><code>npm run check:session</code></td>
+            <td>the client's session-end announcement: a 401 about the session ends it, a 401 about sign-in does not, a 500 never does</td>
+            <td>No — it stubs <code>fetch</code> and needs no server at all</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p>
+        The technique is the same in every one: <strong>no framework</strong>. A
+        script asserts, prints what it saw, and exits non-zero when the claim is
+        false. <code>checkGuards</code> and <code>check:session</code> are the
+        cheap half of the pyramid — no database, no port, milliseconds — which is
+        why they are the two to run on every save.
+      </p>
+
+      <h2>7. The constitution: one rule per layer</h2>
+
+      <ul>
+        <li><strong>Contract</strong> — the type both sides compile against. Change here, and the compiler finds the call sites.</li>
+        <li><strong>Route</strong> — binds a URL to a controller, and decides which band (public / guarded / family-scoped) it sits in. Nothing else.</li>
+        <li><strong>Middleware</strong> — a concern that is not business logic. It must leave a <em>proven</em> fact on the request, and it must fail loudly when mounted wrong.</li>
+        <li><strong>Controller</strong> — reads the request context, calls <strong>one</strong> service, chooses the status code. No business logic, no queries, no <code>req.params.slug</code> re-derivation.</li>
+        <li><strong>Service</strong> — the rules. Never sees a <code>Request</code>. Owns transactions, locks and the shape of refusals.</li>
+        <li><strong>Model</strong> — the only place Prisma appears. Answers <em>facts</em> ("which rows match this familyId"), never policy. Takes a <code>Db</code> so it can join a caller's transaction.</li>
+        <li><strong>View</strong> — a whitelist from row to resource, through an annotated return type the compiler enforces. Never queries.</li>
+        <li><strong>Script</strong> — a claim, made runnable.</li>
+      </ul>
+
+      <div class="callout win">
+        <span class="callout-title">Primary sources</span>
+        <p>
+          <a href="https://expressjs.com/en/guide/routing.html">Express — Routing guide</a>
+          (<code>Router</code>, mount paths, typing handlers) ·
+          <a href="https://developer.mozilla.org/en-US/docs/Learn_web_development/Extensions/Server-side/Express_Nodejs/routes">MDN — Express routes and controllers</a>
+          (the MVC mapping this folder tree follows) ·
+          <a href="https://www.prisma.io/docs">Prisma docs</a>
+          (schema, migrations, the generated client) ·
+          <a href="../reference/0002-express-mvc.html">Reference 02</a> for the layer vocabulary, and
+          <a href="../reference/0006-authorisation-chains.html">Reference 06</a> for why the mount order is a security property.
+        </p>
+      </div>
+
+      <footer class="lesson-footer">
+        <p>
+          If a folder here has drifted from this map, the map is wrong and should be
+          corrected the moment you notice — a stale map is worse than none, because
+          you will trust it.
+        </p>
+      </footer>
+    </div>
+  </body>
+</html>

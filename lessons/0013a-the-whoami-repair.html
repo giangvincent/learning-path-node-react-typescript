@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lesson 13a — Repair whoami before anyone depends on it</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="lesson-header">
+        <p class="eyebrow">Lesson 13a · Week 4–5 · about 45 minutes · one new thing</p>
+        <h1>Repair <code>whoami</code> before anyone depends on it</h1>
+        <p class="lede">
+          A shipped endpoint answers <code>500</code> while <code>typecheck</code>
+          says everything is fine. Before the client can ask "am I logged in?",
+          the endpoint that answers must work — and the fix is one line, because
+          the function it should have called already exists. This is the first of
+          four sittings; it is a repair, so it gets its own commit and nothing
+          else.
+        </p>
+        <div class="meta-row">
+          <span>Mission: ship KinLink</span>
+          <span>Requires: <a href="0012-the-pending-invites-list.html">Lesson 12</a></span>
+          <span>Reference: <a href="../reference/0010-client-identity.html">10</a></span>
+          <span>Practice: <a href="0013e-practice.html">Lesson 13e</a></span>
+        </div>
+      </header>
+
+      <div class="callout win">
+        <span class="callout-title">The win</span>
+        <p>
+          <code>GET /api/auth/whoami</code> answers <code>200</code>, fixed by
+          calling the model function that was written for it and used by nothing.
+          <strong>One commit, on its own</strong> — a repair lands before the
+          feature that depends on it.
+        </p>
+      </div>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Build it</h2>
+
+      <ol class="steps">
+        <li>
+          <h3>Verify the baseline, and find the defect</h3>
+          <p>
+            House rule since lesson 11: prove the lesson's claim against
+            <code>main</code> before writing any of it. Start the database and
+            the dev servers, then run the two checks that already exist:
+          </p>
+
+          <pre><code>npm run db:up
+npm run typecheck        # exit 0
+npm run check:invites    # rows returned: 2</code></pre>
+
+          <p>
+            Now the defect. Register — <strong>after your last file save</strong>
+            — and then ask the endpoint this sitting is about, plus the one the
+            next sitting adds:
+          </p>
+
+          <pre><code>npm run dev        # in one terminal
+
+# in another: register, keeping the cookie jar
+curl -sS -i -c /tmp/kinlink.jar -X POST http://localhost:4000/api/auth/register \
+  -H 'Content-Type: application/json' \
+  -d "{\"email\":\"owner-$(date +%s)@probe.invalid\",\"password\":\"password123\"}"
+
+grep kinlink /tmp/kinlink.jar     # must print a kinlink.sid line
+
+curl -sS -b /tmp/kinlink.jar -i http://localhost:4000/api/auth/whoami
+curl -sS -b /tmp/kinlink.jar -i http://localhost:4000/api/families</code></pre>
+
+          <p>
+            <strong>Expected, and both are wrong.</strong>
+            <code>whoami</code> answers <code>500</code> with a Prisma message
+            that names the culprit:
+            <code>Unknown field 'familyId' for select statement on model 'User'</code>.
+            <code>typecheck</code> was green a moment ago. And
+            <code>/api/families</code> answers <code>404</code> whose body is
+            <em>HTML</em>, not JSON — that is the missing read lesson 13b builds.
+          </p>
+
+          <div class="callout warn">
+            <span class="callout-title">An unmounted route fails in the wrong content type</span>
+            <p>
+              <code>Cannot GET /api/families</code> in
+              <code>&lt;pre&gt;</code> tags is Express's built-in 404 handler.
+              Nothing in this API ever wrote it — which is exactly why it is
+              HTML. An API contract that says "errors are
+              <code>{"message": "…"}</code>" is only as good as the routes that
+              answer; the fall-through answers in its own language. A client that
+              does <code>response.json()</code> on every failure throws a parse
+              error here, and that is where the confusing bug report comes from.
+            </p>
+          </div>
+
+          <p>
+            Two more traps, unchanged from lesson 12.
+            <strong>1. The session store is in memory</strong> and the dev server
+            runs under <code>tsx watch</code>: every save restarts the process
+            and kills every session. Register last, not first.
+            <strong>2. Do not diagnose a cookie with <code>whoami</code></strong>
+            until it is fixed — a <code>500</code> tells you nothing about your
+            session. Use the list endpoint: <code>401</code> is a dead cookie,
+            <code>404</code> is a slug that is not yours.
+          </p>
+        </li>
+
+        <li>
+          <h3>Fix <code>whoami</code> — one line, its own commit</h3>
+          <p>
+            The controller hand-wrote a <code>select</code> asking for
+            <code>familyId</code>, a column <code>User</code> has not had since
+            the <code>family_members</code> change. Prisma's excess-property
+            check catches a bad <code>select</code> <strong>only when
+            <code>select</code> is alone</strong> — with a
+            <code>where</code> beside it, the check is silently dropped, so
+            <code>typecheck</code> never saw it.
+          </p>
+
+          <div class="file">
+            <span class="file-path">server/src/controllers/auth.controller.ts (whoami)</span>
+            <pre><code>// before — a hand-written query that bypassed the model layer
+const user = await prisma.user.findUnique({
+  select: { id: true, email: true, familyId: true },
+  where: { id: userId },
+});
+
+// after — the function that already exists for this
+const user = await userModel.findById(userId);</code></pre>
+          </div>
+
+          <div class="callout win">
+            <span class="callout-title">Why this is not "delete the key"</span>
+            <p>
+              <code>user.model.ts</code> already exported
+              <code>findById(id)</code>, selecting exactly
+              <code>{ id, email }</code> — and <code>grep -rn "findById"
+              server/src</code> shows it was used by <strong>nothing</strong>. It
+              was written for <code>whoami</code> and the controller went around
+              it. The fix removes the class of bug, not just the instance: one
+              definition of "a user's public fields", and no hand-written
+              <code>select</code> left to drift.
+            </p>
+          </div>
+
+          <p>
+            <strong>Commit it alone, before anything else in this series.</strong>
+            A reviewer should be able to see "this repairs a shipped 500" without
+            reading four hundred lines of new client code, and the message should
+            carry the mechanism the compiler missed, because that is the part
+            worth remembering:
+          </p>
+
+          <pre><code>git add server/src/controllers/auth.controller.ts
+git commit -F - &lt;&lt;'EOF'
+Fix GET /api/auth/whoami answering 500
+
+whoami hand-wrote select { id, email, familyId } on User, which has had
+no familyId since the family_members change. Prisma's excess-property
+check is dropped when select has a sibling key, so typecheck was green.
+Call userModel.findById, which already selects the public fields.
+
+Typecheck alone could not have caught this.
+EOF</code></pre>
+
+          <p>
+            This is lesson 05's rule again — fix the contract before the
+            consumer. The whole identity flow the next three sittings build calls
+            <code>whoami</code>; building it on a <code>500</code> would teach
+            the client that "not logged in" means "the server is broken".
+          </p>
+        </li>
+      </ol>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Verify (after)</h2>
+
+      <pre><code>npm run typecheck        # exit 0
+npm run check:invites    # rows returned: 2
+
+# restart the dev server (the save killed the session), re-register if the jar is stale
+curl -sS -b /tmp/kinlink.jar -i http://localhost:4000/api/auth/whoami
+# 200 {"data":{"userId":"…","email":"…"}}</code></pre>
+
+      <p>
+        <code>whoami</code> is <code>200</code> where it was <code>500</code>.
+        <code>/api/families</code> is still the HTML <code>404</code> — that is
+        the next sitting's whole job. You are done when
+        <code>whoami</code> answers and the repair is committed on its own.
+      </p>
+
+      <div class="prompt">
+        <span class="prompt-title">Ask your teacher</span>
+        <p>
+          Ask where the <code>whoami</code> fix belongs in the commit history —
+          answers are in <a href="0013e-practice.html">Lesson 13e</a>. Ask whether
+          <code>typecheck</code> should have caught this, and exactly when
+          Prisma's excess-property check is dropped. And ask what else in the
+          tree might be hiding behind the same blind spot.
+        </p>
+      </div>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Log it</h2>
+      <p>
+        Two minutes, then close the tab. This is the step that makes the plan
+        real, and the one every lesson before this forgot to ask for.
+      </p>
+      <ul>
+        <li>Minutes: _</li>
+        <li>One line — what fought back, or what you could not recall: _</li>
+        <li>Committed: <code>&lt;hash&gt;</code> (builds only)</li>
+      </ul>
+      <p>
+        Add it to this week's block in
+        <a href="../PROGRESS.md">PROGRESS.md</a>. At the week's end, fill the
+        three signals — can explain / can extend / can break.
+      </p>
+
+      <footer class="lesson-footer">
+        <p class="next-up">
+          <strong>Next:</strong> Lesson 13b — the read that makes "your" true.
+          Nothing has ever told a caller which families are theirs; today the
+          contract, the model, the view, the route and the runnable check that
+          proves the scoping.
+        </p>
+        <p>
+          <a href="../MISSION.md">MISSION.md</a> ·
+          <a href="../ROADMAP.md">ROADMAP.md</a> ·
+          <a href="../GLOSSARY.md">GLOSSARY.md</a> ·
+          <a href="../PROGRESS.md">PROGRESS.md</a> ·
+          <a href="0012-the-pending-invites-list.html">Lesson 12</a> ·
+          <a href="0013b-the-read-that-makes-your-true.html">Lesson 13b</a> ·
+          <a href="../reference/0010-client-identity.html">Reference 10</a>
+        </p>
+      </footer>
+    </div>
+    <script src="../assets/quiz.js"></script>
+  </body>
+</html>

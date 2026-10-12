@@ -1,0 +1,344 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lesson 14a — One place to notice a dead session</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="lesson-header">
+        <p class="eyebrow">Lesson 14a · Week 4–5 · about 60 minutes · one new thing</p>
+        <h1>One place to notice a dead session</h1>
+        <p class="lede">
+          Log in, delete the session cookie, then click into your family. The
+          client has no idea: it renders "Failed to load: GET
+          /api/families/&lt;slug&gt;/invitations -&gt; 401" while still showing you
+          the logged-in family list. Only one screen in the app knows what a
+          <code>401</code> means, and it is not the one that found out. Today
+          moves that knowledge into the transport layer, so any request that
+          discovers a dead session lands the whole app on the login screen.
+        </p>
+        <div class="meta-row">
+          <span>Mission: ship KinLink</span>
+          <span>Requires: <a href="0013d-the-invites-list-renders.html">Lesson 13d</a></span>
+          <span>Reference: <a href="../reference/0010-client-identity.html">10</a> · <a href="../reference/0012-map-of-kinlink.html">12</a></span>
+          <span>Practice: <a href="0014d-practice.html">Lesson 14d</a></span>
+        </div>
+      </header>
+
+      <div class="callout win">
+        <span class="callout-title">The win</span>
+        <p>
+          A dead session is noticed once and handled by every screen, for free.
+          The knowledge leaves the one screen that had it and moves into the
+          transport, so the failure mode of a future screen forgetting is gone
+          before the screen is written.
+        </p>
+      </div>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Warm-up: the map, from memory</h2>
+
+      <p>
+        Five minutes, no looking. Answer these out loud or on paper <em>before</em>
+        opening <a href="../reference/0012-map-of-kinlink.html">Reference 12</a>,
+        then check yourself and note what you missed. This is the interleaved
+        drill the roadmap asks for at the start of every session — and the honest
+        way to deal with the fear that you will forget everything, because
+        <em>retrieval</em> is what builds storage strength. Re-reading the map
+        feels productive and does almost nothing.
+      </p>
+
+      <ol class="steps">
+        <li>
+          <h3>Name the folders, split by which side of the wire they live on.</h3>
+        </li>
+        <li>
+          <h3>
+            A request arrives for <code>GET /api/families/nguyen/invitations</code>.
+            Name every middleware it passes, in order, and say what fact each one
+            leaves on the request.
+          </h3>
+        </li>
+        <li>
+          <h3>
+            Where does <code>where: { userId }</code> live, and which invariant
+            does it enforce?
+          </h3>
+        </li>
+        <li>
+          <h3>
+            Which file is the only place Prisma appears? Which is the only place a
+            URL string appears?
+          </h3>
+        </li>
+        <li>
+          <h3>
+            Name the four <code>check:*</code> scripts that existed before today,
+            and the invariant each one protects.
+          </h3>
+        </li>
+      </ol>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Build it</h2>
+
+      <ol class="steps">
+        <li>
+          <h3>Verify the baseline, and reproduce the bug</h3>
+          <p>Both halves, as always — the commands, then the running app.</p>
+
+          <pre><code>npm run db:up
+npm run typecheck          # exit 0
+npm run check:families     # 2 families, roles [owner, member]</code></pre>
+
+          <p>
+            <strong>Now cause it.</strong> Start the app, sign in, and then delete
+            the session cookie out from under the running page:
+          </p>
+
+          <pre><code>npm run dev      # then open http://localhost:5173 and sign in
+
+# DevTools → Application → Cookies → http://localhost:5173
+#   delete  kinlink.sid
+# then click your family's link (or reload /family/&lt;slug&gt;/invites)</code></pre>
+
+          <p>
+            <strong>What you see is the bug.</strong> The page reads
+            <code>Failed to load: GET /api/families/&lt;slug&gt;/invitations
+            -&gt; 401</code> — and if you navigate back to <code>/</code>, the
+            family list still renders, because <code>useSession</code> asked its
+            question once at mount and nobody has asked it since. The app holds
+            two contradictory beliefs: "I am logged in" and "I was just told
+            401".
+          </p>
+
+          <div class="callout warn">
+            <span class="callout-title">Why deleting the cookie is a fair test</span>
+            <p>
+              It is exactly what happens in production when the session expires
+              (<code>maxAge: 24h</code>), when the store restarts, or when a
+              session is invalidated server-side. And it is <em>deterministic</em>,
+              which the alternative — restarting the API and waiting — is not.
+              A bug you can cause on demand is a bug you can prove you fixed.
+            </p>
+          </div>
+        </li>
+
+        <li>
+          <h3>The seam: one module that knows a session ended</h3>
+          <p>
+            The transport layer is plain TypeScript. It has no React, and it must
+            not learn any — <code>request()</code> is not a component and must
+            never call <code>useState</code>. So it cannot reach
+            <code>useSession</code>'s state directly. It needs a seam. Give it the
+            smallest one that works: a set of listeners, and two functions.
+          </p>
+
+          <div class="file">
+            <span class="file-path">client/src/lib/session.ts (new)</span>
+            <pre><code>/**
+ * The one place a dead session is announced.
+ *
+ * `request()` is plain TypeScript: it has no React and must not learn any, so it
+ * cannot reach `useSession`'s state directly. It publishes here instead, and the
+ * session hook subscribes. One request notices; every screen reacts.
+ */
+type Listener = () =&gt; void;
+
+const listeners = new Set&lt;Listener&gt;();
+
+/** Subscribe to "the server says our session is gone". Returns an unsubscribe. */
+export function onSessionEnded(listener: Listener): () =&gt; void {
+  listeners.add(listener);
+  return () =&gt; {
+    listeners.delete(listener);
+  };
+}
+
+/** Called by the transport layer when a 401 means the session, not the input. */
+export function announceSessionEnded(): void {
+  for (const listener of listeners) listener();
+}</code></pre>
+          </div>
+
+          <p>
+            Twenty lines, no classes, no framework. The <code>Set</code> is the
+            whole "event bus" — and the returned unsubscribe is what stops the
+            listener accumulating every time a component remounts.
+          </p>
+        </li>
+
+        <li>
+          <h3>The transport announces — but only when the 401 is about the session</h3>
+          <p>
+            Here is the trap, and it is the whole reason this step is longer than
+            it looks. <code>POST /api/auth/login</code> answers
+            <code>401</code> when the <em>password is wrong</em>. That is a
+            verdict on the input, not an eviction — and a transport that treats
+            every <code>401</code> as "your session died" will punish a typo by
+            logging the user out of a session they never had.
+          </p>
+
+          <div class="file">
+            <span class="file-path">client/src/lib/api.ts (addition)</span>
+            <pre><code>import { announceSessionEnded } from "./session";
+
+async function request&lt;T&gt;(
+  path: string,
+  options: {
+    method?: "GET" | "POST";
+    body?: unknown;
+    /**
+     * Does this request carry the caller's session?
+     *
+     * A 401 answers two different questions and the caller is the only one who
+     * knows which was asked: on a session-carrying request it means "your
+     * session is gone" -- a fact about the whole app; on a sign-in request it
+     * means "those credentials are wrong" -- a verdict on this form's input.
+     * Same status code, opposite blast radius.
+     */
+    expectsSession?: boolean;
+  } = {},
+): Promise&lt;T&gt; {
+  const response = await fetch(path, { /* unchanged */ });
+
+  if (!response.ok) {
+    // The transport cannot tell the two 401s apart; the caller opted in above.
+    // Announcing here is what makes the fix reach every screen at once instead
+    // of each screen growing its own "Failed to load: ... 401" branch.
+    if (response.status === 401 &amp;&amp; (options.expectsSession ?? true)) {
+      announceSessionEnded();
+    }
+    throw new ApiError(
+      response.status,
+      `${options.method ?? "GET"} ${path} -&gt; ${response.status}`,
+    );
+  }
+  // ... unchanged</code></pre>
+          </div>
+
+          <p>And the two callers that must opt out, because a wrong password is not a dead session:</p>
+
+          <div class="file">
+            <span class="file-path">client/src/lib/api.ts (login and register)</span>
+            <pre><code>export function login(input: {
+  email: string;
+  password: string;
+}): Promise&lt;AuthResponse&gt; {
+  return request&lt;AuthResponse&gt;("/api/auth/login", {
+    method: "POST",
+    body: input,
+    expectsSession: false,
+  });
+}
+
+export function register(input: {
+  email: string;
+  password: string;
+}): Promise&lt;AuthResponse&gt; {
+  return request&lt;AuthResponse&gt;("/api/auth/register", {
+    method: "POST",
+    body: input,
+    expectsSession: false,
+  });
+}</code></pre>
+          </div>
+
+          <p>
+            The default is <code>true</code>, which is the right direction to fail
+            in: a new endpoint that forgets the option is treated as
+            session-carrying, so a dead session is still noticed. Only the two
+            sign-in endpoints, which are <em>about</em> being anonymous, opt out.
+          </p>
+        </li>
+
+        <li>
+          <h3>The session subscribes</h3>
+          <div class="file">
+            <span class="file-path">client/src/lib/useSession.ts (addition)</span>
+            <pre><code>import { onSessionEnded } from "./session";
+
+// ... inside useSession(), after the existing fetch effect:
+
+  // Any request, on any screen, can be the one that discovers the session is
+  // gone. Subscribe once here so the app lands on the login screen whichever
+  // call found out -- and so no screen has to handle a 401 itself.
+  useEffect(
+    () =&gt; onSessionEnded(() =&gt; setState({ status: "anonymous" })),
+    [],
+  );</code></pre>
+          </div>
+
+          <p>
+            One line of subscription, and the effect returns the unsubscribe
+            itself. This is the half that makes the bug go away: <code>Home</code>
+            re-renders on the state change, unmounts <code>FamilyList</code>, and
+            the login screen appears — even though the request that failed came
+            from a different component entirely.
+          </p>
+        </li>
+      </ol>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Verify (after)</h2>
+
+      <pre><code>npm run typecheck       # exit 0
+npm run dev             # then open http://localhost:5173</code></pre>
+
+      <p>
+        Cause the bug again, exactly as in step 1 — sign in, delete
+        <code>kinlink.sid</code>, click your family. <strong>The login screen
+        replaces the family list</strong>, and the "Failed to load" message never
+        appears. Same three clicks as the baseline; opposite outcome.
+      </p>
+
+      <p>
+        <a href="0014c-the-proof.html">Lesson 14c</a> turns this property into a
+        runnable check; <a href="0014b-off-the-wire.html">Lesson 14b</a> is a
+        small cleanup that comes first — the family id that is still on the wire.
+      </p>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Log it</h2>
+      <p>
+        Two minutes, then close the tab. This is the step that makes the plan
+        real, and the one every lesson before this forgot to ask for.
+      </p>
+      <ul>
+        <li>Minutes: _</li>
+        <li>One line — what fought back, or what you could not recall: _</li>
+        <li>Committed: <code>&lt;hash&gt;</code> (builds only)</li>
+      </ul>
+      <p>
+        Add it to this week's block in
+        <a href="../PROGRESS.md">PROGRESS.md</a>. At the week's end, fill the
+        three signals — can explain / can extend / can break.
+      </p>
+
+      <footer class="lesson-footer">
+        <p class="next-up">
+          <strong>Next:</strong> Lesson 14b — off the wire. Delete the family id
+          from <code>PersonResource</code>, the field that cannot be used and
+          only tempts a route that should not exist.
+        </p>
+        <p>
+          <a href="../MISSION.md">MISSION.md</a> ·
+          <a href="../ROADMAP.md">ROADMAP.md</a> ·
+          <a href="../GLOSSARY.md">GLOSSARY.md</a> ·
+          <a href="../PROGRESS.md">PROGRESS.md</a> ·
+          <a href="0013d-the-invites-list-renders.html">Lesson 13d</a> ·
+          <a href="0014b-off-the-wire.html">Lesson 14b</a> ·
+          <a href="../reference/0012-map-of-kinlink.html">Reference 12</a>
+        </p>
+      </footer>
+    </div>
+    <script src="../assets/quiz.js"></script>
+  </body>
+</html>

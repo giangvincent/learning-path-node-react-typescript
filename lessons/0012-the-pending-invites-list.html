@@ -1,0 +1,758 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lesson 12 — The pending-invites list</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="lesson-header">
+        <p class="eyebrow">Lesson 12 · Week 4–5 · about seventy-five minutes</p>
+        <h1>The pending-invites list</h1>
+        <p class="lede">
+          An owner mints an invite, gets a token back once, and then — nothing.
+          There is no way to see what is outstanding. Lesson 10 tried to write
+          this endpoint and left two type errors behind. Today: give
+          <code>Invitation</code> the column it was missing, walk one read
+          through every layer the way <code>people</code> does, and prove with a
+          runnable check that the list shows only what can still be claimed.
+        </p>
+        <div class="meta-row">
+          <span>Mission: ship KinLink</span>
+          <span>Requires: <a href="0011-finish-the-invitation-client.html">Lesson 11</a></span>
+          <span>Reference: <a href="../reference/0009-invitation-protocol.html">Reference 09</a></span>
+        </div>
+      </header>
+
+      <div class="callout win">
+        <span class="callout-title">The win</span>
+        <p>
+          <code>GET /api/families/:slug/invitations</code> answers
+          <code>200</code> with the family's claimable invites, newest first,
+          owner-only, and the token hash nowhere in the body. Plus a runnable
+          proof — <code>npm run check:invites</code> — that a used invite and an
+          expired invite are both absent, and that a shareable link survives the
+          wire as <code>email: null</code>.
+        </p>
+      </div>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Build it</h2>
+
+      <ol class="steps">
+        <li>
+          <h3>Verify the baseline (before)</h3>
+          <p>
+            Lesson 11 left <code>typecheck</code> green and no list route. Prove
+            the absence with a real request. First get a session cookie as an
+            owner (register makes you one):
+          </p>
+
+          <pre><code>npm run db:up &amp;&amp; npm run dev        # in one terminal
+
+# in another — register, keeping the cookie jar
+curl -sS -i -c /tmp/kinlink.jar -X POST http://localhost:4000/api/auth/register \
+  -H 'Content-Type: application/json' \
+  -d "{\"email\":\"owner-$(date +%s)@probe.invalid\",\"password\":\"password123\"}"</code></pre>
+
+          <p>
+            <strong>Read the response before going on.</strong> You need
+            <code>201 Created</code> <em>and</em> a
+            <code>Set-Cookie: kinlink.sid=…</code> header. If you see
+            <code>409 {"message":"Email already registered"}</code>, the jar stays
+            empty and every request after this one answers <code>401</code> — which
+            looks exactly like "the lesson is broken" and is not. That is why the
+            email above is unique per run instead of a fixed string.
+          </p>
+
+          <pre><code>grep kinlink /tmp/kinlink.jar   # must print a kinlink.sid line, not nothing</code></pre>
+
+          <div class="callout warn">
+            <span class="callout-title">The two traps between register and request</span>
+            <p>
+              <strong>1. The session store is in memory.</strong>
+              <code>express-session</code> defaults to <code>MemoryStore</code>, and
+              the dev server runs under <code>tsx watch</code>. Every file save
+              restarts the process and <em>every session dies with it</em>. So while
+              you are still creating files, the cookie you just earned is already
+              dead by the time you curl. Register <em>after</em> your last save.
+              (This is the concrete reason lesson 05's reference reaches for Redis in
+              production — not theory, this exact papercut.)
+            </p>
+            <p>
+              <strong>2. Do not diagnose the session with <code>/whoami</code>.</strong>
+              It is the broken endpoint lesson 12 flagged: it answers
+              <code>500</code> on <code>main</code> because it selects a
+              <code>familyId</code> that <code>User</code> no longer has. A 500 tells
+              you nothing about your cookie. Use the list endpoint instead —
+              <code>401</code> means no session, <code>404</code> means the session is
+              fine but the slug is not a family you belong to.
+            </p>
+          </div>
+
+          <p>
+            <strong>The slug is the part that bites.</strong> Register does not
+            return it, and — this is a real gap — <em>no endpoint tells you which
+            families you belong to yet</em>. Worse, every register creates a
+            <strong>brand-new family</strong>: re-registering does not reuse your
+            old one, so a slug you copied from an earlier run now belongs to a
+            different user and answers <strong>404 "Family not found"</strong>.
+            That 404 is the <code>loadFamily</code> collapse working correctly — the
+            family either does not exist or you are not in it, and you must not be
+            able to tell which.
+          </p>
+
+          <p>
+            Two ways to find yours. The slug is derived, so you can predict it: the
+            email's local part, lowercased with runs of non-alphanumerics replaced
+            by <code>-</code>, then six random characters. So
+            <code>owner-1791449541@probe.invalid</code> owns a family whose slug
+            starts <code>owner-1791449541-</code>. Or just look:
+          </p>
+
+          <pre><code>npm run db:studio    # browse `families`, copy the slug of the family whose
+                     # `name` matches the email you just registered with</code></pre>
+
+          <p>Then ask for the list:</p>
+
+          <pre><code>curl -sS -b /tmp/kinlink.jar -i http://localhost:4000/api/families/&lt;slug&gt;/invitations</code></pre>
+
+          <p>
+            Expected right now: <strong><code>404</code></strong>. The router is
+            mounted but has no <code>GET</code> route, so Express falls through.
+            That 404 is this lesson's red line. Read the body: a
+            <code>{"message":"Family not found"}</code> here means the
+            <em>slug</em> is wrong (or stale); a
+            <code>{"message":"Authentication required"}</code> means the
+            <em>cookie</em> is gone. Two different problems, two different fixes —
+            do not reach for the wrong one.
+          </p>
+
+          <div class="callout warn">
+            <span class="callout-title">Design gap worth naming now</span>
+            <p>
+              A slug the client cannot discover is a slug the client cannot use.
+              The API answers "what is in this family?" but never "which families
+              are mine?", so today the only ways to learn a slug are the database
+              or the registration side effect. The client cannot do either. A
+              <code>GET /api/families</code> returning the caller's families with
+              slugs and roles is the missing read — and it is the first thing
+              lesson 13 needs, because the list UI has to know which family it is
+              rendering.
+            </p>
+          </div>
+
+          <p>
+            Three other statuses are worth capturing while you are here, because
+            the lesson has to keep them: <code>401</code> with no cookie,
+            <code>404</code> for a family you are not in (the
+            <code>loadFamily</code> collapse), <code>403</code> for a member who
+            is not an owner.
+          </p>
+        </li>
+
+        <li>
+          <h3>Give <code>Invitation</code> the column it was missing</h3>
+          <p>
+            Lesson 10's controller ordered by <code>createdAt</code>, a column
+            that did not exist. That was not a stray typo: <code>Family</code>,
+            <code>User</code>, <code>FamilyMember</code> and <code>Person</code>
+            all record when they were created, and <code>Invitation</code> does
+            not. A pending-invite list wants to say "sent two days ago", and
+            ordering needs the field, so add it.
+          </p>
+
+          <div class="file">
+            <span class="file-path">prisma/schema.prisma (addition)</span>
+            <pre><code>model Invitation {
+  id        String    @id @default(uuid())
+  familyId  String    @map("family_id")
+  role      FamilyRole @default(member)
+  email     String?
+  tokenHash String  @unique @map("token_hash")
+  expiresAt DateTime @map("expires_at")
+  usedAt    DateTime? @map("used_at")
+  createdBy String    @map("created_by")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  family Family @relation(fields: [familyId], references: [id], onDelete: Cascade)
+
+  @@index([familyId])
+  @@map("invitations")
+}</code></pre>
+          </div>
+
+          <div class="file">
+            <span class="file-path">terminal</span>
+            <pre><code>npx prisma migrate dev --name add_invitation_created_at</code></pre>
+          </div>
+
+          <div class="callout warn">
+            <span class="callout-title">Two things this migration is honest about</span>
+            <p>
+              <strong>Existing rows are backfilled with the migration time.</strong>
+              <code>@default(now())</code> on a table with rows means every old
+              invite claims it was created at migration. For a dev database of
+              test invites that is fine; for production you would add the column
+              nullable, backfill a real value, then tighten it. Say the second
+              half out loud in an interview — it is the difference between
+              "migrations ran" and "migrations were reasoned about".
+            </p>
+            <p>
+              <strong>This migration does one thing.</strong> The pending query
+              would like an index on <code>(familyId, usedAt, expiresAt)</code>,
+              but at a handful of rows that is unmeasurable and it is a separate
+              change. House rule from lesson 08: a migration should do one thing.
+            </p>
+          </div>
+
+          <div class="callout">
+            <span class="callout-title">The cheaper fix, and why it loses</span>
+            <p>
+              You could avoid the migration by ordering on
+              <code>expiresAt</code> — today every invite is
+              <code>createdAt + 7 days</code>, so the two orders are identical.
+              It loses on honesty: the ordering silently depends on the TTL being
+              constant, and the list still cannot say when an invite was sent.
+              Adding the missing column is one word of schema and removes the
+              dependence.
+            </p>
+          </div>
+        </li>
+
+        <li>
+          <h3>The contract: what the client may see</h3>
+          <p>
+            Both sides compile against <code>shared/contracts/</code>. Define the
+            resource here, before any server code, so the shape is a decision you
+            made rather than a side effect of the query.
+          </p>
+
+          <div class="file">
+            <span class="file-path">shared/contracts/invitation.ts (new)</span>
+            <pre><code>/** What the client is allowed to see about one invitation. Not a database row. */
+export interface InvitationResource {
+  id: string;
+  /** null = a shareable link; the client labels it, it does not invent a name. */
+  email: string | null;
+  role: "owner" | "admin" | "member";
+  /** ISO-8601. JSON has no Date type, so the wire carries strings. */
+  createdAt: string;
+  expiresAt: string;
+}</code></pre>
+          </div>
+
+          <div class="file">
+            <span class="file-path">server/src/contracts.ts (addition)</span>
+            <pre><code>export type { InvitationResource } from "../../shared/contracts/invitation.js";</code></pre>
+          </div>
+
+          <div class="callout win">
+            <span class="callout-title">The answer to the open question</span>
+            <p>
+              <strong>Shareable links show <code>email: null</code>, and the
+              client labels that "Anyone with the link".</strong> Not "someone".
+              "Someone" implies a person was chosen and their identity is being
+              withheld; a shareable link has no addressee at all — it is a door
+              left open. The owner needs to tell the two apart precisely so they
+              can revoke the right one, so the distinction travels in the
+              contract as <code>null</code>, not as a display string.
+            </p>
+          </div>
+        </li>
+
+        <li>
+          <h3>The model: one definition of "pending"</h3>
+          <p>
+            Lesson 09 and 10 put the invitation queries in the service, because
+            the lock and the compare-and-set are the transaction's business. A
+            plain read has no such excuse: it goes through the model layer like
+            every other read in KinLink.
+          </p>
+
+          <div class="file">
+            <span class="file-path">server/src/models/invitation.model.ts (new)</span>
+            <pre><code>import { prisma } from "../config/database.js";
+import type { Invitation } from "../../generated/prisma/client.js";
+import type { Db } from "./db.js";
+
+// The model layer re-exports the ORM's types so nothing above it imports Prisma.
+export type { Invitation };
+
+/**
+ * Pending = not claimed and not expired.
+ *
+ * The same pair of conditions the accept path checks, in the same transaction
+ * that consumes a token. If the two ever drift, the list starts offering
+ * invitations the accept endpoint will refuse.
+ */
+export async function findPendingByFamily(
+  familyId: string,
+  database: Db = prisma,
+): Promise&lt;Invitation[]&gt; {
+  return database.invitation.findMany({
+    where: { familyId, usedAt: null, expiresAt: { gt: new Date() } },
+    orderBy: { createdAt: "desc" },
+  });
+}</code></pre>
+          </div>
+        </li>
+
+        <li>
+          <h3>The service</h3>
+          <p>
+            One function, and it is a pass-through today. That is the point: the
+            controller is not allowed to touch the database, and
+            <em>pending</em> is a policy word that deserves a name in the layer
+            where policy lives.
+          </p>
+
+          <div class="file">
+            <span class="file-path">server/src/services/invitation.service.ts (addition)</span>
+            <pre><code>import * as invitationModel from "../models/invitation.model.js";
+import type { Invitation } from "../models/invitation.model.js";
+
+/**
+ * The invitations a family can still act on, newest first.
+ *
+ * "Pending" is a policy word, so it lives here rather than in the query the
+ * controller could have written: one definition of claimable, in one place.
+ */
+export async function listPendingInvitations(
+  familyId: string,
+): Promise&lt;Invitation[]&gt; {
+  return invitationModel.findPendingByFamily(familyId);
+}</code></pre>
+          </div>
+        </li>
+
+        <li>
+          <h3>The view: the hash never crosses this line</h3>
+          <div class="file">
+            <span class="file-path">server/src/views/invitation.view.ts (new)</span>
+            <pre><code>import type { InvitationResource } from "../contracts.js";
+import type { Invitation } from "../models/invitation.model.js";
+
+/**
+ * The row as the client may see it.
+ *
+ * The token hash never crosses this line -- there is no field for it to travel
+ * in. The two dates become ISO strings because JSON has no Date, and the view
+ * is the only place that decision is made.
+ */
+export function toInvitationResource(row: Invitation): InvitationResource {
+  return {
+    id: row.id,
+    email: row.email,
+    role: row.role,
+    createdAt: row.createdAt.toISOString(),
+    expiresAt: row.expiresAt.toISOString(),
+  };
+}</code></pre>
+          </div>
+
+          <p>
+            This is a whitelist, not a filter. If someone later adds a
+            <code>notes</code> column to <code>Invitation</code>, it does not
+            appear on the wire by accident — the view has to name it.
+          </p>
+        </li>
+
+        <li>
+          <h3>The controller and the route</h3>
+          <div class="file">
+            <span class="file-path">server/src/controllers/invitation.controller.ts (new)</span>
+            <pre><code>import type { NextFunction, Request, Response } from "express";
+import type { ApiResponse, InvitationResource } from "../contracts.js";
+import { familyContext } from "../middlewares/family.js";
+import { listPendingInvitations } from "../services/invitation.service.js";
+import { toInvitationResource } from "../views/invitation.view.js";
+
+/**
+ * The invitations a family can still act on.
+ *
+ * The controller names no family and does not read the session. It asks for the
+ * family the request was authorised against -- loadFamily already proved the
+ * caller belongs to it. The slug is never re-read from the URL here; the proof
+ * is the middleware's, and the id is the only trustworthy handle it left behind.
+ */
+export async function getFamilyInvitations(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise&lt;void&gt; {
+  try {
+    const { family } = familyContext(req);
+    const invitations = await listPendingInvitations(family.id);
+
+    const body: ApiResponse&lt;InvitationResource[]&gt; = {
+      data: invitations.map(toInvitationResource),
+    };
+
+    res.status(200).json(body);
+  } catch (error) {
+    next(error);
+  }
+}</code></pre>
+          </div>
+
+          <div class="file">
+            <span class="file-path">server/src/routes/invitation.routes.ts (addition)</span>
+            <pre><code>import { getFamilyInvitations } from "../controllers/invitation.controller.js";
+
+// Owner-only: the list carries invitees' emails and the roles they were offered.
+invitationRouter.get("/", requireRole("owner"), getFamilyInvitations);</code></pre>
+          </div>
+
+          <p>
+            <code>requireRole("owner")</code> matches the mint route beside it.
+            One deliberate inconsistency to notice: lesson 10's client renders
+            the invite dialog for <code>admin</code> <em>or</em>
+            <code>owner</code>, but the server allows only owners to mint. That is
+            a product decision — "may admins manage invitations?" — and it should
+            be made once, on purpose, then applied to both routes together.
+            Lesson 13 tightens the client to match until you decide.
+          </p>
+        </li>
+
+        <li>
+          <h3>The runnable check</h3>
+          <p>
+            A filter is logic. Seed four invitations in four states and assert the
+            list shows exactly the claimable ones.
+          </p>
+
+          <div class="file">
+            <span class="file-path">server/src/scripts/checkInvites.ts (new)</span>
+            <pre><code>import "dotenv/config";
+import { randomUUID } from "node:crypto";
+import { prisma } from "../config/database.js";
+import { listPendingInvitations } from "../services/invitation.service.js";
+import { toInvitationResource } from "../views/invitation.view.js";
+
+// Four invitations, four states. The list must show exactly the claimable two:
+// a used invite is not pending, an expired invite is not pending, and the
+// shareable row (email: null) must survive the wire as null, not as "".
+async function main(): Promise&lt;void&gt; {
+  const slug = `probe-${randomUUID().slice(0, 8)}`;
+  const family = await prisma.family.create({
+    data: { slug, name: "Pending probe" },
+  });
+
+  try {
+    const future = new Date(Date.now() + 86_400_000);
+    const past = new Date(Date.now() - 86_400_000);
+
+    const seed = async (input: {
+      email: string | null;
+      usedAt: Date | null;
+      expiresAt: Date;
+      createdAt: Date;
+    }): Promise&lt;void&gt; =&gt; {
+      await prisma.invitation.create({
+        data: {
+          familyId: family.id,
+          role: "member",
+          email: input.email,
+          tokenHash: `${slug}-${randomUUID()}`,
+          createdAt: input.createdAt,
+          expiresAt: input.expiresAt,
+          usedAt: input.usedAt,
+          createdBy: "probe",
+        },
+      });
+    };
+
+    const t = Date.now();
+    await seed({ email: "old@probe.invalid", usedAt: null, expiresAt: future, createdAt: new Date(t - 2000) });
+    await seed({ email: null, usedAt: null, expiresAt: future, createdAt: new Date(t - 1000) });
+    await seed({ email: "used@probe.invalid", usedAt: past, expiresAt: future, createdAt: new Date(t) });
+    await seed({ email: "stale@probe.invalid", usedAt: null, expiresAt: past, createdAt: new Date(t) });
+
+    const rows = await listPendingInvitations(family.id);
+    const resources = rows.map(toInvitationResource);
+    const emails = resources.map((r) =&gt; r.email);
+
+    console.log(`rows returned:  ${resources.length}`);
+    console.log(`emails:         ${JSON.stringify(emails)}`);
+    console.log(`newest first:   ${emails[0] === null}`);
+
+    if (resources.length !== 2) {
+      throw new Error(`EXPECTED 2 pending, got ${resources.length}`);
+    }
+    if (!emails.includes(null)) {
+      throw new Error("SHAREABLE HIDDEN: the email:null row is missing");
+    }
+    if (emails.includes("used@probe.invalid") || emails.includes("stale@probe.invalid")) {
+      throw new Error("NOT PENDING: a used or expired invite was listed");
+    }
+    if (emails[0] !== null) {
+      throw new Error("ORDER WRONG: expected the newest first");
+    }
+    const sample = resources[0];
+    if (
+      typeof sample?.createdAt !== "string" ||
+      typeof sample?.expiresAt !== "string"
+    ) {
+      throw new Error("VIEW WRONG: dates must cross the wire as ISO strings");
+    }
+
+    console.log("\npending filter, ordering and view mapping all held");
+  } finally {
+    await prisma.family.delete({ where: { id: family.id } });
+    await prisma.$disconnect();
+  }
+}
+
+main().catch((error: unknown) =&gt; {
+  console.error(error);
+  process.exitCode = 1;
+});</code></pre>
+          </div>
+
+          <div class="file">
+            <span class="file-path">package.json (scripts, addition)</span>
+            <pre><code>"check:invites": "tsx server/src/scripts/checkInvites.ts"</code></pre>
+          </div>
+        </li>
+      </ol>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Verify (after)</h2>
+
+      <pre><code>npm run typecheck     # exit 0
+npm run check:invites # 2 rows; the shareable one first</code></pre>
+
+      <p>Expected <code>check:invites</code> output:</p>
+
+      <pre><code>rows returned:  2
+emails:         [null,"old@probe.invalid"]
+newest first:   true
+
+pending filter, ordering and view mapping all held</code></pre>
+
+      <p>Then the same curl from the top, now as an owner:</p>
+
+      <pre><code>curl -sS -b /tmp/kinlink.jar http://localhost:4000/api/families/&lt;slug&gt;/invitations</code></pre>
+
+      <pre><code>{ "data": [ { "id": "…", "email": null, "role": "member",
+              "createdAt": "…", "expiresAt": "…" } ] }</code></pre>
+
+      <p>
+        Send one invite with an email and one shareable link first, so the body
+        shows both shapes. No <code>tokenHash</code>, ever.
+      </p>
+
+      <div class="callout warn">
+        <span class="callout-title">What <code>typecheck</code> does not catch (measured)</span>
+        <p>
+          While probing this lesson I wrote
+          <code>prisma.user.findUnique({ select: { id: true, familyId: true } })</code>
+          on a model with no <code>familyId</code>. Two results, same session:
+        </p>
+        <ul>
+          <li>
+            <code>select</code> <strong>alone</strong> →
+            <code>error TS2353: 'familyId' does not exist in type 'UserSelect'</code>.
+          </li>
+          <li>
+            the <strong>same</strong> <code>select</code> with a
+            <code>where</code> beside it → <strong>no error at all</strong>.
+          </li>
+        </ul>
+        <p>
+          At runtime the query throws
+          <code>Unknown field 'familyId' for select statement on model 'User'</code>.
+          So the excess-property check that protects a bare <code>select</code>
+          is lost as soon as the object has a second key. This is not
+          hypothetical: <code>server/src/controllers/auth.controller.ts</code>
+          line 121 selects exactly that shape in <code>whoami</code>, so
+          <strong><code>GET /api/auth/whoami</code> answers 500</strong> — with a
+          green typecheck. The lesson: typecheck proves the code <em>parses</em>;
+          only running it proves it <em>works</em>. Both halves of every Verify
+          block exist for this reason.
+        </p>
+      </div>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Defend it</h2>
+
+      <h3>Why is "pending" defined in one place?</h3>
+      <p>
+        The list and the accept handler must agree on what claimable means. If the
+        list is written from a different definition — say it forgets the expiry
+        check — the owner sees invitations the invitee cannot use, and the bug
+        looks like an accept failure. One definition, referenced twice.
+      </p>
+
+      <h3>Why does the controller not read <code>req.params.slug</code>?</h3>
+      <p>
+        Lesson 10's version did, and that is where one of its two type errors came
+        from. The deeper problem is not the type: re-reading the slug means
+        re-deriving an authorisation fact that <code>loadFamily</code> already
+        proved. <code>familyContext(req).family.id</code> is the id of the family
+        the request was <em>authorised against</em> — the only handle worth
+        trusting.
+      </p>
+
+      <h3>Why is the list owner-only?</h3>
+      <p>
+        It carries invitees' email addresses and the roles they were offered.
+        That is administrative data about membership, and membership changes are
+        owner business today. If the product says admins invite people, move
+        <code>requireRole("owner")</code> to <code>"admin"</code> on both the
+        list and the mint route in the same commit.
+      </p>
+
+      <h3>What are the three refusal statuses here?</h3>
+      <p>
+        <code>401</code> no session — <code>requireAuth</code>, before anything
+        family-shaped is read. <code>404</code> not a member — <code>loadFamily</code>
+        collapsing "no such family" and "not your family" into one body.
+        <code>403</code> member but not owner — <code>requireRole</code>, and
+        legitimately honest about it, because the caller is inside the boundary
+        and already knows the family exists.
+      </p>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Break it on purpose</h2>
+
+      <ol>
+        <li>
+          <strong>Drop the expiry condition.</strong> Change the where clause to
+          <code>where: { familyId, usedAt: null }</code>. Run
+          <code>npm run check:invites</code>. Predict first: the stale invite
+          reappears — <code>rows returned: 3</code>. Measured with <em>both</em>
+          conditions removed: <code>rows returned: 4</code>, and the check throws
+          <code>EXPECTED 2 pending, got 4</code>.
+        </li>
+        <li>
+          <strong>Return the raw rows and skip the view.</strong> Put
+          <code>res.json({ data: invitations })</code> in the controller. The
+          response now carries <code>tokenHash</code> — a credential, on a list
+          endpoint. This is the mistake the view exists to make impossible.
+        </li>
+        <li>
+          <strong>Move the guard to <code>"member"</code>.</strong> Any member
+          now reads every pending invitee's email address. The 403 is the only
+          thing standing between a member and the family's invitation book.
+        </li>
+        <li>
+          <strong>Trust the bare <code>select</code>.</strong> Add
+          <code>familyId: true</code> to a <code>select</code> that also has a
+          <code>where</code>, and run <code>npm run typecheck</code>. It is green.
+          Then call the endpoint. It is a 500. Typecheck is half a proof.
+        </li>
+      </ol>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Retrieval practice</h2>
+
+      <div class="quiz" data-quiz>
+        <script type="application/json">
+          [
+            {
+              "q": "What makes an invitation \"pending\"?",
+              "options": [
+                "usedAt is null and expiresAt is in the future",
+                "The row exists and the family still has an owner",
+                "The token hash is still unique in the table",
+                "The invitee has an account but no membership yet"
+              ],
+              "answer": 0,
+              "why": "The list and the accept path must agree on the same pair: not claimed (usedAt null) and not expired. If they drift, the list offers invitations that accept will refuse."
+            },
+            {
+              "q": "Why does the controller read family from the request context?",
+              "options": [
+                "loadFamily already proved membership and left the id behind",
+                "The slug is not available inside a nested router",
+                "Reading params again would be slower on every request",
+                "Express 5 strips params from mounted child routers"
+              ],
+              "answer": 0,
+              "why": "Re-reading the slug re-derives an authorisation fact the middleware already established. Lesson 10's version did exactly that and it is where one of its two type errors came from."
+            },
+            {
+              "q": "How does a shareable invite reach the client?",
+              "options": [
+                "As email null, which the client labels itself",
+                "As the string \"someone\", replaced before rendering",
+                "It is omitted from the list until it is claimed",
+                "As a masked address with the domain hidden"
+              ],
+              "answer": 0,
+              "why": "A shareable link has no addressee, so there is no address to invent. null is the honest value and the client renders 'Anyone with the link' — the owner needs to tell the two kinds apart to revoke the right one."
+            },
+            {
+              "q": "Why does the view convert the dates to strings?",
+              "options": [
+                "JSON has no Date type, so the wire carries ISO strings",
+                "MySQL returns dates as strings and the types must match",
+                "React cannot render a Date object in JSX",
+                "Prisma requires toISOString before serialising rows"
+              ],
+              "answer": 0,
+              "why": "The view is the single place the row becomes a resource. Dates become ISO strings there because JSON has no Date, and the token hash has no field to travel in at all."
+            }
+          ]
+        </script>
+      </div>
+
+      <div class="prompt">
+        <span class="prompt-title">Ask your teacher</span>
+        <p>
+          Ask how to backfill <code>created_at</code> for real production rows
+          instead of stamping them with the migration time. Ask whether the
+          pending list should paginate before it can ever be long. Ask for the
+          one-line fix to the <code>whoami</code> 500, and where it belongs in the
+          commit history. Ask what the client does when it has no session at all —
+          there is still no login screen.
+        </p>
+      </div>
+
+      <h2>Primary source</h2>
+
+      <div class="callout win">
+        <span class="callout-title">Read this next</span>
+        <p>
+          <a href="../reference/0009-invitation-protocol.html">Reference 09</a> §5
+          (collapse on the wire — why the 404 and 403 here are honest) and §4 (the
+          two authorisation rules the mint still enforces). Then
+          <a href="../reference/0002-express-mvc.html">Reference 02</a> for the
+          chain this lesson just walked: route → middleware → controller →
+          service → model → view → JSON.
+        </p>
+      </div>
+
+      <footer class="lesson-footer">
+        <p class="next-up">
+          <strong>Next:</strong> Lessons 13a–13d — render the list. First fix the
+          <code>whoami</code> 500, then the family read, then the client's
+          identity, then a <code>/family/:slug/invites</code> route, the
+          <code>api</code> helper, the "Anyone with the link" label, and the
+          family slug the client has been missing since lesson 06. Practice is
+          Lesson 13e.
+        </p>
+        <p>
+          <a href="../MISSION.md">MISSION.md</a> ·
+          <a href="../ROADMAP.md">ROADMAP.md</a> ·
+          <a href="../GLOSSARY.md">GLOSSARY.md</a> ·
+          <a href="../PROGRESS.md">PROGRESS.md</a> ·
+          <a href="0011-finish-the-invitation-client.html">Lesson 11</a> ·
+          <a href="0010-render-invitations-client.html">Lesson 10</a> ·
+          <a href="0009-invitations.html">Lesson 09</a> ·
+          <a href="../reference/0009-invitation-protocol.html">Reference 09</a>
+        </p>
+      </footer>
+    </div>
+    <script src="../assets/quiz.js"></script>
+  </body>
+</html>

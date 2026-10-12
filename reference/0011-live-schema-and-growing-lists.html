@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Reference 11 — Live schema and growing lists</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="lesson-header">
+        <p class="eyebrow">Reference 11 · migrations and query behaviour</p>
+        <h1>Changing a column that already has rows — and when a list earns a page</h1>
+        <p class="lede">
+          Two questions that arrive the moment data is real. The first: a column
+          you add today must be filled for rows written yesterday, and filling it
+          with "now" is a lie. The second: every list grows, and pagination is
+          the right answer exactly when the growth is unbounded — not before.
+          Both are answered here with the engine's own rules.
+        </p>
+        <div class="meta-row">
+          <span>Used by: <a href="../lessons/0013a-the-whoami-repair.html">Lesson 13a–13e</a></span>
+          <span>Requires: <a href="0003-prisma-data-layer.html">Reference 03</a></span>
+          <span>Vocabulary: <a href="../GLOSSARY.md">GLOSSARY.md</a></span>
+        </div>
+      </header>
+
+      <h2>1. Expand → backfill → contract</h2>
+
+      <p>
+        The trap is <code>createdAt DateTime @default(now())</code> added to a
+        table that already has rows. Prisma emits
+        <code>ADD COLUMN created_at … NOT NULL DEFAULT CURRENT_TIMESTAMP(3)</code>,
+        and MySQL fills every existing row with the moment the
+        <code>ALTER</code> ran. Every old invite now claims it was created during
+        the deploy. The migration reports success, because it did exactly what it
+        was told — the schema is right and the <em>data</em> is wrong.
+      </p>
+
+      <p>Three steps, in this order, and the order is not stylistic:</p>
+
+      <pre><code>-- 1. EXPAND — nullable, no default. Existing rows get NULL, not a lie.
+ALTER TABLE invitations ADD COLUMN created_at DATETIME(3) NULL;
+
+-- 2. BACKFILL — the best available truth, in bounded batches.
+UPDATE invitations
+   SET created_at = expires_at - INTERVAL 7 DAY
+ WHERE created_at IS NULL
+ LIMIT 1000;              -- repeat until "0 rows affected"
+
+-- 3. CONTRACT — only now is NOT NULL a promise the data keeps.
+ALTER TABLE invitations
+  MODIFY created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3);</code></pre>
+
+      <p>
+        MySQL 8.0 makes step 1 cheap and step 3 expensive, which is exactly the
+        right way round — the cheap, reversible step goes first:
+      </p>
+
+      <table>
+        <thead>
+          <tr><th>Step</th><th>Algorithm</th><th>Rebuilds the table?</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Adding a nullable column</td>
+            <td><code>INSTANT</code>, metadata-only (default since 8.0.12)</td>
+            <td>No</td>
+          </tr>
+          <tr>
+            <td>Setting a column default</td>
+            <td><code>INSTANT</code>, metadata-only</td>
+            <td>No</td>
+          </tr>
+          <tr>
+            <td><strong>Making a column <code>NOT NULL</code></strong></td>
+            <td><code>INPLACE</code></td>
+            <td><strong>Yes</strong></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p>
+        The manual is blunt about step 3: making a column
+        <code>NOT NULL</code> "rebuilds the table in place… Data is reorganized
+        substantially, making it an expensive operation" — and
+        "the operation fails if the column contains <code>NULL</code> values".
+        That last clause is why the backfill must come first, and why the order
+        is enforced by the engine rather than by taste.
+      </p>
+
+      <div class="callout">
+        <span class="callout-title">The honest answer when no source exists</span>
+        <p>
+          Step 2 needs a <em>real</em> value, and sometimes there is none. If the
+          only thing you know is <code>expiresAt</code> and a fixed TTL, then
+          <code>expires_at - INTERVAL 7 DAY</code> is an <strong>estimate</strong>
+          — write it down as one. If even that is a guess, the honest move is to
+          leave the column <code>NULL</code> and teach the view to render
+          "unknown". A fabricated timestamp is worse than a missing one: it
+          survives review and outlives the memory that it was invented.
+        </p>
+      </div>
+
+      <p>
+        <strong>Doing it with Prisma.</strong> Prisma can only express the
+        schema, not the intermediate state, so you write the migration by hand —
+        the same technique lesson 06 used for the
+        <code>INSERT … SELECT</code> that had to run before
+        <code>DROP COLUMN users.family_id</code>:
+      </p>
+
+      <pre><code>npx prisma migrate dev --create-only --name add_invitation_created_at
+# hand-edit the generated migration.sql to the three statements above
+npx prisma migrate dev</code></pre>
+
+      <p>
+        Prisma's own guide generalises this to a two-migration
+        <em>expand and contract</em>: expand the schema and deploy, run the
+        backfill as a typed data-migration script, then contract in a second
+        migration. For a single column, one hand-edited migration is the shorter
+        version of the same idea.
+      </p>
+
+      <h2>2. When a list has earned pagination</h2>
+
+      <p>
+        The question to ask is not "could this get long?" — everything could. It
+        is: <strong>is the size bounded by construction?</strong> Three natural
+        bounds exist in KinLink's pending-invite list, and each is a real
+        mechanism rather than a hope:
+      </p>
+
+      <ul>
+        <li>invites expire after 7 days, so old rows leave the query by themselves;</li>
+        <li>the mint refuses a second pending invite for the same email, so duplicates cannot accumulate;</li>
+        <li>the number of people a family is inviting in a given week is small, by the nature of the product.</li>
+      </ul>
+
+      <p>
+        Nothing in that list is a promise. That is the point: pagination is owed
+        when the bound is <em>structural</em> (an event log, a feed, a family's
+        people over years), not when it is merely plausible. Adding a page
+        envelope early costs every caller a cursor, and it does not make anything
+        faster — the query is already limited by
+        <code>family_id</code>.
+      </p>
+
+      <div class="callout">
+        <span class="callout-title">The shape to reach for when the bound stops holding</span>
+        <p>
+          A hard <code>take</code> so a data bug cannot become an unbounded
+          response; an index on the columns the query filters; and a
+          <code>meta.nextCursor</code> — which costs nothing to add later,
+          because <code>ApiResponse</code> already carries an optional
+          <code>meta</code>, so no client breaks when it appears.
+        </p>
+      </div>
+
+      <pre><code>return database.invitation.findMany({
+  where: { familyId, usedAt: null, expiresAt: { gt: new Date() } },
+  orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+  take: 200,        // a data bug must not become an unbounded response
+});</code></pre>
+
+      <p>
+        Note the tiebreaker: <code>id</code> after <code>createdAt</code>. Two
+        invites created in the same millisecond have no defined order without it,
+        and an unstable sort is a pagination bug waiting to be written.
+      </p>
+
+      <h2>3. When it is unbounded, use a keyset — never <code>OFFSET</code></h2>
+
+      <p>
+        The temptation is <code>LIMIT 20 OFFSET 40</code>. It is wrong twice
+        over. It is slow, because SQL defines it as sorting everything and then
+        <em>dropping</em> the first N rows — Winand quotes the standard: "the rows
+        in the derived table are first sorted according to the &lt;order by
+        clause&gt; and then limited by dropping the number of rows specified in
+        the &lt;result offset clause&gt; from the beginning". And it is
+        <em>incorrect</em>, because a row inserted between two page fetches
+        shifts everything down and the reader sees a duplicate.
+      </p>
+
+      <p>The seek recipe replaces the count with the last thing seen:</p>
+
+      <pre><code>SELECT ...
+  FROM invitations
+ WHERE family_id = ?
+   AND (created_at, id) &lt; (?, ?)     -- the last row of the previous page
+ ORDER BY created_at DESC, id DESC
+ LIMIT 20;</code></pre>
+
+      <p>
+        Same <code>ORDER BY</code>, same index, no drifting. The cost is that you
+        cannot jump to "page 7" — which is fine for "load more", and the reason
+        keyset pagination is the natural partner of infinite scroll.
+      </p>
+
+      <div class="callout win">
+        <span class="callout-title">The verdict for lesson 13</span>
+        <p>
+          <strong>Do not paginate the pending-invites list.</strong> It is bounded
+          by expiry and by the mint's one-per-email rule, and its caller is one
+          owner looking at one family. So the code in this project has no cursor,
+          no page envelope and no cap — and that is a decision, not an omission.
+          Add <code>take</code> the day the shape stops being auditable by eye;
+          add the index when the read measures slow; and add
+          <code>meta.nextCursor</code> the day the bound stops holding. The change
+          that will force it is a filter the user drives ("show used invites
+          too"), because that turns a bounded read into an unbounded one.
+        </p>
+      </div>
+
+      <div class="callout win">
+        <span class="callout-title">Primary sources</span>
+        <p>
+          <a href="https://dev.mysql.com/doc/refman/8.0/en/innodb-online-ddl-operations.html"
+            >MySQL 8.0 — Online DDL Operations</a
+          >
+          (the column-operations table: <code>INSTANT</code> for adding, and
+          "Rebuilds Table: Yes" plus "fails if the column contains NULL values"
+          for <code>NOT NULL</code>) ·
+          <a href="https://www.prisma.io/docs/guides/v7/database/data-migration"
+            >Prisma ORM v7 — Expand-and-contract migrations</a
+          >
+          (expand, backfill with a typed script, contract) ·
+          <a href="https://use-the-index-luke.com/no-offset">Markus Winand — use-the-index-luke, #NoOffset</a>
+          (the standard's own wording on <code>offset</code>, and the seek recipe) ·
+          <a href="https://github.com/github/gh-ost">GitHub — gh-ost</a>
+          (what step 3 looks like when the table is too big to rebuild in place).
+        </p>
+      </div>
+
+      <footer class="lesson-footer">
+        <p>Reference docs are meant to be argued with. If a rule here is wrong, say so.</p>
+      </footer>
+    </div>
+  </body>
+</html>

@@ -1,0 +1,478 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lesson 13c — The client can sign in</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="lesson-header">
+        <p class="eyebrow">Lesson 13c · Week 4–5 · about 60 minutes · one new thing</p>
+        <h1>The client can sign in</h1>
+        <p class="lede">
+          The server now answers both questions a browser needs — "who am I?" and
+          "which families are mine?" — and the browser still cannot ask either.
+          This sitting gives the client one transport helper, a session hook with
+          four states, and a login screen. The window is the one the client opens
+          on: it signs in and sees the families the previous sitting made real.
+        </p>
+        <div class="meta-row">
+          <span>Mission: ship KinLink</span>
+          <span>Requires: <a href="0013b-the-read-that-makes-your-true.html">Lesson 13b</a></span>
+          <span>Reference: <a href="../reference/0010-client-identity.html">10</a></span>
+          <span>Practice: <a href="0013e-practice.html">Lesson 13e</a></span>
+        </div>
+      </header>
+
+      <div class="callout win">
+        <span class="callout-title">The win</span>
+        <p>
+          Four states — <code>loading</code>, <code>anonymous</code>,
+          <code>error</code>, <code>authenticated</code> — and a login form that
+          appears for exactly one of them. Sign up in the browser and the list of
+          <em>your</em> families renders, from a slug the client was given rather
+          than one it guessed.
+        </p>
+      </div>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Build it</h2>
+
+      <ol class="steps">
+        <li>
+          <h3>The client's one fetch helper</h3>
+          <p>
+            The old <code>lib/api.ts</code> had a single function that fetched
+            <code>/api/people</code> — <strong>not a mounted route</strong>. Delete
+            it; people live at <code>/api/families/:slug/people</code> and will get
+            their own function when a screen needs one. In its place, one helper
+            that owns the envelope and the status.
+          </p>
+
+          <div class="file">
+            <span class="file-path">client/src/lib/api.ts (rewritten)</span>
+            <pre><code>import type {
+  ApiResponse,
+  AuthResponse,
+  FamilyResource,
+  InvitationResource,
+} from "../contracts";
+
+/**
+ * A failed response, carrying the status so callers can tell "you are not logged
+ * in" (401) from "the server broke" (500). Lesson 05 drew that line on the
+ * server; this is the client finally consuming it.
+ */
+export class ApiError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
+/**
+ * One fetch, one envelope. Components call named functions with types, never
+ * URLs, and nothing here throws for a 401 -- it throws an ApiError, and the
+ * caller decides what a 401 means.
+ */
+async function request&lt;T&gt;(
+  path: string,
+  options: { method?: "GET" | "POST"; body?: unknown } = {},
+): Promise&lt;T&gt; {
+  const response = await fetch(path, {
+    method: options.method ?? "GET",
+    credentials: "include",
+    headers:
+      options.body === undefined
+        ? undefined
+        : { "Content-Type": "application/json" },
+    body: options.body === undefined ? undefined : JSON.stringify(options.body),
+  });
+
+  if (!response.ok) {
+    throw new ApiError(
+      response.status,
+      `${options.method ?? "GET"} ${path} -&gt; ${response.status}`,
+    );
+  }
+  if (response.status === 204) {
+    return undefined as T;
+  }
+
+  const body = (await response.json()) as ApiResponse&lt;T&gt;;
+  return body.data;
+}
+
+export function getSession(): Promise&lt;AuthResponse&gt; {
+  return request&lt;AuthResponse&gt;("/api/auth/whoami");
+}
+
+export function login(input: {
+  email: string;
+  password: string;
+}): Promise&lt;AuthResponse&gt; {
+  return request&lt;AuthResponse&gt;("/api/auth/login", {
+    method: "POST",
+    body: input,
+  });
+}
+
+export function register(input: {
+  email: string;
+  password: string;
+}): Promise&lt;AuthResponse&gt; {
+  return request&lt;AuthResponse&gt;("/api/auth/register", {
+    method: "POST",
+    body: input,
+  });
+}
+
+export function getFamilies(): Promise&lt;FamilyResource[]&gt; {
+  return request&lt;FamilyResource[]&gt;("/api/families");
+}
+
+export function getInvitations(slug: string): Promise&lt;InvitationResource[]&gt; {
+  return request&lt;InvitationResource[]&gt;(
+    `/api/families/${encodeURIComponent(slug)}/invitations`,
+  );
+}</code></pre>
+          </div>
+
+          <div class="callout">
+            <span class="callout-title"><code>credentials: "include"</code> is load-bearing</span>
+            <p>
+              Without it the browser does not attach the session cookie to a
+              cross-origin <code>fetch</code>, and every request here answers
+              <code>401</code>. In development Vite proxies
+              <code>/api</code> to Express, so the origin is the same and this
+              looks unnecessary — it is not, and it is exactly the kind of thing
+              that survives to production and then breaks there. Set it once, in
+              the helper.
+            </p>
+          </div>
+        </li>
+
+        <li>
+          <h3><code>useSession</code> — four states, one question</h3>
+          <p>
+            The session is server state, so the truth is <em>fetched</em>. This
+            hook is the fetch, plus the only genuinely interesting decision in
+            the client: a <code>401</code> is not an error.
+          </p>
+
+          <div class="file">
+            <span class="file-path">client/src/lib/useSession.ts (new)</span>
+            <pre><code>import { useCallback, useEffect, useState } from "react";
+import type { AuthResponse } from "../contracts";
+import { ApiError, getSession } from "./api";
+
+export type SessionState =
+  | { status: "loading" }
+  | { status: "anonymous" }
+  | { status: "error"; message: string }
+  | { status: "authenticated"; user: AuthResponse };
+
+/**
+ * Who is this browser, according to the server?
+ *
+ * The session lives on the server, so the truth is fetched, never mirrored into
+ * a client store. Three outcomes, three states: a 401 is "not logged in" -- an
+ * ordinary state the UI renders a login form for -- while anything else is a
+ * fault worth showing.
+ */
+export function useSession(): { state: SessionState; refresh: () =&gt; void } {
+  const [state, setState] = useState&lt;SessionState&gt;({ status: "loading" });
+  const [nonce, setNonce] = useState(0);
+
+  useEffect(() =&gt; {
+    let live = true;
+
+    getSession()
+      .then((user) =&gt; {
+        if (live) setState({ status: "authenticated", user });
+      })
+      .catch((cause: unknown) =&gt; {
+        if (!live) return;
+        if (cause instanceof ApiError &amp;&amp; cause.status === 401) {
+          setState({ status: "anonymous" });
+          return;
+        }
+        setState({
+          status: "error",
+          message: cause instanceof Error ? cause.message : "Unknown error",
+        });
+      });
+
+    return () =&gt; {
+      live = false;
+    };
+  }, [nonce]);
+
+  const refresh = useCallback(() =&gt; setNonce((n) =&gt; n + 1), []);
+
+  return { state, refresh };
+}</code></pre>
+          </div>
+
+          <p>
+            Two things to notice. The <code>live</code> flag means a response that
+            arrives after unmount cannot write state — the same discipline as
+            ignoring a stale fetch. And <code>refresh</code> is a counter, not a
+            mutation: a successful login does not <em>construct</em> an
+            authenticated user, it asks the server again. One source of truth,
+            one write path.
+          </p>
+        </li>
+
+        <li>
+          <h3>The login screen — an answer to "no session", not an error page</h3>
+          <div class="file">
+            <span class="file-path">client/src/LoginScreen.tsx (new)</span>
+            <pre><code>import { useState } from "react";
+import type { FormEvent } from "react";
+import { ApiError, login, register } from "./lib/api";
+
+/**
+ * The screen the client shows when the server says "I do not know you".
+ *
+ * Login and register are one form because they are one question -- "who are
+ * you?" -- and the only difference is which endpoint answers. Both leave a
+ * session cookie behind, which is why success just refreshes the session.
+ */
+export default function LoginScreen({ onSignedIn }: { onSignedIn: () =&gt; void }) {
+  const [mode, setMode] = useState&lt;"login" | "register"&gt;("login");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState&lt;string | null&gt;(null);
+  const [pending, setPending] = useState(false);
+
+  const submit = async (event: FormEvent) =&gt; {
+    event.preventDefault();
+    setPending(true);
+    setError(null);
+    try {
+      await (mode === "login"
+        ? login({ email, password })
+        : register({ email, password }));
+      onSignedIn();
+    } catch (cause: unknown) {
+      setError(
+        cause instanceof ApiError &amp;&amp; cause.status === 401
+          ? "Wrong email or password."
+          : "That did not work. Try again.",
+      );
+    } finally {
+      setPending(false);
+    }
+  };
+
+  return (
+    &lt;main style={{ fontFamily: "system-ui, sans-serif", padding: "2rem" }}&gt;
+      &lt;h1&gt;KinLink&lt;/h1&gt;
+      &lt;h2&gt;{mode === "login" ? "Log in" : "Create your family"}&lt;/h2&gt;
+
+      &lt;form onSubmit={submit}&gt;
+        &lt;p&gt;
+          &lt;input
+            type="email"
+            value={email}
+            onChange={(event) =&gt; setEmail(event.target.value)}
+            placeholder="email"
+            required
+          /&gt;
+        &lt;/p&gt;
+        &lt;p&gt;
+          &lt;input
+            type="password"
+            value={password}
+            onChange={(event) =&gt; setPassword(event.target.value)}
+            placeholder="password"
+            required
+          /&gt;
+        &lt;/p&gt;
+        &lt;button type="submit" disabled={pending}&gt;
+          {pending ? "Working…" : mode === "login" ? "Log in" : "Sign up"}
+        &lt;/button&gt;
+      &lt;/form&gt;
+
+      {error &amp;&amp; &lt;p role="alert"&gt;{error}&lt;/p&gt;}
+
+      &lt;p&gt;
+        &lt;button
+          type="button"
+          onClick={() =&gt; setMode(mode === "login" ? "register" : "login")}
+        &gt;
+          {mode === "login" ? "Need an account?" : "Already have an account?"}
+        &lt;/button&gt;
+      &lt;/p&gt;
+    &lt;/main&gt;
+  );
+}</code></pre>
+          </div>
+
+          <div class="callout warn">
+            <span class="callout-title">Import the event type by name</span>
+            <p>
+              <code>import type { FormEvent } from "react"</code> is not
+              decoration. Under <code>verbatimModuleSyntax</code> and
+              <code>jsx: react-jsx</code> there is no <code>React</code> value in
+              scope, so writing <code>React.FormEvent</code> fails with
+              <em>TS2686: 'React' refers to a UMD global, but the current file is
+              a module.</em>
+            </p>
+          </div>
+        </li>
+
+        <li>
+          <h3>Wire it up, and render your families</h3>
+          <p>
+            <code>Home</code> is the three states of a session; <code>FamilyList</code>
+            renders only once the session is known, because "which families?" is a
+            question only an identity can answer. The link to each family's invites
+            page is the next sitting's job — today the names render as plain text.
+          </p>
+
+          <div class="file">
+            <span class="file-path">client/src/App.tsx (rewritten)</span>
+            <pre><code>import { useEffect, useState } from "react";
+import { Route, Routes } from "react-router-dom";
+import AcceptPage from "./AcceptPage";
+import LoginScreen from "./LoginScreen";
+import type { FamilyResource } from "./contracts";
+import { getFamilies } from "./lib/api";
+import { useSession } from "./lib/useSession";
+
+/**
+ * The families this session belongs to. Rendered only once the session is
+ * known, because "which families?" is a question only an identity can answer.
+ */
+function FamilyList() {
+  const [families, setFamilies] = useState&lt;FamilyResource[] | null&gt;(null);
+  const [error, setError] = useState&lt;string | null&gt;(null);
+
+  useEffect(() =&gt; {
+    getFamilies()
+      .then(setFamilies)
+      .catch((cause: unknown) =&gt;
+        setError(cause instanceof Error ? cause.message : "Unknown error"),
+      );
+  }, []);
+
+  if (error) return &lt;p role="alert"&gt;Failed to load: {error}&lt;/p&gt;;
+  if (!families) return &lt;p&gt;Loading…&lt;/p&gt;;
+
+  return (
+    &lt;main style={{ fontFamily: "system-ui, sans-serif", padding: "2rem" }}&gt;
+      &lt;h1&gt;KinLink&lt;/h1&gt;
+      &lt;ul&gt;
+        {families.map((family) =&gt; (
+          &lt;li key={family.slug}&gt;
+            {family.name} — you are {family.role}
+          &lt;/li&gt;
+        ))}
+      &lt;/ul&gt;
+    &lt;/main&gt;
+  );
+}
+
+/** The three states of a session: unknown, absent, present. */
+function Home() {
+  const { state, refresh } = useSession();
+
+  if (state.status === "loading") return &lt;p&gt;Checking your session…&lt;/p&gt;;
+  if (state.status === "error") return &lt;p role="alert"&gt;{state.message}&lt;/p&gt;;
+  if (state.status === "anonymous") return &lt;LoginScreen onSignedIn={refresh} /&gt;;
+  return &lt;FamilyList /&gt;;
+}
+
+export default function App() {
+  return (
+    &lt;Routes&gt;
+      &lt;Route path="/invite/:token" element={&lt;AcceptPage /&gt;} /&gt;
+      &lt;Route path="/" element={&lt;Home /&gt;} /&gt;
+    &lt;/Routes&gt;
+  );
+}</code></pre>
+          </div>
+        </li>
+      </ol>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Verify (after)</h2>
+
+      <pre><code>npm run typecheck        # exit 0
+npm run dev              # then open http://localhost:5173</code></pre>
+
+      <ol>
+        <li>With no cookie: the login form, in a fresh browser profile.</li>
+        <li>
+          Sign up with a new email: the form is replaced by a list of one family,
+          "…'s family — you are owner".
+        </li>
+        <li>Reload: still signed in, because <code>whoami</code> answers 200.</li>
+      </ol>
+
+      <div class="callout warn">
+        <span class="callout-title">Two sessions, one browser</span>
+        <p>
+          A cookie is per browser, not per tab, so you cannot be logged in as two
+          users in two tabs of the same profile. Use one normal window and one
+          private window — the same trick you will need for the invitation flow,
+          where the inviter and the invitee must be different people.
+        </p>
+      </div>
+
+      <div class="prompt">
+        <span class="prompt-title">Ask your teacher</span>
+        <p>
+          Ask why the client fetches the session instead of storing it, and what
+          changes when a session dies mid-use. Answers are in
+          <a href="0013e-practice.html">Lesson 13e</a>.
+        </p>
+      </div>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Log it</h2>
+      <p>
+        Two minutes, then close the tab. This is the step that makes the plan
+        real, and the one every lesson before this forgot to ask for.
+      </p>
+      <ul>
+        <li>Minutes: _</li>
+        <li>One line — what fought back, or what you could not recall: _</li>
+        <li>Committed: <code>&lt;hash&gt;</code> (builds only)</li>
+      </ul>
+      <p>
+        Add it to this week's block in
+        <a href="../PROGRESS.md">PROGRESS.md</a>. At the week's end, fill the
+        three signals — can explain / can extend / can break.
+      </p>
+
+      <footer class="lesson-footer">
+        <p class="next-up">
+          <strong>Next:</strong> Lesson 13d — the invites list renders. Turn the
+          family name into a link and add the screen that shows pending
+          invitations for a slug the server handed out.
+        </p>
+        <p>
+          <a href="../MISSION.md">MISSION.md</a> ·
+          <a href="../ROADMAP.md">ROADMAP.md</a> ·
+          <a href="../GLOSSARY.md">GLOSSARY.md</a> ·
+          <a href="../PROGRESS.md">PROGRESS.md</a> ·
+          <a href="0013b-the-read-that-makes-your-true.html">Lesson 13b</a> ·
+          <a href="0013d-the-invites-list-renders.html">Lesson 13d</a> ·
+          <a href="../reference/0010-client-identity.html">Reference 10</a>
+        </p>
+      </footer>
+    </div>
+    <script src="../assets/quiz.js"></script>
+  </body>
+</html>

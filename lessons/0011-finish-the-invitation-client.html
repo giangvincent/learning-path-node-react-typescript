@@ -1,0 +1,909 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lesson 11 — Finish the invitation client</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="lesson-header">
+        <p class="eyebrow">Lesson 11 · Week 4–5 · about sixty minutes</p>
+        <h1>Finish the invitation client</h1>
+        <p class="lede">
+          Lesson 10 wrote three files that looked finished and weren't:
+          the controller failed <code>npm run typecheck</code>, the
+          router was never mounted, and the accept page imported a
+          package that isn't installed. Today: prove the baseline is
+          red, fix exactly that, harden the mint so two submissions
+          cannot both succeed, prove it's green, and ship a runnable
+          invitation client.
+        </p>
+        <div class="meta-row">
+          <span>Mission: ship KinLink</span>
+          <span>Requires: <a href="0010-render-invitations-client.html">Lesson 10</a></span>
+          <span>Reference: <a href="../reference/0009-invitation-protocol.html">Reference 09</a></span>
+        </div>
+      </header>
+
+      <div class="callout warn">
+        <span class="callout-title">Why this lesson exists</span>
+        <p>
+          Lesson 10 introduced code in three files that did not run.
+          Typecheck was red, endpoints answered 404, and a React page
+          imported a symbol from a package the manifest had never
+          declared. The lesson text wasn't wrong about the design — it
+          was wrong about the <em>state</em>: it described the build as
+          if it were complete. This lesson names that mistake, closes
+          the gap, and commits. The three complaints from the lesson-10
+          review are the working list.
+        </p>
+      </div>
+
+      <div class="callout win">
+        <span class="callout-title">The win</span>
+        <p>
+          A green baseline (<code>npm run typecheck</code> → 0,
+          <code>npm run check:mint</code> → 1 credential for 2
+          concurrent mints), a mounted <code>invitationRouter</code>
+          that answers <code>POST /api/families/:slug/invitations</code>
+          for owners and <code>POST /api/invitations/:token/accept</code>
+          for authenticated invitees, and a client that installs
+          <code>react-router-dom</code>, registers
+          <code>/invite/:token</code>, and renders the accept page from
+          the URL token.
+        </p>
+      </div>
+
+      <div class="pixel-rule"></div>
+
+      <h2>House rule (effective from this lesson)</h2>
+
+      <p>
+        Every lesson that touches code now opens with a
+        <strong>Verify</strong> paragraph, listing the exact commands
+        that prove green. The author runs them against the lesson's
+        verbatim code shape against <code>main</code>, and the lesson is
+        not considered finished until they exit 0. Three corollaries the
+        lesson-10 mistakes make concrete:
+      </p>
+
+      <ol>
+        <li>
+          <strong>Lesson code that doesn't compile is a bug, not a
+          draft.</strong> If the lesson text contains verbatim code
+          blocks and <code>npm run typecheck</code> would error on them,
+          the lesson is wrong — not the runner. Lesson 10's controller
+          had two errors and should never have shipped inside a lesson.
+        </li>
+        <li>
+          <strong>Every new module is named, installed, and verified to
+          resolve.</strong> If the lesson says
+          <code>import { useParams } from "react-router-dom"</code>, the
+          lesson text must (a) say which package adds the symbol, (b)
+          show the exact install command, and (c) include a Verify step
+          that asserts the import resolves. Lesson 11 does all three.
+        </li>
+        <li>
+          <strong>Stubs are not step bodies.</strong> A handler whose
+          body is <code>// ... then createInvitation(...)</code> teaches
+          nothing the reader can run. Either the body is implemented (and
+          is the lesson's working code), or the route is removed.
+        </li>
+      </ol>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Build it</h2>
+
+      <div class="callout">
+        <span class="callout-title">Where you already are</span>
+        <p>
+          If you followed the first pass of this lesson, your tree
+          already has steps 2, 4, 5 and 6 and <code>typecheck</code> is
+          green. <strong>Step 3 is the new work</strong> — the mint
+          re-check and its runnable proof. Do that, run the Verify block
+          at the end, commit.
+        </p>
+      </div>
+
+      <ol class="steps">
+        <li>
+          <h3>Capture the red baseline (Verify, before)</h3>
+          <p>
+            Run the two commands that will judge this lesson's work.
+            Both should fail today — that failure <em>is</em> the
+            evidence the lesson is needed.
+          </p>
+
+          <pre><code>npm run typecheck
+npm ls react-router-dom</code></pre>
+
+          <p>Expected output at the start of this lesson:</p>
+          <ul>
+            <li>
+              <code>typecheck</code> exits non-zero with two errors in
+              <code>server/src/controllers/invitation.controller.ts</code>
+              — one because <code>req.params.slug</code> is typed
+              <code>string | string[] | undefined</code>, one because
+              <code>orderBy: { createdAt: "desc" }</code> names a column
+              that does not exist on the <code>Invitation</code> model.
+            </li>
+            <li>
+              <code>npm ls react-router-dom</code> prints
+              <code>(empty)</code> — the package isn't installed, so
+              <code>AcceptPage.tsx</code> cannot resolve.
+            </li>
+          </ul>
+          <p>
+            Don't fix anything yet. Those two red lines are the bug
+            list this lesson closes.
+          </p>
+        </li>
+
+        <li>
+          <h3>Mount the router, split the two endpoints</h3>
+          <p>
+            The two endpoints have different guards, so they live in two
+            different routers on two different paths. Don't merge them:
+            the create route rides on <code>loadFamily</code> (the slug
+            must resolve to a family the caller belongs to); the accept
+            route doesn't (the invitee is not a member yet — by
+            definition).
+          </p>
+
+          <div class="file">
+            <span class="file-path">server/src/routes/invitation.routes.ts (replace)</span>
+            <pre><code>import { Router } from "express";
+import { requireAuth, authContext } from "../middlewares/auth.js";
+import { familyContext } from "../middlewares/family.js";
+import { requireRole } from "../middlewares/role.js";
+import {
+  createInvitation,
+  acceptInvitation,
+} from "../services/invitation.service.js";
+
+// Create rides loadFamily: slug names the family, owner role gates the mint.
+export const invitationRouter = Router({ mergeParams: true });
+
+invitationRouter.post("/", requireRole("owner"), async (req, res, next) =&gt; {
+  try {
+    const { family, membership } = familyContext(req);
+    const { email, role } = (req.body ?? {}) as {
+      email?: unknown;
+      role?: unknown;
+    };
+
+    if (role !== "member" &amp;&amp; role !== "admin") {
+      res.status(400).json({ message: "role must be 'member' or 'admin'" });
+      return;
+    }
+    if (email !== undefined &amp;&amp; email !== null &amp;&amp; typeof email !== "string") {
+      res.status(400).json({ message: "email must be a string" });
+      return;
+    }
+
+    const result = await createInvitation({
+      familyId: family.id,
+      callerMembershipId: membership.id,
+      role,
+      email: typeof email === "string" ? email.trim() || null : null,
+    });
+
+    if (!result.ok) {
+      if (result.reason === "insufficient-role") {
+        res.status(403).json({ message: "Insufficient role" });
+        return;
+      }
+      // already-pending: a live credential for this email already exists.
+      // Minting a second would leave the first unaccountable.
+      res
+        .status(409)
+        .json({ message: "An invitation is already pending for that email" });
+      return;
+    }
+
+    res.status(201).json({ token: result.token });
+  } catch (e) {
+    next(e);
+  }
+});
+
+// Accept stands alone — the invitee is not yet a member of any family here.
+export const acceptInvitationRouter = Router();
+
+acceptInvitationRouter.post(
+  "/:token/accept",
+  requireAuth,
+  async (req, res, next) =&gt; {
+    try {
+      const { userId } = authContext(req);
+      const { token } = req.params;
+      if (typeof token !== "string" || token.length === 0) {
+        res.status(400).json({ message: "Missing token" });
+        return;
+      }
+      const result = await acceptInvitation(token, userId);
+      if (result.ok) {
+        res.status(204).end();
+        return;
+      }
+      // Collapse on wire: not-found / expired / used / already-member all 409.
+      // The same body for every refusal is the right amount of information.
+      res.status(409).json({ message: "This invitation cannot be accepted" });
+    } catch (e) {
+      next(e);
+    }
+  },
+);</code></pre>
+          </div>
+
+          <p>
+            Notice the route no longer trusts <code>membership.role</code>
+            from the request context. It passes
+            <code>callerMembershipId</code> and lets the service decide —
+            step 3 explains why.
+          </p>
+
+          <div class="file">
+            <span class="file-path">server/src/routes/index.ts (edit)</span>
+            <pre><code>import { authRouter } from "./auth.routes.js";
+import { familyRouter } from "./family.routes.js";
+import {
+  acceptInvitationRouter,
+  invitationRouter,
+} from "./invitation.routes.js";
+
+// ... existing public + requireAuth + loadFamily mounts unchanged ...
+
+// Owners create invites scoped to a family they belong to.
+apiRouter.use("/families/:slug/invitations", loadFamily, invitationRouter);
+
+// Accept does not need loadFamily — invitee is not yet a member.
+apiRouter.use("/invitations", acceptInvitationRouter);</code></pre>
+          </div>
+
+          <p>
+            Both <code>use()</code> calls sit on the protected side of
+            the router, after <code>requireAuth</code>. The split is what
+            lesson 10 tried to express with <code>mergeParams</code>:
+            same resource, different authorisation context.
+          </p>
+        </li>
+
+        <li>
+          <h3>Harden the mint: one transaction, one credential</h3>
+          <p>
+            The route guard saw the inviter's role <em>when the request
+            arrived</em>. Two things can go wrong between then and the
+            write:
+          </p>
+          <ol>
+            <li>
+              <strong>The role is stale.</strong> Another owner demotes
+              the caller; the request is already in flight and mints an
+              invite anyway. This is exactly the race
+              <code>transferOwnership</code> closes, and the fix is the
+              same: re-read the membership <em>inside</em> the lock.
+            </li>
+            <li>
+              <strong>The mint runs twice.</strong> A double-clicked
+              button, or a retried request, submits the same email twice.
+              Two <code>findFirst</code>-then-<code>create</code> calls
+              race, both see "no pending invite", both insert — two live
+              credentials for one person. Lesson 10's note called the
+              mint endpoint out for exactly this; here is the fix.
+            </li>
+          </ol>
+
+          <div class="file">
+            <span class="file-path">server/src/services/invitation.service.ts (replace createInvitation)</span>
+            <pre><code>import { createHash, randomBytes } from "node:crypto";
+import type { Db } from "../models/db.js";
+import { transact } from "../models/db.js";
+import * as membershipModel from "../models/membership.model.js";
+import { ROLES, type Role } from "../models/membership.model.js";
+
+export type MintResult =
+  | { ok: true; token: string }
+  | {
+      ok: false;
+      reason: "invalid-role" | "insufficient-role" | "already-pending";
+    };
+
+const INVITE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * Mint an invite, inside one transaction behind the family lock.
+ *
+ * The route guard saw the inviter's role when the request arrived; another
+ * owner may have demoted them since. Re-reading the membership INSIDE the lock
+ * is the fix (the same shape as transferOwnership). The lock also serialises
+ * mints for one family, so two simultaneous submissions -- a double-clicked
+ * button, a retried request -- cannot both pass the pending check below and
+ * mint two live credentials for the same person.
+ */
+export async function createInvitation(input: {
+  familyId: string;
+  callerMembershipId: string;
+  role: Role;
+  email?: string | null;
+}): Promise&lt;MintResult&gt; {
+  if (!ROLES.includes(input.role)) return { ok: false, reason: "invalid-role" };
+
+  return transact(async (tx: Db) =&gt; {
+    await membershipModel.lockFamily(input.familyId, tx);
+
+    const inviter = await membershipModel.findByFamily(
+      input.familyId,
+      input.callerMembershipId,
+      tx,
+    );
+    if (inviter === null || RANK[input.role] &gt; RANK[inviter.role]) {
+      return { ok: false, reason: "insufficient-role" };
+    }
+
+    // Targeted invites are one-per-email while pending. Shareable links
+    // (email: null) are deliberately exempt -- minting several is legitimate.
+    const email = input.email ?? null;
+    if (email !== null) {
+      const pending = await tx.invitation.findFirst({
+        where: {
+          familyId: input.familyId,
+          email,
+          usedAt: null,
+          expiresAt: { gt: new Date() },
+        },
+      });
+      if (pending !== null) return { ok: false, reason: "already-pending" };
+    }
+
+    const token = randomBytes(32).toString("base64url");
+    await tx.invitation.create({
+      data: {
+        familyId: input.familyId,
+        role: input.role,
+        email,
+        tokenHash: hashToken(token),
+        expiresAt: new Date(Date.now() + INVITE_TTL_MS),
+        createdBy: inviter.userId,
+      },
+    });
+    return { ok: true, token };
+  });
+}</code></pre>
+          </div>
+
+          <p>
+            Keep <code>hashToken</code>, <code>RANK</code>,
+            <code>InvitationResult</code> and <code>acceptInvitation</code>
+            from lesson 09 — only the mint changes. Three details carry
+            the fix:
+          </p>
+          <ul>
+            <li>
+              <code>lockFamily</code> is reused, not re-invented. It
+              already exists in <code>membership.model.ts</code>, because
+              "serialise every mutation of one family" is the same need
+              roles had. One lock, one family, every writer.
+            </li>
+            <li>
+              The membership is re-read with the existing
+              <code>findByFamily(familyId, membershipId, tx)</code> —
+              the same model call <code>transferOwnership</code> uses.
+              No new model function is needed.
+            </li>
+            <li>
+              <code>createdBy</code> now comes from
+              <code>inviter.userId</code>, read inside the lock — not
+              from the route's copy. The identity is re-proved, not
+              inherited.
+            </li>
+          </ul>
+
+          <h3 style="margin-top: 2rem">The runnable proof</h3>
+          <p>
+            Concurrency logic needs more than a typecheck. Mirror
+            <code>check:ownership</code>: two <code>Promise.all</code>
+            mints for one email, and a demotion between the guard and the
+            read.
+          </p>
+
+          <div class="file">
+            <span class="file-path">server/src/scripts/checkMint.ts (new)</span>
+            <pre><code>import "dotenv/config";
+import { randomUUID } from "node:crypto";
+import { prisma } from "../config/database.js";
+import { createInvitation } from "../services/invitation.service.js";
+
+// Two submissions, one email, no scheduler involved: Promise.all fires both
+// createInvitation calls into the same family. The lock serialises them, so the
+// second must see the first's row and refuse. Remove lockFamily and this fails.
+async function main(): Promise&lt;void&gt; {
+  const slug = `probe-${randomUUID().slice(0, 8)}`;
+  const family = await prisma.family.create({
+    data: { slug, name: "Mint probe" },
+  });
+  const email = `${slug}@probe.invalid`;
+
+  try {
+    const owner = await prisma.user.create({
+      data: { email: `${slug}-owner@probe.invalid`, passwordHash: "x" },
+    });
+    const ownerMembership = await prisma.familyMember.create({
+      data: { userId: owner.id, familyId: family.id, role: "owner" },
+    });
+
+    const mint = (): Promise&lt;{ ok: boolean; reason?: string }&gt; =&gt;
+      createInvitation({
+        familyId: family.id,
+        callerMembershipId: ownerMembership.id,
+        role: "member",
+        email,
+      });
+
+    const [a, b] = await Promise.all([mint(), mint()]);
+    const succeeded = [a, b].filter((r) =&gt; r.ok).length;
+    const rows = await prisma.invitation.count({
+      where: { familyId: family.id, email },
+    });
+
+    console.log(`concurrent mints succeeded: ${succeeded}`);
+    console.log(`invitation rows written:    ${rows}`);
+
+    if (succeeded !== 1 || rows !== 1) {
+      throw new Error(
+        `DUPLICATE MINT: ${succeeded} succeeded, ${rows} row(s) written, expected 1/1`,
+      );
+    }
+
+    // Demotion race: the guard saw "owner"; by the time the service reads,
+    // the inviter is a member. Re-reading inside the lock is what refuses this.
+    await prisma.familyMember.update({
+      where: { id: ownerMembership.id },
+      data: { role: "member" },
+    });
+    const demoted = await createInvitation({
+      familyId: family.id,
+      callerMembershipId: ownerMembership.id,
+      role: "admin",
+      email: `${slug}-late@probe.invalid`,
+    });
+    console.log(`demoted inviter refused:    ${!demoted.ok}`);
+
+    if (demoted.ok) {
+      throw new Error("STALE ROLE TRUSTED: demoted member minted an admin invite");
+    }
+
+    console.log("\nsingle-credential invariant held under forced concurrency");
+  } finally {
+    await prisma.family.delete({ where: { id: family.id } });
+    await prisma.user.deleteMany({ where: { email: { startsWith: slug } } });
+    await prisma.$disconnect();
+  }
+}
+
+main().catch((error: unknown) =&gt; {
+  console.error(error);
+  process.exitCode = 1;
+});</code></pre>
+          </div>
+
+          <div class="file">
+            <span class="file-path">package.json (scripts, addition)</span>
+            <pre><code>"check:mint": "tsx server/src/scripts/checkMint.ts"</code></pre>
+          </div>
+        </li>
+
+        <li>
+          <h3>Delete the broken <code>listInvitations</code></h3>
+          <p>
+            Lesson 10 added <code>listInvitations</code> with two
+            typecheck errors: <code>req.params.slug</code> has the wrong
+            type, and <code>orderBy: { createdAt }</code> names a column
+            that does not exist. The pending-invites list is its own
+            design conversation (shareable vs targeted: show the email or
+            nothing?) and lands in lesson 12. Delete the controller now,
+            so this lesson's Verify is green.
+          </p>
+          <p>
+            <strong>Confirmed: delete it, don't patch it in place.</strong>
+            The list endpoint belongs under
+            <code>/api/families/:slug/invitations</code> behind
+            <code>loadFamily</code>, which makes <code>slug</code> a
+            known string and <code>req.family</code> available. Lesson 12
+            writes it in that shape.
+          </p>
+
+          <div class="file">
+            <span class="file-path">server/src/controllers/invitation.controller.ts (delete the file)</span>
+            <pre><code>rm server/src/controllers/invitation.controller.ts</code></pre>
+          </div>
+        </li>
+
+        <li>
+          <h3>Install <code>react-router-dom</code> and wire one route</h3>
+          <p>
+            Lesson 10 used <code>useParams</code> without naming the
+            package, registering the route, or showing the install step.
+            Three things were missing; do all three. <code>useParams</code>,
+            <code>Routes</code> and <code>Route</code> all come from
+            <code>react-router-dom</code>.
+          </p>
+
+          <div class="file">
+            <span class="file-path">terminal</span>
+            <pre><code>npm install react-router-dom@^6.28.0</code></pre>
+          </div>
+
+          <p>
+            The <code>^6.28.0</code> pins the 6.x line that has both the
+            hook and the data-router APIs. Bump only with a deliberate
+            plan.
+          </p>
+
+          <div class="file">
+            <span class="file-path">client/src/main.tsx (replace)</span>
+            <pre><code>import { StrictMode } from "react";
+import { createRoot } from "react-dom/client";
+import { BrowserRouter } from "react-router-dom";
+import App from "./App";
+
+const container = document.getElementById("root");
+if (!container) throw new Error("Missing #root element");
+
+createRoot(container).render(
+  &lt;StrictMode&gt;
+    &lt;BrowserRouter&gt;
+      &lt;App /&gt;
+    &lt;/BrowserRouter&gt;
+  &lt;/StrictMode&gt;,
+);</code></pre>
+          </div>
+
+          <p>
+            <code>BrowserRouter</code> wraps the tree once at the entry
+            point, so every descendant can call <code>useParams</code>,
+            <code>useNavigate</code> and friends. Wrap it once, at the
+            root — wrapping lower means nested layouts have to remember
+            to re-wrap.
+          </p>
+
+          <div class="callout warn">
+            <span class="callout-title">One slash is load-bearing</span>
+            <p>
+              An earlier draft of this lesson wrote the closing tag as
+              <code>&lt;BrowserRouter&gt;</code> instead of
+              <code>&lt;/BrowserRouter&gt;</code>. The compiler catches
+              it — this is exactly what the client half of
+              <code>npm run typecheck</code> is for. Measured output from
+              that one missing slash:
+            </p>
+            <pre><code>client/src/main.tsx(10,4): error TS17008: JSX element 'StrictMode' has no corresponding closing tag.
+client/src/main.tsx(11,6): error TS17008: JSX element 'BrowserRouter' has no corresponding closing tag.
+client/src/main.tsx(14,5): error TS17002: Expected corresponding JSX closing tag for 'BrowserRouter'.
+client/src/main.tsx(16,1): error TS1005: '&lt;/' expected.</code></pre>
+            <p>
+              Four errors, one cause. <strong>TS17008 /
+              TS17002</strong> are the pair to recognise: "no
+              corresponding closing tag" plus "expected corresponding
+              closing tag" almost always means a tag was never closed —
+              usually a typo, sometimes a genuinely forgotten
+              <code>&lt;/&gt;</code>. If you only ever ran the server
+              typecheck, you would never see them.
+            </p>
+          </div>
+        </li>
+
+        <li>
+          <h3>Register the route, render the page</h3>
+          <p>
+            <code>AcceptPage</code> already reads the token with
+            <code>useParams</code> and posts to the accept endpoint.
+            What's missing is the route declaration that turns
+            <code>/invite/&lt;token&gt;</code> into a mount of
+            <code>AcceptPage</code>.
+          </p>
+
+          <div class="file">
+            <span class="file-path">client/src/App.tsx (replace)</span>
+            <pre><code>import { useState, useEffect } from "react";
+import { Routes, Route } from "react-router-dom";
+import type { PersonResource } from "./contracts";
+import { getPeople } from "./lib/api";
+import AcceptPage from "./AcceptPage";
+
+function FamilyView() {
+  const [people, setPeople] = useState&lt;PersonResource[] | null&gt;(null);
+  const [error, setError] = useState&lt;string | null&gt;(null);
+
+  useEffect(() =&gt; {
+    getPeople()
+      .then(setPeople)
+      .catch((cause: unknown) =&gt; {
+        setError(cause instanceof Error ? cause.message : "Unknown error");
+      });
+  }, []);
+
+  if (error) return &lt;p role="alert"&gt;Failed to load: {error}&lt;/p&gt;;
+  if (!people) return &lt;p&gt;Loading…&lt;/p&gt;;
+
+  return (
+    &lt;main style={{ fontFamily: "system-ui, sans-serif", padding: "2rem" }}&gt;
+      &lt;h1&gt;KinLink&lt;/h1&gt;
+      &lt;ul&gt;
+        {people.map((person) =&gt; (
+          &lt;li key={person.id}&gt;
+            {person.name} — {person.living ? "living" : "remembered"}
+          &lt;/li&gt;
+        ))}
+      &lt;/ul&gt;
+    &lt;/main&gt;
+  );
+}
+
+export default function App() {
+  return (
+    &lt;Routes&gt;
+      &lt;Route path="/invite/:token" element={&lt;AcceptPage /&gt;} /&gt;
+      &lt;Route path="/" element={&lt;FamilyView /&gt;} /&gt;
+    &lt;/Routes&gt;
+  );
+}</code></pre>
+          </div>
+
+          <p>
+            <code>AcceptPage.tsx</code> must default-export so
+            <code>App.tsx</code> can mount it:
+          </p>
+
+          <div class="file">
+            <span class="file-path">client/src/AcceptPage.tsx (final)</span>
+            <pre><code>import { useParams } from "react-router-dom";
+import { useEffect, useState } from "react";
+
+export default function AcceptPage() {
+  const { token } = useParams&lt;{ token: string }&gt;();
+  const [status, setStatus] = useState&lt;"idle" | "ok" | "err"&gt;("idle");
+
+  useEffect(() =&gt; {
+    if (!token) return;
+    fetch(`/api/invitations/${encodeURIComponent(token)}/accept`, {
+      method: "POST",
+      credentials: "include",
+    }).then((r) =&gt; setStatus(r.status === 204 ? "ok" : "err"));
+  }, [token]);
+
+  if (status === "ok") return &lt;p&gt;You're in — go to the family.&lt;/p&gt;;
+  if (status === "err") return &lt;p&gt;This link doesn't work.&lt;/p&gt;;
+  return &lt;p&gt;Accepting…&lt;/p&gt;;
+}</code></pre>
+          </div>
+        </li>
+      </ol>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Verify (after)</h2>
+
+      <pre><code>npm run typecheck        # exit 0
+npm ls react-router-dom  # react-router-dom@6.x.x
+npm run check:mint       # 1 succeeded, 1 row, demoted refused</code></pre>
+
+      <p>Expected <code>check:mint</code> output:</p>
+
+      <pre><code>concurrent mints succeeded: 1
+invitation rows written:    1
+demoted inviter refused:    true
+
+single-credential invariant held under forced concurrency</code></pre>
+
+      <p>Then start the stack and load the accept page:</p>
+
+      <pre><code>npm run db:up &amp;&amp; npm run db:migrate &amp;&amp; npm run db:seed
+npm run dev
+# Visit http://localhost:5173/invite/anything
+# Expected: "Accepting…" then "This link doesn't work."</code></pre>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Defend it</h2>
+
+      <h3>Why re-read the role inside the transaction?</h3>
+      <p>
+        The middleware is a photograph; the database is the world. Between
+        the photograph and the write, an owner can demote the caller.
+        Trusting the snapshot means a demoted admin mints an invite with
+        authority they no longer have. The lock plus the re-read is the
+        same defense as <code>transferOwnership</code> — and it costs one
+        extra query inside a transaction you were opening anyway.
+      </p>
+
+      <h3>Why does the lock also stop duplicate invitations?</h3>
+      <p>
+        Two <code>findFirst</code>-then-<code>create</code> calls race the
+        same way two owner-counts race. Both read "no pending invite",
+        both insert. The <code>FOR UPDATE</code> lock makes the second
+        wait for the first to commit, then re-read a world where the row
+        exists, and refuse. <strong>Measured:</strong> with the lock,
+        every run holds at one credential; with <code>lockFamily</code>
+        commented out, 5/5 runs fail — each writes two rows. The lock is
+        the whole mechanism.
+      </p>
+
+      <h3>Why exempt shareable links from the duplicate check?</h3>
+      <p>
+        A shareable invite (<code>email: null</code>) is a link you may
+        legitimately hand out more than once — one per group, one
+        replacement for a leaked URL. "One pending invite per email" is
+        only meaningful when there <em>is</em> an email. The targeted case
+        is where a duplicate is an accounting problem: two live
+        credentials for one person, one of which nobody will remember
+        minting.
+      </p>
+
+      <h3>Why 409, not 201-with-the-existing-token?</h3>
+      <p>
+        Because the server cannot re-issue the token — it only ever stored
+        the hash (Reference 09 §1). Re-returning the existing invite is
+        impossible by design, so the honest answer is "one already
+        exists". The client's next move is to list pending invites (lesson
+        12) or revoke and re-mint.
+      </p>
+
+      <h3>Why split the router into two mount points?</h3>
+      <p>
+        <code>loadFamily</code> is a 404-by-design gate: it answers the
+        same body whether the family doesn't exist or the caller isn't a
+        member. That gate requires <em>membership</em>, and an invitee by
+        definition is not yet a member. Mounting accept under
+        <code>loadFamily</code> returns 404 for every invite URL before
+        the token is even checked.
+      </p>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Break it on purpose</h2>
+
+      <ol>
+        <li>
+          <strong>Unbalance one JSX tag.</strong> Change
+          <code>&lt;/BrowserRouter&gt;</code> back to
+          <code>&lt;BrowserRouter&gt;</code> and run
+          <code>npm run typecheck</code>. Predict the error before you
+          run it. You should see TS17008 for <code>BrowserRouter</code>,
+          TS17002, and TS1005 — four errors from one missing slash. This
+          is the client half of typecheck earning its keep.
+        </li>
+        <li>
+          <strong>Drop the lock.</strong> Comment out
+          <code>lockFamily</code> in <code>createInvitation</code> and run
+          <code>npm run check:mint</code> a few times.
+          <code>2 succeeded, 2 row(s) written</code> — the duplicate
+          invariant holds only because of the lock.
+        </li>
+        <li>
+          <strong>Trust the route's role again.</strong> Pass
+          <code>membership.role</code> and remove the re-read. Demote an
+          owner in one tab, mint in another whose request was already in
+          flight. The stale role wins; the demoted caller mints authority
+          they no longer hold.
+        </li>
+        <li>
+          <strong>Mount the accept route under <code>loadFamily</code>.</strong>
+          Every invite URL collapses to 404 — the invitee is not yet a
+          member, so the gate rejects them before the token is checked.
+        </li>
+        <li>
+          <strong>Skip the package install.</strong> Delete
+          <code>react-router-dom</code> from <code>node_modules</code> and
+          re-run <code>npm run dev</code>. Vite prints a module
+          resolution error pointing at <code>useParams</code> — what
+          lesson 10's reader would have seen.
+        </li>
+      </ol>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Retrieval practice</h2>
+
+      <div class="quiz" data-quiz>
+        <script type="application/json">
+          [
+            {
+              "q": "What does the family lock prevent on the mint endpoint?",
+              "options": [
+                "Two concurrent mints both passing the pending check",
+                "The token hash colliding with another token hash",
+                "Prisma opening more connections than the pool allows",
+                "Express routing the request to the wrong family"
+              ],
+              "answer": 0,
+              "why": "findFirst-then-create is a race: both calls read 'no pending invite', both insert. FOR UPDATE makes the second wait for the first to commit, then re-read a world where the row exists, and refuse. Measured 0/5 passes without it."
+            },
+            {
+              "q": "Why is the inviter's role re-read inside the transaction?",
+              "options": [
+                "The guard's role snapshot can be stale by the time it writes",
+                "The role column is encrypted and decrypted on read",
+                "Express 5 clears req.membership before the service runs",
+                "Prisma caches membership rows across requests"
+              ],
+              "answer": 0,
+              "why": "The middleware sees the role when the request arrives; an owner may demote the caller while it is in flight. Re-reading after the lock is the same defense transferOwnership uses."
+            },
+            {
+              "q": "Why does a duplicate targeted invite answer 409 rather than re-issue a token?",
+              "options": [
+                "Only the token hash is stored, so the raw token cannot be re-sent",
+                "The client is expected to cache the first token in localStorage",
+                "409 is required by the Express 5 router for POST conflicts",
+                "Prisma rejects reads immediately after a create in one transaction"
+              ],
+              "answer": 0,
+              "why": "Reference 09 §1: the raw token is sent once and never stored — the server keeps only the hash. Re-returning the existing invite is impossible by design, so 'one already exists' is the honest answer."
+            },
+            {
+              "q": "Which shareable-invite case is exempt from the duplicate check?",
+              "options": [
+                "email null, because minting several links is legitimate",
+                "email set, because targeted invites are always duplicated",
+                "role owner, because owners may hold several invitations",
+                "expiresAt in the past, because stale rows are ignored"
+              ],
+              "answer": 0,
+              "why": "A shareable link has no addressee, and handing out more than one is legitimate — one per group, one replacement for a leaked URL. 'One per email' only means something when an email exists."
+            }
+          ]
+        </script>
+      </div>
+
+      <div class="prompt">
+        <span class="prompt-title">Ask your teacher</span>
+        <p>
+          Ask why the mint is a lock-and-re-read in one place and accept
+          is a compare-and-set in the other — when is each the right
+          tool? Ask whether <code>check:mint</code> belongs in CI next to
+          <code>check:ownership</code>. Ask how lesson 12's pending list
+          should treat <code>email: null</code> — show nothing, or a label
+          like "Anyone with the link"?
+        </p>
+      </div>
+
+      <h2>Primary source</h2>
+
+      <div class="callout win">
+        <span class="callout-title">Read this next</span>
+        <p>
+          <a href="../reference/0009-invitation-protocol.html">Reference 09</a>
+          §3 (compare-and-set) and §5 (collapse on the wire), then
+          <a href="../reference/0008-races-locks-and-refusals.html">Reference 08</a>
+          §2 for the lock-first pattern the mint now shares. The two
+          endpoints use different concurrency tools on purpose — the next
+          reference argues why.
+        </p>
+      </div>
+
+      <footer class="lesson-footer">
+        <p class="next-up">
+          <strong>Next:</strong> Lesson 12 — the pending-invites list.
+          <code>createdAt</code> on the schema, the list endpoint under
+          <code>loadFamily</code>, and the shareable-link display
+          decision.
+        </p>
+        <p>
+          <a href="../MISSION.md">MISSION.md</a> ·
+          <a href="../ROADMAP.md">ROADMAP.md</a> ·
+          <a href="../GLOSSARY.md">GLOSSARY.md</a> ·
+          <a href="../PROGRESS.md">PROGRESS.md</a> ·
+          <a href="0010-render-invitations-client.html">Lesson 10</a> ·
+          <a href="0009-invitations.html">Lesson 09</a> ·
+          <a href="../reference/0009-invitation-protocol.html">Reference 09</a> ·
+          <a href="../learning-records/0010-finishing-the-invitation-client.md">Record 10</a>
+        </p>
+      </footer>
+    </div>
+    <script src="../assets/quiz.js"></script>
+  </body>
+</html>

@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Reference 10 — Identity on the client</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="lesson-header">
+        <p class="eyebrow">Reference 10 · identity on the client</p>
+        <h1>The client learns who it is</h1>
+        <p class="lede">
+          The session lives on the server. The browser holds a cookie that names
+          it and nothing else, so "am I logged in?" is a question the client can
+          only <em>ask</em> — never remember. This reference is the shape of that
+          question, the read that makes "your family" true, and a defect the
+          compiler was structurally unable to see.
+        </p>
+        <div class="meta-row">
+          <span>Used by: <a href="../lessons/0013a-the-whoami-repair.html">Lesson 13a–13e</a></span>
+          <span>Requires: <a href="0005-auth-mechanics.html">Reference 05</a></span>
+          <span>Vocabulary: <a href="../GLOSSARY.md">GLOSSARY.md</a></span>
+        </div>
+      </header>
+
+      <h2>1. The session is server state; the client mirrors nothing</h2>
+
+      <p>
+        The cookie is a <strong>pointer</strong>, not a claim. It says "this
+        browser's session is <code>kinlink.sid=abc…</code>"; the server's store
+        says who that is. So a client that keeps
+        <code>loggedIn: true</code> in a store is holding a second source of
+        truth that goes stale the moment the session expires, the store restarts,
+        or another tab logs out. Fetch the truth; do not copy it.
+      </p>
+
+      <p>
+        <code>GET /api/auth/whoami</code> is the ask. It has exactly three
+        shapes of answer:
+      </p>
+
+      <table>
+        <thead>
+          <tr><th>Answer</th><th>Means</th><th>Client renders</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>200</code> <code>{ data: { userId, email } }</code></td>
+            <td>a session, and it is valid</td>
+            <td>the app</td>
+          </tr>
+          <tr>
+            <td><code>401</code></td>
+            <td>no session — nobody is logged in</td>
+            <td>the login screen</td>
+          </tr>
+          <tr>
+            <td><code>5xx</code></td>
+            <td>the server failed to answer</td>
+            <td>an error</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="callout">
+        <span class="callout-title">401 is a state, not a failure</span>
+        <p>
+          This is the line lesson 05 drew on the server —
+          <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-401-unauthorized">RFC 9110 §15.5.2</a>,
+          "no valid credentials" — finally consumed on the other side of the
+          wire. Code that lumps <code>401</code> in with "the request failed"
+          shows a broken-server message to someone who simply has not logged in.
+          Anonymous is a place the UI has a screen for.
+        </p>
+      </div>
+
+      <h2>2. The state machine</h2>
+
+      <pre><code>loading ──200──▶ authenticated ──(session dies)──▶ anonymous
+   │                                                   │
+   ├──401──▶ anonymous ──(login / register ok)─────────┘
+   │              ▲
+   └──other──▶ error</code></pre>
+
+      <p>
+        Four states, and <code>loading</code> is a real one — it is the state
+        before the server has spoken. Skipping it is how a page flashes a login
+        form at a user who is about to be recognised.
+      </p>
+
+      <pre><code>export type SessionState =
+  | { status: "loading" }
+  | { status: "anonymous" }
+  | { status: "error"; message: string }
+  | { status: "authenticated"; user: AuthResponse };
+
+export function useSession(): { state: SessionState; refresh: () =&gt; void } {
+  const [state, setState] = useState&lt;SessionState&gt;({ status: "loading" });
+  const [nonce, setNonce] = useState(0);
+
+  useEffect(() =&gt; {
+    let live = true;
+
+    getSession()
+      .then((user) =&gt; {
+        if (live) setState({ status: "authenticated", user });
+      })
+      .catch((cause: unknown) =&gt; {
+        if (!live) return;
+        if (cause instanceof ApiError &amp;&amp; cause.status === 401) {
+          setState({ status: "anonymous" });
+          return;
+        }
+        setState({
+          status: "error",
+          message: cause instanceof Error ? cause.message : "Unknown error",
+        });
+      });
+
+    return () =&gt; {
+      live = false;
+    };
+  }, [nonce]);
+
+  const refresh = useCallback(() =&gt; setNonce((n) =&gt; n + 1), []);
+
+  return { state, refresh };
+}</code></pre>
+
+      <p>
+        Two details earn their keep. The <code>live</code> flag prevents a
+        resolved request from writing state after unmount — the same
+        "cancel the flight you launched" idea as the <code>alive</code> guard in
+        a data-fetching effect. And <code>refresh</code> is how a successful
+        login turns <code>anonymous</code> into <code>authenticated</code>: the
+        form does not fake a user, it asks the server again.
+      </p>
+
+      <h2>3. The read that makes "your" true: <code>GET /api/families</code></h2>
+
+      <p>
+        <code>register</code> returns <code>{ userId, email }</code> and,
+        deliberately, no family slug. Before this route existed there were
+        exactly two ways to learn a slug: query the database, or read it as a
+        registration side effect. A browser can do neither — so the client could
+        not name the family it was looking at.
+      </p>
+
+      <pre><code>GET /api/families
+→ 200 { "data": [ { "slug": "nguyen-a1b2c3", "name": "Minh's family", "role": "owner" } ] }</code></pre>
+
+      <p>
+        It rides <code>requireAuth</code> <strong>alone</strong> — not
+        <code>loadFamily</code>. That is not an oversight: there is no
+        <code>:slug</code> to resolve, because answering "which families are
+        mine?" <em>is the whole route</em>. The caller is named by the session
+        and by nothing else, and the query carries
+        <code>where: { userId }</code>, so it inherits the property every
+        family-scoped read has: no version of it returns a family the caller has
+        no membership in.
+      </p>
+
+      <p>
+        The view drops the family <code>id</code> and ships the
+        <code>slug</code>. An id the client never sees is an id it cannot hand
+        back to a route that might trust it.
+      </p>
+
+      <h2>4. A defect the compiler could not see</h2>
+
+      <p>
+        <code>GET /api/auth/whoami</code> answered <code>500</code> while
+        <code>npm run typecheck</code> exited <code>0</code>. The controller
+        hand-wrote a <code>select</code> naming <code>familyId</code> — a column
+        <code>User</code> has not had since the <code>family_members</code>
+        change. Prisma's excess-property check catches that error
+        <strong>only when <code>select</code> is alone</strong>; add a
+        <code>where</code> beside it and the check is silently dropped. At
+        runtime: <code>Unknown field 'familyId' for select statement on model
+        'User'</code>.
+      </p>
+
+      <table>
+        <thead>
+          <tr><th>Shape</th><th><code>typecheck</code></th><th>Runtime</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>findUnique({ select: { id, familyId } })</code></td>
+            <td><code>TS2353</code></td>
+            <td>throws</td>
+          </tr>
+          <tr>
+            <td><code>findUnique({ select: { id, familyId }, where })</code></td>
+            <td><strong>silent</strong></td>
+            <td>throws</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="callout win">
+        <span class="callout-title">The fix is not "delete the key"</span>
+        <p>
+          <code>user.model.ts</code> already exported
+          <code>findById(id)</code> — selecting exactly
+          <code>{ id, email }</code>. It was written for <code>whoami</code>, and
+          the controller bypassed it to write its own query. Replacing three
+          lines with <code>userModel.findById(userId)</code> fixes the 500
+          <em>and</em> removes the class of bug: there is now one definition of
+          "a user's public fields", and no hand-written <code>select</code> left
+          to drift out of date.
+        </p>
+      </div>
+
+      <p>
+        <strong>Where it belongs in history: its own commit, before the
+        feature.</strong> It repairs shipped code, so it should be reviewable on
+        its own and greppable by <code>git log</code>/<code>bisect</code>. Its
+        message should name the mechanism typecheck missed, so the history
+        carries the lesson rather than just the diff. And it must land
+        <em>first</em>, by lesson 05's rule — fix the contract before the
+        consumer: a client identity flow built on a 500 teaches the client that
+        "anonymous" means "broken".
+      </p>
+
+      <div class="callout win">
+        <span class="callout-title">Primary sources</span>
+        <p>
+          <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-401-unauthorized"
+            >RFC 9110 §15.5.2 — 401 Unauthorized</a
+          >
+          (the distinction the state machine rests on) ·
+          <a href="https://react.dev/learn/you-might-not-need-an-effect"
+            >react.dev — You Might Not Need an Effect</a
+          >
+          (when fetching in an effect is the right shape, and how to ignore a
+          stale response) ·
+          <a href="https://tanstack.com/query/latest/docs/framework/react/overview"
+            >TanStack Query</a
+          >
+          (what this hand-rolled hook is buying by hand today).
+        </p>
+      </div>
+
+      <footer class="lesson-footer">
+        <p>Reference docs are meant to be argued with. If a rule here is wrong, say so.</p>
+      </footer>
+    </div>
+  </body>
+</html>

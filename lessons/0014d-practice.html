@@ -1,0 +1,349 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lesson 14d — Practice: the dead session</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="lesson-header">
+        <p class="eyebrow">Lesson 14d · a later day · about 45 minutes · drills only</p>
+        <h1>Practice: the dead session</h1>
+        <p class="lede">
+          The drills for the whole 14 series — <a href="0014a-the-seam-that-notices.html">14a</a>,
+          <a href="0014b-off-the-wire.html">14b</a>,
+          <a href="0014c-the-proof.html">14c</a>. Run this on a <em>different
+          day</em> from the builds, from memory where you can.
+        </p>
+        <div class="meta-row">
+          <span>Mission: ship KinLink</span>
+          <span>Covers: <a href="0014a-the-seam-that-notices.html">14a</a> · <a href="0014b-off-the-wire.html">14b</a> · <a href="0014c-the-proof.html">14c</a></span>
+          <span>Prior practice: <a href="0013e-practice.html">Lesson 13e</a></span>
+        </div>
+      </header>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Defend it</h2>
+
+      <h3>Why not just handle the <code>401</code> in each screen?</h3>
+      <p>
+        Because that is what the baseline was, and it fails the same way twice.
+        <code>InvitesPage</code> turned a <code>401</code> into
+        "Failed to load", which is a lie about what happened — the load did not
+        fail, the session ended. And <code>FamilyList</code> had no branch at all,
+        so the app stayed "logged in". A per-screen fix means every future screen
+        must remember, and the failure mode of forgetting is invisible: a page
+        that renders an error instead of a login form. Move it into the transport
+        and the next screen is correct before it is written.
+      </p>
+
+      <h3>Why a module-level listener and not a React context?</h3>
+      <p>
+        Because the thing that <em>notices</em> — <code>request()</code> — is not a
+        component. A context would force the transport to import React and to be
+        constructed inside the tree, which inverts the dependency: the library
+        would need to know about the UI. A module with a
+        <code>Set</code> of callbacks is the smallest seam that lets a non-React
+        layer publish and a React layer subscribe. The name for this is a
+        notifier (or an event bus), and its cost is honest: it is global state, so
+        it must stay tiny and there must be exactly one of it.
+      </p>
+
+      <h3>Why must a <code>401</code> from login <em>not</em> end the session?</h3>
+      <p>
+        Because it is not about the session. <code>POST /api/auth/login</code>
+        answers <code>401</code> for "wrong email or password" — a verdict on what
+        the user typed, which the form renders as "Wrong email or password." If the
+        transport announced on every <code>401</code>, that verdict would also be
+        broadcast as "your session is gone", which is both false and confusing:
+        the app would flip states in response to a typo. The fix is not a smarter
+        <code>401</code> inspector — the status code genuinely does not carry the
+        difference — it is letting the <em>caller</em>, who asked the question,
+        say which question it asked. Hence <code>expectsSession</code>.
+      </p>
+
+      <h3>The seam only covers what goes through it — what about <code>AcceptPage</code>?</h3>
+      <p>
+        Good catch, and it is in the map:
+        <code>client/src/AcceptPage.tsx</code> is the one component that calls
+        <code>fetch</code> directly instead of going through
+        <code>lib/api.ts</code>. So it is <em>not</em> covered by the announce: an
+        expired session on the accept page still renders "This link doesn't
+        work." That is arguably acceptable — the link really does not work for
+        that visitor right now — but it is the same class of bug, and the cure is
+        the same: route it through a named function in
+        <code>lib/api.ts</code>. A seam protects the traffic that uses it; that is
+        a property to state out loud, not a flaw to hide.
+      </p>
+
+      <h3>Should <code>useSession</code> be replaced by TanStack Query now?</h3>
+      <p>
+        <strong>No — and the trigger is worth naming rather than deferring again.</strong>
+        Look at what the client fetches: <code>whoami</code>,
+        <code>families</code>, <code>invitations</code>. All three are read-once
+        per screen, and <strong>nothing in the client mutates them</strong>. A
+        query cache earns its keep by knowing what to invalidate after a write;
+        with no writes, it is a store whose most valuable feature has nothing to
+        do. Here is the honest comparison:
+      </p>
+
+      <table>
+        <thead><tr><th>Concern</th><th><code>useSession</code> + <code>useEffect</code> today</th><th>TanStack Query</th></tr></thead>
+        <tbody>
+          <tr><td>fetch once per mount</td><td>yes</td><td>yes</td></tr>
+          <tr><td>loading / error flags</td><td>by hand, per screen</td><td><code>isPending</code>, <code>isError</code></td></tr>
+          <tr><td>two components asking the same thing → one request</td><td>no — two requests</td><td>yes, deduplicated</td></tr>
+          <tr><td>shared cache across routes</td><td>no — refetch on every mount</td><td>yes, keyed</td></tr>
+          <tr><td>refetch on focus / staleness</td><td>no</td><td><code>staleTime</code>, <code>refetchOnWindowFocus</code></td></tr>
+          <tr><td>retry a failed read</td><td>no</td><td>yes, with backoff</td></tr>
+          <tr><td><strong>invalidate a read after a write</strong></td><td><strong>no</strong></td><td><strong>yes — the reason it exists</strong></td></tr>
+        </tbody>
+      </table>
+
+      <p>
+        <strong>The trigger: the first screen where a mutation must invalidate a
+        read.</strong> That is the next lesson's people screen — add a person, and
+        the list must show them; add a relationship, and the tree must redraw.
+        Adopt it there, and the comparison above stops being a table and becomes
+        a measurement. Two things to say in an interview about why: a cache without
+        invalidation is a place for stale data to hide, and the migration is cheap
+        <em>because</em> of today's work — the transport already owns the envelope
+        and the 401 rule, so swapping the data layer touches neither.
+      </p>
+
+      <h3>How can "resend this invite" work if the raw token was never stored?</h3>
+      <p>
+        It cannot mean "show me the link again" — that door is closed on purpose.
+        The raw token existed for one HTTP response and was never written down;
+        storing it would mean a plaintext credential at rest, which is exactly
+        what hashing it avoided. So <strong>resend means: mint a new credential
+        and kill the old one, in one transaction.</strong> The protocol:
+      </p>
+      <ol>
+        <li>
+          <strong>New token, new hash, new expiry.</strong> Same shape as the
+          original mint, and the raw value leaves in the response body exactly
+          once — the only place that credential will ever exist.
+        </li>
+        <li>
+          <strong>The old invite must die.</strong> Otherwise one person
+          accumulates live credentials and every revoked email still works.
+          Expressing "died" is a real schema decision: reusing
+          <code>usedAt</code> hides it from the pending filter, but it conflates
+          <em>claimed</em> with <em>revoked</em>, and the difference is exactly
+          what you want in six months when you ask how many invites were actually
+          accepted. Add <code>revokedAt</code> (its own migration, one thing), and
+          "pending" becomes <code>usedAt: null AND revokedAt: null AND expiresAt
+          &gt; now</code> — three distinct end-states, one definition, still in
+          <code>findPendingByFamily</code>.
+        </li>
+        <li>
+          <strong>One transaction behind <code>lockFamily</code>, with the
+          inviter's role re-read inside the lock.</strong> Two concurrent resends
+          would otherwise each mint and each revoke, leaving two live tokens and
+          an emailed link that is already dead — the same race shape as the
+          duplicate-mint in lesson 11, which is why the same lock is the answer.
+          And the role must be re-read because resend is a mint: an owner demoted
+          since the request arrived must not get another credential out.
+        </li>
+        <li>
+          <strong>The granted role is carried over, and re-checked against the
+          inviter's rank.</strong> Otherwise resend is an escalation path: mint a
+          <code>member</code> invite, then resend it as <code>owner</code>.
+        </li>
+        <li>
+          <strong>Accept that a retry is not safe.</strong> A retried resend mints
+          a second credential and revokes the first, so the link the user was
+          emailed is dead. This is the same non-idempotence lesson 08 recorded for
+          transfers: either the UI never auto-retries, or it needs an idempotency
+          key (week 8's asynchrony thread). Do not quietly retry it.
+        </li>
+      </ol>
+      <p>
+        Worth noticing what that decision does to the other open question: an
+        owner who wants to <em>see</em> revoked invites is asking for "show used
+        invites too" — the exact filter Reference 11 §2 named as the thing that
+        converts a bounded read into an unbounded one, and therefore the change
+        that will one day force pagination. Three lessons, one thread.
+      </p>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Break it on purpose</h2>
+
+      <ol>
+        <li>
+          <strong>Remove the sign-in exception.</strong> Delete
+          <code>expectsSession: false</code> from <code>login</code> and run
+          <code>npm run check:session</code>. Predicted: two announcements.
+          Measured:
+          <code>Error: EXPECTED exactly 1 announcement, got 2</code>, exit
+          <strong>1</strong>. Now a mistyped password would be broadcast as "your
+          session died" — to a user who is <em>on the login screen</em>.
+        </li>
+        <li>
+          <strong>Put <code>familyId</code> back in the view.</strong> Add
+          <code>familyId: person.familyId</code> to
+          <code>toPersonResource</code> and run <code>npm run typecheck</code>.
+          Measured:
+          <code>error TS2353: Object literal may only specify known properties,
+          and 'familyId' does not exist in type 'PersonResource'</code>, exit
+          <strong>1</strong>. Notice this is the <em>opposite</em> of the Prisma
+          blind spot: an annotated return type is checked, a
+          <code>select</code> with a sibling key is not.
+        </li>
+        <li>
+          <strong>Announce on every failure.</strong> Change the condition to
+          <code>if (!response.ok) announceSessionEnded();</code> and run
+          <code>check:session</code>. Predict before measuring: the 500 case
+          starts announcing, so the count is 2 rather than 1 — a server fault now
+          reads as a logout, and the user retypes a correct password into a broken
+          system. This is the most confusing bug in this series' family.
+        </li>
+        <li>
+          <strong>Never unsubscribe.</strong> Drop the cleanup from the
+          <code>useEffect</code> in <code>useSession</code> (<code>useEffect(() =&gt;
+          { onSessionEnded(...); }, [])</code>). Every remount adds a listener to
+          the same <code>Set</code>, so one <code>401</code> ends the session
+          N times. Harmless here — <code>setState</code> is idempotent — and a leak
+          everywhere else. Say why it is harmless <em>this</em> time, because
+          "it works" is not the reason.
+        </li>
+        <li>
+          <strong>Move the check outside <code>include</code>.</strong> Move
+          <code>checkSessionEnd.ts</code> to <code>client/scripts/</code> (beside
+          <code>src</code>, not inside it) and run <code>npm run typecheck</code>.
+          It stays green, and the file is no longer compiled at all — so it can
+          drift from the transport it claims to test, silently. Lesson 05's trap,
+          exactly.
+        </li>
+      </ol>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Retrieval practice</h2>
+
+      <div class="quiz" data-quiz>
+        <script type="application/json">
+          [
+            {
+              "q": "Why does the transport need the caller to say a 401 is about sign-in?",
+              "options": [
+                "The status code alone cannot tell eviction from wrong input",
+                "Sign-in requests are sent without any cookies at all",
+                "The login route answers 403 and not 401 when wrong",
+                "React batches the two announcements into a single one"
+              ],
+              "answer": 0,
+              "why": "POST /api/auth/login answers 401 for a wrong password -- a verdict on the input -- and GET /api/families answers 401 for a dead session. The status code is identical, so only the caller knows which question it asked."
+            },
+            {
+              "q": "Why can't the client check script use process.exitCode?",
+              "options": [
+                "The client program is typed for the browser, not for Node",
+                "tsx strips process from client files before running them",
+                "Vite replaces process with undefined during the build",
+                "The DOM library declares process as a read-only property"
+              ],
+              "answer": 0,
+              "why": "client/tsconfig.json sets types to [\"vite/client\"] plus the DOM lib and deliberately no Node types, so a component can never reach process. The check throws instead, and an unhandled rejection exits non-zero."
+            },
+            {
+              "q": "What must resend do, given the raw token was never stored?",
+              "options": [
+                "Mint a new credential and revoke the old one",
+                "Hash the original token again and return that value",
+                "Email the same link again and extend its expiry time",
+                "Recreate the invitation row with an identical token"
+              ],
+              "answer": 0,
+              "why": "The raw token existed for one response and was never written down; storing it would be a plaintext credential at rest. So resend is a fresh mint plus a revocation of the old invite, in one transaction behind the family lock."
+            },
+            {
+              "q": "When does the client adopt a server-state library?",
+              "options": [
+                "When a write must invalidate a read on screen",
+                "When the app grows past roughly twenty components",
+                "When the first request starts taking over a second",
+                "When three screens fetch the very same endpoint"
+              ],
+              "answer": 0,
+              "why": "A cache's value is knowing what to invalidate after a mutation. Nothing in this client mutates yet, so the library would be a store whose most valuable feature has nothing to do -- the people screen is where that changes."
+            }
+          ]
+        </script>
+      </div>
+
+      <div class="prompt">
+        <span class="prompt-title">Ask your teacher</span>
+        <p>
+          Ask whether <code>AcceptPage</code> should be moved onto
+          <code>lib/api.ts</code> now, and what else is still bypassing the
+          transport. Ask whether the <code>revokedAt</code> column should be added
+          before or inside the resend build. Ask how to tell a
+          <code>401</code> from a <code>403</code> on the client when both mean
+          "no", and whether the client should ever render them differently. And
+          ask why the notes claimed a <code>check:mint</code> exists when it does
+          not — because that is a real debt, not a typo.
+        </p>
+      </div>
+
+      <h2>Primary source</h2>
+
+      <div class="callout win">
+        <span class="callout-title">Read this next</span>
+        <p>
+          <a href="https://react.dev/learn/you-might-not-need-an-effect">react.dev — You Might Not Need an Effect</a>
+          §"Fetching data": the cleanup flag you are already using, and the
+          sentence that predicts this lesson — that as soon as data must be shared
+          or invalidated, a hand-rolled effect stops being the right tool. Then
+          <a href="../reference/0010-client-identity.html">Reference 10</a> §1–2
+          for the state machine this series wires into, and
+          <a href="../reference/0012-map-of-kinlink.html">Reference 12</a> §5,
+          where the missing mint proof is recorded.
+        </p>
+      </div>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Log it</h2>
+      <p>
+        Two minutes, then close the tab. This is the step that makes the plan
+        real, and the one every lesson before this forgot to ask for.
+      </p>
+      <ul>
+        <li>Minutes: _</li>
+        <li>One line — what fought back, or what you could not recall: _</li>
+        <li>Committed: <code>&lt;hash&gt;</code> (builds only)</li>
+      </ul>
+      <p>
+        Add it to this week's block in
+        <a href="../PROGRESS.md">PROGRESS.md</a>. At the week's end, fill the
+        three signals — can explain / can extend / can break.
+      </p>
+
+      <footer class="lesson-footer">
+        <p class="next-up">
+          <strong>Next:</strong> Lesson 15 — the invitation lifecycle, finished.
+          The mint UI (replacing the dead <code>InviteDialog</code>), revoke,
+          resend with a <code>revokedAt</code> column, and the
+          <code>check:mint</code> proof the notes claim exists and the tree does
+          not have.
+        </p>
+        <p>
+          <a href="../MISSION.md">MISSION.md</a> ·
+          <a href="../ROADMAP.md">ROADMAP.md</a> ·
+          <a href="../GLOSSARY.md">GLOSSARY.md</a> ·
+          <a href="../PROGRESS.md">PROGRESS.md</a> ·
+          <a href="0014a-the-seam-that-notices.html">Lesson 14a</a> ·
+          <a href="0013e-practice.html">Lesson 13e</a> ·
+          <a href="../reference/0012-map-of-kinlink.html">Reference 12</a>
+        </p>
+      </footer>
+    </div>
+    <script src="../assets/quiz.js"></script>
+  </body>
+</html>

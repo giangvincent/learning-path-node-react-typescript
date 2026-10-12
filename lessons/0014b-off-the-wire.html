@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lesson 14b — Off the wire</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="lesson-header">
+        <p class="eyebrow">Lesson 14b · Week 4–5 · about 20 minutes · one new thing, short</p>
+        <h1>Off the wire</h1>
+        <p class="lede">
+          A short sitting with one decision: delete <code>familyId</code> from
+          <code>PersonResource</code>. It is a field the client has never read,
+          that cannot be used, and whose only future is to tempt a route that
+          should not exist. The deletion is compiler-enforced, which is the whole
+          point.
+        </p>
+        <div class="meta-row">
+          <span>Mission: ship KinLink</span>
+          <span>Requires: <a href="0014a-the-seam-that-notices.html">Lesson 14a</a></span>
+          <span>Reference: <a href="../reference/0004-ids-and-tenancy.html">04</a></span>
+          <span>Practice: <a href="0014d-practice.html">Lesson 14d</a></span>
+        </div>
+      </header>
+
+      <div class="callout win">
+        <span class="callout-title">The win</span>
+        <p>
+          <code>PersonResource</code> and <code>FamilyResource</code> agree: a
+          client never holds a family id it cannot safely hand back.
+          <code>npm run typecheck</code> exits 0 — and would have failed if the
+          field were not truly gone from both sides.
+        </p>
+      </div>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Build it</h2>
+
+      <ol class="steps">
+        <li>
+          <h3>Take the family id off the wire</h3>
+          <p>
+            <code>PersonResource</code> has shipped
+            <code>familyId</code> since lesson 02, and
+            <code>grep -rn familyId client/src</code> finds
+            <strong>nothing</strong>: the client has never read it. It is a field
+            that cannot be used (the routes take a slug), and its only future is
+            to tempt an endpoint that accepts a family id — the thing Reference 04
+            forbids. Lesson 13b's <code>FamilyResource</code> drops the family id
+            on exactly this argument, so the two views disagree with each other.
+          </p>
+
+          <div class="file">
+            <span class="file-path">shared/contracts/person.ts</span>
+            <pre><code>export interface PersonResource {
+  id: string;
+  name: string;
+  living: boolean;
+}</code></pre>
+          </div>
+
+          <div class="file">
+            <span class="file-path">server/src/views/person.view.ts</span>
+            <pre><code>export function toPersonResource(person: Person): PersonResource {
+  return {
+    id: person.id,
+    name: person.displayName,
+    living: person.deathDate === null,
+  };
+}</code></pre>
+          </div>
+
+          <div class="callout win">
+            <span class="callout-title">Why this deletion is compiler-enforced</span>
+            <p>
+              <code>toPersonResource</code> has an <strong>annotated return
+              type</strong>, so the object literal is checked against
+              <code>PersonResource</code>. Put <code>familyId</code> back and
+              <code>npm run typecheck</code> fails. Contrast the session-11 blind
+              spot: a Prisma <code>select</code> with a <code>where</code> beside
+              it hid a dead column from the compiler for a month. The view is
+              checked; the query was not. Measured, in
+              <a href="0014d-practice.html">Lesson 14d</a>.
+            </p>
+          </div>
+
+          <p>
+            <strong>One caveat for the interview.</strong> Removing a field from a
+            response is a breaking change for a consumer you do not control. Here
+            the only consumer is this repository, and it never read the field — so
+            this is safe. In a public API you would version it, or keep it and
+            stop promising it. Say the caveat out loud rather than skipping to
+            "the compiler was fine".
+          </p>
+        </li>
+      </ol>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Verify (after)</h2>
+
+      <pre><code>npm run typecheck        # exit 0
+grep -rn familyId client/src   # no matches — nothing read it</code></pre>
+
+      <p>
+        <a href="0014d-practice.html">Lesson 14d</a>'s break-it puts
+        <code>familyId</code> back and shows the <code>TS2353</code> that proves
+        the deletion is real.
+      </p>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Log it</h2>
+      <p>
+        Two minutes, then close the tab. This is the step that makes the plan
+        real, and the one every lesson before this forgot to ask for.
+      </p>
+      <ul>
+        <li>Minutes: _</li>
+        <li>One line — what fought back, or what you could not recall: _</li>
+        <li>Committed: <code>&lt;hash&gt;</code> (builds only)</li>
+      </ul>
+      <p>
+        Add it to this week's block in
+        <a href="../PROGRESS.md">PROGRESS.md</a>. At the week's end, fill the
+        three signals — can explain / can extend / can break.
+      </p>
+
+      <footer class="lesson-footer">
+        <p class="next-up">
+          <strong>Next:</strong> Lesson 14c — the proof. Turn "a 401 that is about
+          the session ends it" into a runnable check with no test framework.
+        </p>
+        <p>
+          <a href="../MISSION.md">MISSION.md</a> ·
+          <a href="../ROADMAP.md">ROADMAP.md</a> ·
+          <a href="../GLOSSARY.md">GLOSSARY.md</a> ·
+          <a href="../PROGRESS.md">PROGRESS.md</a> ·
+          <a href="0014a-the-seam-that-notices.html">Lesson 14a</a> ·
+          <a href="0014c-the-proof.html">Lesson 14c</a> ·
+          <a href="../reference/0004-ids-and-tenancy.html">Reference 04</a>
+        </p>
+      </footer>
+    </div>
+    <script src="../assets/quiz.js"></script>
+  </body>
+</html>

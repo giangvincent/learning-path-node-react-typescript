@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lesson 13e — Practice: the client's identity</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="lesson-header">
+        <p class="eyebrow">Lesson 13e · a later day · about 45 minutes · drills only</p>
+        <h1>Practice: the client's identity</h1>
+        <p class="lede">
+          The drills for the whole series — <a href="0013a-the-whoami-repair.html">13a</a>
+          through <a href="0013d-the-invites-list-renders.html">13d</a>. Run this on a
+          <em>different day</em> from the builds, from memory where you can:
+          retrieval is what builds storage strength, and re-reading the builds
+          feels productive while doing almost nothing.
+        </p>
+        <div class="meta-row">
+          <span>Mission: ship KinLink</span>
+          <span>Covers: <a href="0013a-the-whoami-repair.html">13a</a> · <a href="0013b-the-read-that-makes-your-true.html">13b</a> · <a href="0013c-the-client-can-sign-in.html">13c</a> · <a href="0013d-the-invites-list-renders.html">13d</a></span>
+          <span>Next practice: <a href="0014d-practice.html">Lesson 14d</a></span>
+        </div>
+      </header>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Defend it</h2>
+
+      <h3>What does the client do when it has no session at all?</h3>
+      <p>
+        It shows the login form — <strong>not</strong> an error, and not an empty
+        page. That is the whole content of the
+        <code>anonymous</code> state, and it is why
+        <code>401</code> must not be treated as a failure. The distinction is
+        <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-401-unauthorized">RFC 9110</a>'s:
+        <code>401</code> means "no valid credentials", which is a perfectly
+        ordinary thing to be. A client that routes <code>401</code> into
+        "something went wrong" shows a broken-server message to a new visitor,
+        and the visitor has no way to recover.
+      </p>
+
+      <h3>Where does the <code>whoami</code> fix belong in the commit history?</h3>
+      <p>
+        <strong>Its own commit, first.</strong> Three reasons, in order of
+        importance: it repairs code that is already shipped, so it should be
+        reviewable alone; the message must record <em>why typecheck missed
+        it</em>, because that is the durable lesson and a diff cannot hold it;
+        and <code>git log</code>/<code>bisect</code> should land on it directly
+        rather than inside four hundred lines of new client code. The sequencing
+        is lesson 05's rule — fix the contract before the consumer — and it is
+        not bookkeeping here: the client calls <code>whoami</code> on every
+        load.
+      </p>
+
+      <h3>How do you backfill <code>created_at</code> for real production rows?</h3>
+      <p>
+        You do not stamp them with the migration time. You split it into three
+        steps — <strong>expand, backfill, contract</strong> — and the order is
+        enforced by the engine rather than chosen for style: MySQL makes adding a
+        nullable column an <code>INSTANT</code>, metadata-only operation, but
+        making a column <code>NOT NULL</code> "rebuilds the table in place" and
+        "fails if the column contains <code>NULL</code> values". So: add it
+        nullable, write the <em>true</em> value in bounded batches, then tighten.
+        Prisma cannot express the middle state, so you write the migration with
+        <code>--create-only</code> and edit the SQL by hand — exactly the
+        technique lesson 06 used for the backfill that had to run before
+        <code>DROP COLUMN</code>. And when there is no source for the true value,
+        <code>expires_at - INTERVAL 7 DAY</code> is an <em>estimate</em> to be
+        labelled as one; <code>NULL</code> and an "unknown" label is braver than
+        a fabricated timestamp, because a fabricated one survives review.
+        Full detail, with the engine's own rules: <a href="../reference/0011-live-schema-and-growing-lists.html">Reference 11</a> §1.
+      </p>
+
+      <h3>Should the pending list paginate before it can ever be long?</h3>
+      <p>
+        No. The test is not "could this get long?" but "is the size bounded by
+        construction?" Three real mechanisms bound this list: invites expire
+        after seven days, the mint refuses a second pending invite for the same
+        email, and one owner is looking at one family. So today the project has
+        no cursor, no page envelope and no cap — and that is a decision, not an
+        oversight. When it does earn one, it earns a <em>keyset</em> and not an
+        <code>OFFSET</code>: the standard defines <code>offset</code> as sorting
+        everything and dropping the first N rows, which is both slow and
+        <em>wrong</em>, because a row inserted between two page fetches shifts
+        the page and the reader sees a duplicate. The change that will force the
+        issue is a filter the user drives — "show used invites too" — because
+        that is what turns a bounded read into an unbounded one.
+        <a href="../reference/0011-live-schema-and-growing-lists.html">Reference 11</a> §2–3.
+      </p>
+
+      <h3>Why does the client fetch the session instead of storing it?</h3>
+      <p>
+        The cookie is a pointer, not a claim; the server's store says who the
+        session is. A client store holding <code>loggedIn: true</code> is a
+        second source of truth that goes stale the moment the session expires or
+        the store restarts — and <code>MemoryStore</code> restarts on every file
+        save, which you have now felt. Fetch it, and let one write path
+        (<code>refresh</code>) update it.
+      </p>
+
+      <h3>Why does <code>GET /api/families</code> skip <code>loadFamily</code>?</h3>
+      <p>
+        Because there is no <code>:slug</code> to resolve — answering "which
+        families are mine?" <em>is</em> the route. <code>loadFamily</code> exists
+        to turn a named family into a proven one; naming nothing, there is
+        nothing to prove. The security property is unchanged and lives one layer
+        down, in <code>where: { userId }</code>: no version of the query returns
+        a family the caller has no membership in.
+      </p>
+
+      <h3>Why does an unmounted route answer in HTML, not JSON?</h3>
+      <p>
+        Because nothing in the API answered it at all. <code>Cannot GET
+        /api/families</code> came from Express's built-in fall-through handler,
+        which predates this API and speaks HTML. That is why the baseline in
+        lesson 13a could not tell a client "this route does not exist yet" in the
+        language every other endpoint uses — and why the same request answers
+        <code>401</code> <em>JSON</em> once the route exists and the guard runs.
+      </p>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Break it on purpose</h2>
+
+      <ol>
+        <li>
+          <strong>Drop the <code>where</code> clause.</strong> Delete
+          <code>where: { userId }</code> from <code>findAllForUser</code> and run
+          both halves of Verify. Predicted: <code>typecheck</code> stays green —
+          the <code>userId</code> parameter is merely unused, and no
+          <code>noUnusedParameters</code> rule exists to notice. Measured:
+          <code>npm run typecheck</code> → exit <strong>0</strong>, and
+          <code>check:families</code> →
+          <code>families returned: 7</code>,
+          <code>roles: ["owner","member","owner","owner","owner","member","owner"]</code>,
+          then <code>Error: EXPECTED 2 families, got 7</code>. Seven, because the
+          dev database held four other memberships. That is a cross-tenant leak
+          that the compiler was never able to see — the whole argument for the
+          runtime half of every Verify block.
+        </li>
+        <li>
+          <strong>Skip the view.</strong> Return
+          <code>res.json({ data: memberships })</code> from the controller. The
+          response now carries each family's <code>id</code> — an internal
+          identifier the client was never meant to hold. The
+          <code>"id" in row</code> assertion in <code>check:families</code> is
+          what would have caught it, and it is why the view is a whitelist rather
+          than a filter.
+        </li>
+        <li>
+          <strong>Mount the route above the guard.</strong> Move
+          <code>apiRouter.get("/families", getMyFamilies)</code> to sit with
+          <code>/health</code>, above <code>apiRouter.use(requireAuth)</code>.
+          Predict first: <code>requireAuth</code> never runs, so
+          <code>req.authenticatedUserId</code> is undefined,
+          <code>authContext</code> throws
+          <code>Route is missing requireAuth</code>, and the error handler turns
+          it into a <code>500</code>. Loud, and loud is the point — the tripwire
+          makes a misplaced route fail immediately instead of quietly serving
+          another family's data.
+        </li>
+        <li>
+          <strong>Let the slug be invented.</strong> In
+          <code>App.tsx</code>, replace the family list with a hardcoded
+          <code>&lt;Link to="/family/probe-1234/invites"&gt;</code>. It renders
+          perfectly for you and <code>404 Family not found</code> for everyone
+          else, because <code>loadFamily</code> collapses "no such family" and
+          "not your family" into the same body. Guessing an identifier is the
+          mistake; asking <code>GET /api/families</code> is the fix.
+        </li>
+        <li>
+          <strong>Collapse <code>401</code> into <code>anonymous</code>.</strong>
+          In <code>useSession</code>, replace the whole <code>catch</code> body
+          with <code>setState({ status: "anonymous" })</code>. Now revert the
+          <code>whoami</code> fix so it <code>500</code>s again, and reload. The
+          app shows a login form, the user types a correct password, and it does
+          nothing — forever. A broken server now presents as a login loop, which
+          is the single most confusing bug in this series' family.
+        </li>
+      </ol>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Retrieval practice</h2>
+
+      <div class="quiz" data-quiz>
+        <script type="application/json">
+          [
+            {
+              "q": "What does a 401 from /api/auth/whoami mean to the client?",
+              "options": [
+                "There is no session, so show the login form",
+                "The server has failed, so show an error message",
+                "The cookie has expired, so delete it and retry",
+                "The route is missing, so fall back to home"
+              ],
+              "answer": 0,
+              "why": "401 means 'no valid credentials', which is an ordinary state rather than a failure. The client has a screen for exactly this, and it is the login form -- which is why 401 must never be routed into the error branch."
+            },
+            {
+              "q": "Why does GET /api/families ride requireAuth alone?",
+              "options": [
+                "It names no slug, so there is nothing to prove",
+                "It lists families, so loadFamily has nothing to load here",
+                "It is public, so no session is needed for it",
+                "It runs first, so the guard has not run yet"
+              ],
+              "answer": 0,
+              "why": "loadFamily exists to turn a named family into a proven one. This route names nothing -- answering 'which families are mine?' is the point -- so the caller is named by the session and the scoping is the where clause."
+            },
+            {
+              "q": "When does a list earn pagination?",
+              "options": [
+                "When its size is unbounded by construction itself",
+                "When it might conceivably grow large in future",
+                "When the query becomes slower than one second",
+                "When the table holds over one hundred rows"
+              ],
+              "answer": 0,
+              "why": "The pending-invites list is bounded by the 7-day expiry and by the mint's one-per-email rule, so it gets no cursor and no cap. A plausible future is not a bound; a structural one is."
+            },
+            {
+              "q": "How do you backfill a column you just added?",
+              "options": [
+                "Make it nullable, backfill, then make it required",
+                "Add it required, stamped with the migration time",
+                "Drop the table, then recreate it with the column",
+                "Add it required, leaving the existing rows blank"
+              ],
+              "answer": 0,
+              "why": "MySQL makes adding a nullable column INSTANT, while making a column NOT NULL rebuilds the table and fails if any NULL remains -- so the order is forced by the engine: expand, backfill in batches, then contract."
+            }
+          ]
+        </script>
+      </div>
+
+      <div class="prompt">
+        <span class="prompt-title">Ask your teacher</span>
+        <p>
+          Ask whether <code>useSession</code> should be replaced by TanStack
+          Query now, and what exactly it buys beyond this hook. Ask what should
+          happen when a session dies mid-use — the tab is open, the cookie
+          expires, and some unrelated request answers <code>401</code>. Ask why
+          <code>PersonResource</code> still ships <code>familyId</code> when
+          today's view drops the family id on the argument that a client should
+          never hold an id it cannot safely hand back. And ask how "resend this
+          invite" can work at all when the raw token was never stored.
+        </p>
+      </div>
+
+      <h2>Primary source</h2>
+
+      <div class="callout win">
+        <span class="callout-title">Read this next</span>
+        <p>
+          <a href="https://react.dev/learn/you-might-not-need-an-effect">react.dev — You Might Not Need an Effect</a>:
+          the section on fetching data in an effect, why the cleanup flag
+          exists, and what a library would give you instead. Then
+          <a href="../reference/0010-client-identity.html">Reference 10</a> for
+          the state machine and the whoami defect, and
+          <a href="../reference/0011-live-schema-and-growing-lists.html">Reference 11</a>
+          for the two questions this series answers in prose.
+        </p>
+      </div>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Log it</h2>
+      <p>
+        Two minutes, then close the tab. This is the step that makes the plan
+        real, and the one every lesson before this forgot to ask for.
+      </p>
+      <ul>
+        <li>Minutes: _</li>
+        <li>One line — what fought back, or what you could not recall: _</li>
+        <li>Committed: <code>&lt;hash&gt;</code> (builds only)</li>
+      </ul>
+      <p>
+        Add it to this week's block in
+        <a href="../PROGRESS.md">PROGRESS.md</a>. At the week's end, fill the
+        three signals — can explain / can extend / can break.
+      </p>
+
+      <footer class="lesson-footer">
+        <p class="next-up">
+          <strong>Next:</strong> <a href="0014a-the-seam-that-notices.html">Lesson 14a</a>
+          — one place to notice a dead session.
+        </p>
+        <p>
+          <a href="../MISSION.md">MISSION.md</a> ·
+          <a href="../ROADMAP.md">ROADMAP.md</a> ·
+          <a href="../GLOSSARY.md">GLOSSARY.md</a> ·
+          <a href="../PROGRESS.md">PROGRESS.md</a> ·
+          <a href="0013a-the-whoami-repair.html">Lesson 13a</a> ·
+          <a href="0013d-the-invites-list-renders.html">Lesson 13d</a> ·
+          <a href="../reference/0010-client-identity.html">Reference 10</a> ·
+          <a href="../reference/0011-live-schema-and-growing-lists.html">Reference 11</a>
+        </p>
+      </footer>
+    </div>
+    <script src="../assets/quiz.js"></script>
+  </body>
+</html>

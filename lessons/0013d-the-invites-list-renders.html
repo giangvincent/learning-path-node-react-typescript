@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lesson 13d — The invites list renders</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="lesson-header">
+        <p class="eyebrow">Lesson 13d · Week 4–5 · about 45 minutes · one new thing</p>
+        <h1>The invites list renders</h1>
+        <p class="lede">
+          The payoff of the whole series: the pending-invites list renders at
+          <code>/family/:slug/invites</code>, for a slug the client was given
+          rather than one it guessed. One new screen, one link, one route — and
+          the browser walkthrough that proves the whole client is honest.
+        </p>
+        <div class="meta-row">
+          <span>Mission: ship KinLink</span>
+          <span>Requires: <a href="0013c-the-client-can-sign-in.html">Lesson 13c</a></span>
+          <span>Reference: <a href="../reference/0011-live-schema-and-growing-lists.html">11</a></span>
+          <span>Practice: <a href="0013e-practice.html">Lesson 13e</a></span>
+        </div>
+      </header>
+
+      <div class="callout win">
+        <span class="callout-title">The win</span>
+        <p>
+          Click a family and its pending invitations render — the address
+          resolved by lesson 12's label rule, a shareable invite labelled "Anyone
+          with the link". The client is now honest end to end: no dead
+          <code>/api/people</code> fetch, no invented slug, no second copy of "am
+          I logged in".
+        </p>
+      </div>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Build it</h2>
+
+      <ol class="steps">
+        <li>
+          <h3>The list screen</h3>
+          <p>
+            The page that renders invites needs a slug. It gets one from the URL,
+            and the URL is only reachable through a link the family list built
+            from <code>GET /api/families</code> — so the slug is always one the
+            server handed out.
+          </p>
+
+          <div class="file">
+            <span class="file-path">client/src/InvitesPage.tsx (new)</span>
+            <pre><code>import { useEffect, useState } from "react";
+import { useParams } from "react-router-dom";
+import type { InvitationResource } from "./contracts";
+import { getInvitations } from "./lib/api";
+
+/**
+ * The label rule from lesson 12, in one place: a null email is a shareable link,
+ * not a person whose identity is being withheld.
+ */
+function addressee(invitation: InvitationResource): string {
+  return invitation.email ?? "Anyone with the link";
+}
+
+export default function InvitesPage() {
+  const { slug } = useParams&lt;{ slug: string }&gt;();
+  const [invitations, setInvitations] = useState&lt;InvitationResource[] | null&gt;(
+    null,
+  );
+  const [error, setError] = useState&lt;string | null&gt;(null);
+
+  useEffect(() =&gt; {
+    if (!slug) return;
+    getInvitations(slug)
+      .then(setInvitations)
+      .catch((cause: unknown) =&gt;
+        setError(cause instanceof Error ? cause.message : "Unknown error"),
+      );
+  }, [slug]);
+
+  if (error) return &lt;p role="alert"&gt;Failed to load: {error}&lt;/p&gt;;
+  if (!invitations) return &lt;p&gt;Loading…&lt;/p&gt;;
+  if (invitations.length === 0) return &lt;p&gt;No pending invitations.&lt;/p&gt;;
+
+  return (
+    &lt;main style={{ fontFamily: "system-ui, sans-serif", padding: "2rem" }}&gt;
+      &lt;h1&gt;Pending invitations&lt;/h1&gt;
+      &lt;ul&gt;
+        {invitations.map((invitation) =&gt; (
+          &lt;li key={invitation.id}&gt;
+            {addressee(invitation)} — {invitation.role} — sent{" "}
+            {new Date(invitation.createdAt).toLocaleDateString()}
+          &lt;/li&gt;
+        ))}
+      &lt;/ul&gt;
+    &lt;/main&gt;
+  );
+}</code></pre>
+          </div>
+        </li>
+
+        <li>
+          <h3>Link to it, and add the route</h3>
+          <p>
+            Three small edits to <code>App.tsx</code>: import
+            <code>Link</code> and <code>InvitesPage</code>, wrap the family name
+            in a <code>&lt;Link&gt;</code>, and register the route. Here is the
+            finished file — the only lines that differ from lesson 13c are
+            marked:
+          </p>
+
+          <div class="file">
+            <span class="file-path">client/src/App.tsx (final)</span>
+            <pre><code>import { useEffect, useState } from "react";
+import { Link, Route, Routes } from "react-router-dom";      // + Link
+import AcceptPage from "./AcceptPage";
+import InvitesPage from "./InvitesPage";                      // + new import
+import LoginScreen from "./LoginScreen";
+import type { FamilyResource } from "./contracts";
+import { getFamilies } from "./lib/api";
+import { useSession } from "./lib/useSession";
+
+function FamilyList() {
+  const [families, setFamilies] = useState&lt;FamilyResource[] | null&gt;(null);
+  const [error, setError] = useState&lt;string | null&gt;(null);
+
+  useEffect(() =&gt; {
+    getFamilies()
+      .then(setFamilies)
+      .catch((cause: unknown) =&gt;
+        setError(cause instanceof Error ? cause.message : "Unknown error"),
+      );
+  }, []);
+
+  if (error) return &lt;p role="alert"&gt;Failed to load: {error}&lt;/p&gt;;
+  if (!families) return &lt;p&gt;Loading…&lt;/p&gt;;
+
+  return (
+    &lt;main style={{ fontFamily: "system-ui, sans-serif", padding: "2rem" }}&gt;
+      &lt;h1&gt;KinLink&lt;/h1&gt;
+      &lt;ul&gt;
+        {families.map((family) =&gt; (
+          &lt;li key={family.slug}&gt;
+            &lt;Link to={`/family/${family.slug}/invites`}&gt;{family.name}&lt;/Link&gt; —
+            you are {family.role}
+          &lt;/li&gt;
+        ))}
+      &lt;/ul&gt;
+    &lt;/main&gt;
+  );
+}
+
+function Home() {
+  const { state, refresh } = useSession();
+
+  if (state.status === "loading") return &lt;p&gt;Checking your session…&lt;/p&gt;;
+  if (state.status === "error") return &lt;p role="alert"&gt;{state.message}&lt;/p&gt;;
+  if (state.status === "anonymous") return &lt;LoginScreen onSignedIn={refresh} /&gt;;
+  return &lt;FamilyList /&gt;;
+}
+
+export default function App() {
+  return (
+    &lt;Routes&gt;
+      &lt;Route path="/invite/:token" element={&lt;AcceptPage /&gt;} /&gt;
+      &lt;Route path="/family/:slug/invites" element={&lt;InvitesPage /&gt;} /&gt;  // + route
+      &lt;Route path="/" element={&lt;Home /&gt;} /&gt;
+    &lt;/Routes&gt;
+  );
+}</code></pre>
+          </div>
+        </li>
+      </ol>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Verify (after)</h2>
+
+      <pre><code>npm run typecheck        # exit 0
+npm run dev              # then open http://localhost:5173</code></pre>
+
+      <ol>
+        <li>Sign up with a new email: the list of one family, "you are owner".</li>
+        <li>
+          Click it: <code>/family/&lt;slug&gt;/invites</code> renders "No pending
+          invitations."
+        </li>
+        <li>
+          Mint two invites by curl — one with an <code>email</code>, one with
+          <code>email: null</code> for a shareable link — then reload: two rows,
+          and the shareable one is labelled "Anyone with the link".
+        </li>
+      </ol>
+
+      <p>Mint the two rows from another terminal:</p>
+
+      <pre><code>SLUG=owner-…   # from the browser URL, or GET /api/families
+
+curl -sS -b /tmp/kinlink.jar -X POST \
+  http://localhost:4000/api/families/$SLUG/invitations \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"relative@probe.invalid","role":"member"}'
+
+curl -sS -b /tmp/kinlink.jar -X POST \
+  http://localhost:4000/api/families/$SLUG/invitations \
+  -H 'Content-Type: application/json' \
+  -d '{"email":null,"role":"member"}'</code></pre>
+
+      <p>
+        You have finished the series when the pending-invites list renders for a
+        family the client found by asking. Then run
+        <a href="0013e-practice.html">Lesson 13e</a> — the drills — on a later
+        day, from memory.
+      </p>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Log it</h2>
+      <p>
+        Two minutes, then close the tab. This is the step that makes the plan
+        real, and the one every lesson before this forgot to ask for.
+      </p>
+      <ul>
+        <li>Minutes: _</li>
+        <li>One line — what fought back, or what you could not recall: _</li>
+        <li>Committed: <code>&lt;hash&gt;</code> (builds only)</li>
+      </ul>
+      <p>
+        Add it to this week's block in
+        <a href="../PROGRESS.md">PROGRESS.md</a>. At the week's end, fill the
+        three signals — can explain / can extend / can break.
+      </p>
+
+      <footer class="lesson-footer">
+        <p class="next-up">
+          <strong>Next:</strong> <a href="0013e-practice.html">Lesson 13e</a> —
+          the practice for the whole series (defend it, break it, retrieval).
+          Then <a href="0014a-the-seam-that-notices.html">Lesson 14a</a> — one
+          place to notice a dead session.
+        </p>
+        <p>
+          <a href="../MISSION.md">MISSION.md</a> ·
+          <a href="../ROADMAP.md">ROADMAP.md</a> ·
+          <a href="../GLOSSARY.md">GLOSSARY.md</a> ·
+          <a href="../PROGRESS.md">PROGRESS.md</a> ·
+          <a href="0013c-the-client-can-sign-in.html">Lesson 13c</a> ·
+          <a href="0012-the-pending-invites-list.html">Lesson 12</a> ·
+          <a href="../reference/0011-live-schema-and-growing-lists.html">Reference 11</a>
+        </p>
+      </footer>
+    </div>
+    <script src="../assets/quiz.js"></script>
+  </body>
+</html>

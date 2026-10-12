@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lesson 14c — The proof</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="lesson-header">
+        <p class="eyebrow">Lesson 14c · Week 4–5 · about 45 minutes · one new thing</p>
+        <h1>The proof</h1>
+        <p class="lede">
+          Lesson 14a established a rule with a sharp edge — a <code>401</code>
+          ends the session when it is about the session, and never when it is
+          about the input. A sharp edge deserves a proof. This sitting adds the
+          project's first client-side check: it stubs <code>fetch</code>, needs
+          no test framework, and pins the rule.
+        </p>
+        <div class="meta-row">
+          <span>Mission: ship KinLink</span>
+          <span>Requires: <a href="0014a-the-seam-that-notices.html">Lesson 14a</a></span>
+          <span>Reference: <a href="../reference/0010-client-identity.html">10</a></span>
+          <span>Practice: <a href="0014d-practice.html">Lesson 14d</a></span>
+        </div>
+      </header>
+
+      <div class="callout win">
+        <span class="callout-title">The win</span>
+        <p>
+          <code>npm run check:session</code> — a client-side check that stubs
+          <code>fetch</code>, needs no server and no database, and prints
+          <code>1 / 0 / 0</code>: a session-carrying <code>401</code> announces,
+          a sign-in <code>401</code> does not, a <code>500</code> does not.
+        </p>
+      </div>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Build it</h2>
+
+      <ol class="steps">
+        <li>
+          <h3>The check, with no test framework</h3>
+          <p>
+            The rule you implemented in 14a has a sharp edge — the sign-in
+            exception — and a sharp edge deserves a proof. The server's
+            <code>check:*</code> scripts need no framework, and neither does this
+            one: <code>request()</code> talks to global <code>fetch</code>, so the
+            check <em>replaces</em> fetch and inspects what the transport
+            announced. No DOM, no React, no port, no database.
+          </p>
+
+          <div class="file">
+            <span class="file-path">client/src/scripts/checkSessionEnd.ts (new)</span>
+            <pre><code>import { onSessionEnded } from "../lib/session.js";
+import { ApiError, getFamilies, login } from "../lib/api.js";
+
+// The first runnable check that lives on the client, and it needs no test
+// framework: `request` talks to global fetch, so this replaces fetch and then
+// inspects what the transport announced. No DOM, no React, no port, no database.
+//
+// The claim under test is narrow and worth being precise about: a 401 must end
+// the session when it is ABOUT the session, and must never end it when it is
+// about the input. Same status code, opposite consequences.
+async function main(): Promise&lt;void&gt; {
+  let announcements = 0;
+  const unsubscribe = onSessionEnded(() =&gt; {
+    announcements += 1;
+  });
+
+  const respondWith = (status: number): void =&gt; {
+    globalThis.fetch = (async () =&gt;
+      new Response("{}", { status })) as unknown as typeof fetch;
+  };
+
+  const swallowApiError = (work: Promise&lt;unknown&gt;): Promise&lt;void&gt; =&gt;
+    work.then(
+      () =&gt; undefined,
+      (cause: unknown) =&gt; {
+        if (!(cause instanceof ApiError)) throw cause;
+      },
+    );
+
+  respondWith(401);
+  await swallowApiError(getFamilies());
+  console.log(`401 on a session-carrying read -&gt; announced: ${announcements}`);
+
+  const beforeSignIn = announcements;
+  await swallowApiError(login({ email: "nobody@probe.invalid", password: "no" }));
+  console.log(
+    `401 on a sign-in attempt        -&gt; announced: ${announcements - beforeSignIn}`,
+  );
+
+  const beforeFault = announcements;
+  respondWith(500);
+  await swallowApiError(getFamilies());
+  console.log(
+    `500 on a session-carrying read  -&gt; announced: ${announcements - beforeFault}`,
+  );
+
+  unsubscribe();
+
+  if (announcements !== 1) {
+    throw new Error(
+      `EXPECTED exactly 1 announcement, got ${announcements}: a 401 must end the ` +
+        `session when it is about the session, and never when it is about input`,
+    );
+  }
+
+  console.log(
+    "\nsession-end announcement is scoped to the session, not to 401",
+  );
+}
+
+await main();</code></pre>
+          </div>
+
+          <div class="file">
+            <span class="file-path">package.json (scripts, addition)</span>
+            <pre><code>"check:session": "tsx client/src/scripts/checkSessionEnd.ts"</code></pre>
+          </div>
+
+          <div class="callout warn">
+            <span class="callout-title">The first version of this file did not compile (measured)</span>
+            <p>
+              It ended with the familiar
+              <code>main().catch((error) =&gt; { console.error(error);
+              process.exitCode = 1; })</code>. <code>npm run typecheck</code>
+              answered:
+              <code>client/src/scripts/checkSessionEnd.ts(63,3): error TS2591:
+              Cannot find name 'process'</code>. This file lives in the
+              <strong>client's</strong> program, whose types are the browser's —
+              <code>types: ["vite/client"]</code> plus the DOM lib, and no Node
+              types on purpose, so a component can never reach
+              <code>process</code> or <code>fs</code>. Do not "fix" it by adding
+              <code>"node"</code> to that list; that would hand every component
+              Node APIs to make one script compile. The check fails the honest
+              way instead: it throws, and Node's default unhandled-rejection
+              behaviour makes that a non-zero exit.
+            </p>
+            <p>
+              This is also why the file lives at
+              <code>client/src/scripts/</code> and not
+              <code>client/scripts/</code>: the client tsconfig includes
+              <code>["src"]</code>, so anything outside it is not compiled at all
+              — silently. Lesson 05's trap, one folder over.
+            </p>
+          </div>
+        </li>
+      </ol>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Verify (after)</h2>
+
+      <pre><code>npm run typecheck       # exit 0
+npm run check:session   # 1 / 0 / 0, then the summary line</code></pre>
+
+      <p>Expected <code>check:session</code> output:</p>
+
+      <pre><code>401 on a session-carrying read -&gt; announced: 1
+401 on a sign-in attempt        -&gt; announced: 0
+500 on a session-carrying read  -&gt; announced: 0
+
+session-end announcement is scoped to the session, not to 401</code></pre>
+
+      <div class="callout">
+        <span class="callout-title">`check:session` needs no MySQL — so run it constantly</span>
+        <p>
+          It stubs <code>fetch</code> and touches no server. Together with
+          <code>check:guards</code>, that is the cheap half of the testing
+          pyramid: <code>npm run typecheck &amp;&amp; npm run check:guards &amp;&amp;
+          npm run check:session</code> finishes in about a second and catches the
+          whole class of "the wiring is wrong" bugs — including the one lesson
+          14a fixes.
+        </p>
+      </div>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Log it</h2>
+      <p>
+        Two minutes, then close the tab. This is the step that makes the plan
+        real, and the one every lesson before this forgot to ask for.
+      </p>
+      <ul>
+        <li>Minutes: _</li>
+        <li>One line — what fought back, or what you could not recall: _</li>
+        <li>Committed: <code>&lt;hash&gt;</code> (builds only)</li>
+      </ul>
+      <p>
+        Add it to this week's block in
+        <a href="../PROGRESS.md">PROGRESS.md</a>. At the week's end, fill the
+        three signals — can explain / can extend / can break.
+      </p>
+
+      <footer class="lesson-footer">
+        <p class="next-up">
+          <strong>Next:</strong> <a href="0014d-practice.html">Lesson 14d</a> —
+          the practice for the whole 14 series, on a later day.
+        </p>
+        <p>
+          <a href="../MISSION.md">MISSION.md</a> ·
+          <a href="../ROADMAP.md">ROADMAP.md</a> ·
+          <a href="../GLOSSARY.md">GLOSSARY.md</a> ·
+          <a href="../PROGRESS.md">PROGRESS.md</a> ·
+          <a href="0014b-off-the-wire.html">Lesson 14b</a> ·
+          <a href="0014d-practice.html">Lesson 14d</a> ·
+          <a href="../reference/0010-client-identity.html">Reference 10</a> ·
+          <a href="../reference/0012-map-of-kinlink.html">Reference 12</a>
+        </p>
+      </footer>
+    </div>
+    <script src="../assets/quiz.js"></script>
+  </body>
+</html>

@@ -1,0 +1,391 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lesson 13b — The read that makes "your" true</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="lesson-header">
+        <p class="eyebrow">Lesson 13b · Week 4–5 · about 60 minutes · one new thing</p>
+        <h1>The read that makes "your" true</h1>
+        <p class="lede">
+          Every list so far was reached through a slug the client had to already
+          know. Nothing has ever told a caller which families are theirs. This
+          sitting adds one route — <code>GET /api/families</code> — end to end
+          through every layer, and one runnable check that proves the scoping.
+          Server only; the browser comes next.
+        </p>
+        <div class="meta-row">
+          <span>Mission: ship KinLink</span>
+          <span>Requires: <a href="0013a-the-whoami-repair.html">Lesson 13a</a></span>
+          <span>Reference: <a href="../reference/0004-ids-and-tenancy.html">04</a> · <a href="../reference/0010-client-identity.html">10</a></span>
+          <span>Practice: <a href="0013e-practice.html">Lesson 13e</a></span>
+        </div>
+      </header>
+
+      <div class="callout win">
+        <span class="callout-title">The win</span>
+        <p>
+          <code>GET /api/families</code> returns the caller's families as
+          <code>{ slug, name, role }</code> and nothing else, proven by
+          <code>npm run check:families</code> — two users, three families, and a
+          stranger whose family must never appear.
+        </p>
+      </div>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Build it</h2>
+
+      <ol class="steps">
+        <li>
+          <h3>The read that makes "your" true</h3>
+          <p>
+            Every list so far was reached through a slug the client had to
+            already know. Nothing has ever told a caller which families are
+            theirs: <code>register</code> returns <code>{ userId, email }</code>
+            and deliberately not the slug. Contract first.
+          </p>
+
+          <div class="file">
+            <span class="file-path">shared/contracts/family.ts (new)</span>
+            <pre><code>/** What the client is allowed to see about one family the caller belongs to. */
+export interface FamilyResource {
+  /** The stable handle the client puts in URLs. Not the family id. */
+  slug: string;
+  name: string;
+  /** The caller's role here -- what the client may offer them to do. */
+  role: "owner" | "admin" | "member";
+}</code></pre>
+          </div>
+
+          <div class="file">
+            <span class="file-path">server/src/contracts.ts (addition)</span>
+            <pre><code>export type { FamilyResource } from "../../shared/contracts/family.js";</code></pre>
+          </div>
+
+          <div class="file">
+            <span class="file-path">client/src/contracts.ts (addition)</span>
+            <pre><code>export type { AuthResponse } from "../../shared/contracts/auth";
+export type { FamilyResource } from "../../shared/contracts/family";
+export type { InvitationResource } from "../../shared/contracts/invitation";</code></pre>
+          </div>
+        </li>
+
+        <li>
+          <h3>Model, service, view — one WHERE clause, one definition</h3>
+          <p>
+            The query belongs beside <code>findMembershipWithFamily</code>: same
+            table, same "membership joined to family" shape, one row versus many.
+          </p>
+
+          <div class="file">
+            <span class="file-path">server/src/models/membership.model.ts (addition)</span>
+            <pre><code>/**
+ * Every family this user belongs to, oldest first.
+ *
+ * Same property as findMembershipWithFamily, over many rows instead of one: the
+ * userId is in the WHERE clause, so there is no version of this query that
+ * returns a family the caller has no membership in. The oldest first is what
+ * makes "your family" a stable answer instead of whatever the database returns.
+ */
+export async function findAllForUser(
+  userId: string,
+  database: Db = prisma,
+): Promise&lt;(FamilyMember &amp; { family: Family })[]&gt; {
+  return database.familyMember.findMany({
+    where: { userId },
+    include: { family: true },
+    orderBy: { createdAt: "asc" },
+  });
+}</code></pre>
+          </div>
+
+          <div class="file">
+            <span class="file-path">server/src/services/membership.service.ts (addition)</span>
+            <pre><code>/**
+ * The families this caller belongs to.
+ *
+ * A pass-through today -- the query is already scoped to the caller -- so the
+ * value is in the naming, not the logic: the controller never touches a model,
+ * and "which families are mine" has exactly one definition.
+ */
+export async function listMyFamilies(
+  userId: string,
+): Promise&lt;(FamilyMember &amp; { family: Family })[]&gt; {
+  return membershipModel.findAllForUser(userId);
+}</code></pre>
+          </div>
+
+          <div class="file">
+            <span class="file-path">server/src/views/family.view.ts (new)</span>
+            <pre><code>import type { FamilyResource } from "../contracts.js";
+import type { Family, FamilyMember } from "../models/membership.model.js";
+
+/**
+ * The membership as the client may see it: which family, what it is called, and
+ * what this caller may do there.
+ *
+ * The family id never crosses this line. The slug is the handle the client puts
+ * in a URL, and an id it never sees is an id it cannot pass back to a route that
+ * might trust it.
+ */
+export function toFamilyResource(
+  row: FamilyMember &amp; { family: Family },
+): FamilyResource {
+  return { slug: row.family.slug, name: row.family.name, role: row.role };
+}</code></pre>
+          </div>
+        </li>
+
+        <li>
+          <h3>The controller, and the route that resolves nothing</h3>
+          <div class="file">
+            <span class="file-path">server/src/controllers/family.controller.ts (addition)</span>
+            <pre><code>import { authContext } from "../middlewares/auth.js";
+import { toFamilyResource } from "../views/family.view.js";
+import { listMyFamilies } from "../services/membership.service.js";
+import type { ApiResponse, FamilyResource } from "../contracts.js";
+
+/**
+ * Every family the caller belongs to.
+ *
+ * This is the one family-shaped route that runs with requireAuth alone. There is
+ * no :slug to resolve, because answering "which families are mine?" is the whole
+ * point -- and the caller is named by the session, never by the request.
+ */
+export async function getMyFamilies(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise&lt;void&gt; {
+  try {
+    const { userId } = authContext(req);
+    const memberships = await listMyFamilies(userId);
+
+    const body: ApiResponse&lt;FamilyResource[]&gt; = {
+      data: memberships.map(toFamilyResource),
+    };
+
+    res.status(200).json(body);
+  } catch (error) {
+    next(error);
+  }
+}</code></pre>
+          </div>
+
+          <div class="file">
+            <span class="file-path">server/src/routes/index.ts (addition, under the guard)</span>
+            <pre><code>// The list of families the caller belongs to. It resolves no :slug -- answering
+// "which families are mine?" is the point -- so it rides requireAuth alone.
+apiRouter.get("/families", getMyFamilies);
+
+// :slug NAMES a family. Naming is not authorising: loadFamily proves the caller
+// belongs to it, or answers 404 as if it did not exist.
+apiRouter.use("/families/:slug", loadFamily, familyRouter);</code></pre>
+          </div>
+
+          <p>
+            Note what is <em>not</em> here: no <code>loadFamily</code>. Every other
+            <code>/families/…</code> route carries it, because every other one
+            names a family and has to prove access to it. This route names
+            nothing, so there is nothing to prove — the caller is the
+            <code>userId</code> from the session, and the scoping is the
+            <code>where</code> clause. It is also the first protected route in
+            KinLink to use <code>authContext(req)</code> without
+            <code>familyContext</code>.
+          </p>
+        </li>
+
+        <li>
+          <h3>The runnable check</h3>
+          <p>
+            Two users, three families, and one question: does the caller see
+            their two and <em>not</em> the stranger's?
+          </p>
+
+          <div class="file">
+            <span class="file-path">server/src/scripts/checkFamilies.ts (new)</span>
+            <pre><code>import "dotenv/config";
+import { randomUUID } from "node:crypto";
+import { prisma } from "../config/database.js";
+import { listMyFamilies } from "../services/membership.service.js";
+import { toFamilyResource } from "../views/family.view.js";
+
+// Two users, three families. The caller must see their own two and neither of
+// the stranger's: the userId is in the WHERE clause, the same property the
+// family-scoped routes have, over many rows instead of one.
+async function main(): Promise&lt;void&gt; {
+  const suffix = randomUUID().slice(0, 8);
+  const shared = await prisma.family.create({
+    data: { slug: `probe-shared-${suffix}`, name: "Shared probe" },
+  });
+  const other = await prisma.family.create({
+    data: { slug: `probe-other-${suffix}`, name: "Other probe" },
+  });
+  const strangerFamily = await prisma.family.create({
+    data: { slug: `probe-stranger-${suffix}`, name: "Stranger probe" },
+  });
+
+  try {
+    const me = await prisma.user.create({
+      data: { email: `me-${suffix}@probe.invalid`, passwordHash: "probe" },
+    });
+    const stranger = await prisma.user.create({
+      data: { email: `stranger-${suffix}@probe.invalid`, passwordHash: "probe" },
+    });
+
+    const t = Date.now();
+    await prisma.familyMember.create({
+      data: {
+        userId: me.id,
+        familyId: shared.id,
+        role: "owner",
+        createdAt: new Date(t - 2000),
+      },
+    });
+    await prisma.familyMember.create({
+      data: {
+        userId: me.id,
+        familyId: other.id,
+        role: "member",
+        createdAt: new Date(t - 1000),
+      },
+    });
+    await prisma.familyMember.create({
+      data: { userId: stranger.id, familyId: strangerFamily.id, role: "owner" },
+    });
+
+    const rows = await listMyFamilies(me.id);
+    const resources = rows.map(toFamilyResource);
+    const slugs = resources.map((r) =&gt; r.slug);
+    const roles = resources.map((r) =&gt; r.role);
+
+    console.log(`families returned: ${resources.length}`);
+    console.log(`roles:             ${JSON.stringify(roles)}`);
+
+    if (resources.length !== 2) {
+      throw new Error(`EXPECTED 2 families, got ${resources.length}`);
+    }
+    if (slugs.includes(strangerFamily.slug)) {
+      throw new Error("LEAK: another user's family was returned");
+    }
+    if (!slugs.includes(shared.slug) || !slugs.includes(other.slug)) {
+      throw new Error("MISSING: one of the caller's families was not returned");
+    }
+    if (roles[0] !== "owner" || roles[1] !== "member") {
+      throw new Error(
+        `ORDER/ROLE WRONG: expected [owner, member], got ${JSON.stringify(roles)}`,
+      );
+    }
+    if (resources.some((row) =&gt; "id" in row)) {
+      throw new Error("LEAK: the family id crossed the view");
+    }
+
+    console.log("\nmy-families scoping, ordering and view mapping all held");
+  } finally {
+    await prisma.family.deleteMany({
+      where: { id: { in: [shared.id, other.id, strangerFamily.id] } },
+    });
+    await prisma.user.deleteMany({ where: { email: { contains: suffix } } });
+    await prisma.$disconnect();
+  }
+}
+
+main().catch((error: unknown) =&gt; {
+  console.error(error);
+  process.exitCode = 1;
+});</code></pre>
+          </div>
+
+          <div class="file">
+            <span class="file-path">package.json (scripts, addition)</span>
+            <pre><code>"check:families": "tsx server/src/scripts/checkFamilies.ts"</code></pre>
+          </div>
+        </li>
+      </ol>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Verify (after)</h2>
+
+      <pre><code>npm run typecheck        # exit 0
+npm run check:families   # 2 families, roles [owner, member]</code></pre>
+
+      <p>Expected <code>check:families</code> output:</p>
+
+      <pre><code>families returned: 2
+roles:             ["owner","member"]
+my-families scoping, ordering and view mapping all held</code></pre>
+
+      <p>
+        Then the same curl from lesson 13a's baseline — restart the dev server
+        first, because the <code>tsx watch</code> restart that applied your edits
+        also killed the session, and re-register if the jar is stale:
+      </p>
+
+      <pre><code>curl -sS -b /tmp/kinlink.jar -i http://localhost:4000/api/families
+# 200 {"data":[{"slug":"owner-…-aca54c","name":"…'s family","role":"owner"}]}
+
+curl -sS -i http://localhost:4000/api/families
+# 401 {"message":"Authentication required"}</code></pre>
+
+      <p>
+        Two things to read carefully. The family body carries <code>slug</code>,
+        <code>name</code> and <code>role</code> and <strong>no
+        <code>id</code></strong>. And with no cookie the answer is
+        <code>401</code> <em>JSON</em> — not the HTML <code>404</code> the
+        baseline produced, because the route now exists and the guard now runs.
+      </p>
+
+      <div class="prompt">
+        <span class="prompt-title">Ask your teacher</span>
+        <p>
+          Ask why <code>GET /api/families</code> skips <code>loadFamily</code>
+          when every other <code>/families/…</code> route carries it, and why an
+          unmounted route answered in HTML rather than JSON. Answers are in
+          <a href="0013e-practice.html">Lesson 13e</a>.
+        </p>
+      </div>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Log it</h2>
+      <p>
+        Two minutes, then close the tab. This is the step that makes the plan
+        real, and the one every lesson before this forgot to ask for.
+      </p>
+      <ul>
+        <li>Minutes: _</li>
+        <li>One line — what fought back, or what you could not recall: _</li>
+        <li>Committed: <code>&lt;hash&gt;</code> (builds only)</li>
+      </ul>
+      <p>
+        Add it to this week's block in
+        <a href="../PROGRESS.md">PROGRESS.md</a>. At the week's end, fill the
+        three signals — can explain / can extend / can break.
+      </p>
+
+      <footer class="lesson-footer">
+        <p class="next-up">
+          <strong>Next:</strong> Lesson 13c — the client can sign in. One fetch
+          helper that owns the envelope, a <code>useSession</code> hook with four
+          states, and a login screen that appears for exactly one of them.
+        </p>
+        <p>
+          <a href="../MISSION.md">MISSION.md</a> ·
+          <a href="../ROADMAP.md">ROADMAP.md</a> ·
+          <a href="../GLOSSARY.md">GLOSSARY.md</a> ·
+          <a href="../PROGRESS.md">PROGRESS.md</a> ·
+          <a href="0013a-the-whoami-repair.html">Lesson 13a</a> ·
+          <a href="0013c-the-client-can-sign-in.html">Lesson 13c</a> ·
+          <a href="../reference/0010-client-identity.html">Reference 10</a>
+        </p>
+      </footer>
+    </div>
+    <script src="../assets/quiz.js"></script>
+  </body>
+</html>

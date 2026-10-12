@@ -18,6 +18,8 @@ teacher's memory. Every entry says what it is good for.
   The official tutorial, rewritten around hooks and modern thinking. Use for: mental model of state, effects, and rendering.
 - [react.dev — Thinking in React](https://react.dev/learn/thinking-in-react)
   Use for: the process of decomposing a design into components. Directly applicable to the KinLink tree and dashboard.
+- [react.dev — You Might Not Need an Effect](https://react.dev/learn/you-might-not-need-an-effect)
+  Use for: when fetching in an effect is the right shape, why the cleanup flag exists (ignore a resolved response after unmount), and what a data-fetching library replaces. Read before writing `useSession`-shaped code.
 - [overreacted — Dan Abramov](https://overreacted.io/)
   Deep essays on React's mental model by a former React core maintainer. Use for: understanding *why*, not *how*. Start with The Two Reacts.
 - [patterns.dev — React Stack Patterns](https://www.patterns.dev/react/react-2026/)
@@ -26,7 +28,7 @@ teacher's memory. Every entry says what it is good for.
 ### Data & server state
 
 - [TanStack Query — Overview](https://tanstack.com/query/latest/docs/framework/react/overview)
-  The canonical server-state library. Use for: caching, invalidation, optimistic updates. KinLink uses this, not Redux.
+  The canonical server-state library. Use for: caching, invalidation, optimistic updates. **Not adopted yet, and the rule is now explicit (session 13): adopt it on the first screen where a mutation must invalidate a read** — a cache whose most valuable feature has nothing to invalidate is a store, not a tool. That is the people screen, not today's read-only three.
 - [React Libraries for 2026 — Robin Wieruch](https://www.robinwieruch.de/react-libraries/)
   Opinionated, well-maintained survey of the React ecosystem. Use for: "which library should I pick" decisions.
 
@@ -80,6 +82,16 @@ teacher's memory. Every entry says what it is good for.
   Official MySQL path end-to-end. Use for: schema, migrations, client usage. Start here in week 2.
 - [Prisma docs — ORM](https://www.prisma.io/docs)
   Use for: relations, transactions, query performance, and the generated client's type behaviour.
+- [Prisma ORM v7 — Expand-and-contract migrations](https://www.prisma.io/docs/guides/v7/database/data-migration)
+  Use for: changing a column that already has rows. Three steps — expand the schema and deploy, backfill with a typed `data-migration.ts`, contract in a second migration. The version-matched guide; Prisma cannot express the intermediate state, so the backfill is written by hand.
+- [MySQL 8.0 — Online DDL Operations](https://dev.mysql.com/doc/refman/8.0/en/innodb-online-ddl-operations.html)
+  Use for: what each `ALTER TABLE` actually costs. The column-operations table is the authority for the expand-and-contract order: adding a nullable column is `INSTANT` and metadata-only, setting a default is `INSTANT`, but making a column `NOT NULL` "rebuilds the table in place" and "fails if the column contains `NULL` values". Also the source for `ALGORITHM=`/`LOCK=` choices.
+- [GitHub — gh-ost](https://github.com/github/gh-ost)
+  Use for: what the contract step looks like when the table is too big to rebuild in place — online schema migration by copying through a ghost table. Read before any `NOT NULL` change on a table that matters.
+- [Markus Winand — use-the-index-luke, #NoOffset](https://use-the-index-luke.com/no-offset)
+  Use for: why `OFFSET` is slow *and* wrong. Quotes SQL:2023's own definition ("sorted… then limited by dropping the number of rows specified in the result offset clause"), shows the duplicate-row anomaly when a row is inserted between pages, and gives the seek recipe: `WHERE id < ?last_seen_id ORDER BY id DESC FETCH FIRST 10 ROWS ONLY`.
+- [Markus Winand — Fetching the next page](https://use-the-index-luke.com/sql/partial-results/fetch-next-page)
+  Use for: the book-length version of the above — multi-column keysets, and how the predicate changes the index you need.
 - [MySQL — official Docker image](https://hub.docker.com/_/mysql/)
   Use for: running MySQL 8 locally in a container with no system install.
 - [Docker Docs — Use containerized databases](https://docs.docker.com/guides/databases/)
