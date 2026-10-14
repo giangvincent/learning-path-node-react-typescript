@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lesson 16c — The mutation that invalidates</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="lesson-header">
+        <p class="eyebrow">Lesson 16c · Week 4 · ≈ one session · one new thing</p>
+        <h1>The mutation that invalidates</h1>
+        <p class="lede">
+          This is the screen the last three sessions were waiting for: the first
+          place where a write must be reflected in a read. The cache added in 16b
+          finally has something to do — and the reason it is worth a dependency
+          becomes visible in three lines.
+        </p>
+        <div class="meta-row">
+          <span>Mission: ship KinLink</span>
+          <span>Requires: <a href="0016b-the-screen-and-the-cache.html">Lesson 16b</a></span>
+          <span>References: <a href="../reference/0013-server-state-and-the-screen.html">13</a></span>
+          <span>Practice: <a href="0016f-practice.html">Lesson 16f</a></span>
+        </div>
+      </header>
+
+      <div class="callout win">
+        <span class="callout-title">The win</span>
+        <p>
+          A small form on the people screen creates a person and the list updates
+          itself. Not because anyone copied the new row into local state, but
+          because the mutation <em>invalidated the key the read uses</em> and the
+          cache re-fetched. One rule, and every reader of that key is correct.
+        </p>
+      </div>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Warm-up: retrieve before rereading</h2>
+      <p>
+        Five minutes, from memory. What key did the people read use, and why is it
+        <em>exported</em> rather than written inline? Answer before you scroll
+        back to <a href="../reference/0013-server-state-and-the-screen.html">Reference 13</a>.
+        Today's whole lesson turns on that key being a name two components share.
+      </p>
+
+      <h2>Build it</h2>
+      <ol class="steps">
+        <li>
+          <h3>Verify the baseline</h3>
+          <pre><code>npm run typecheck                 # exit 0
+npm ls @tanstack/react-query      # 5.x, installed in 16b
+grep -n "invalidateQueries" client/src -r   # no match yet -- nothing invalidates anything</code></pre>
+          <p>
+            That last emptiness is the lesson. A cache nobody invalidates is a
+            store; today it becomes a cache.
+          </p>
+        </li>
+
+        <li>
+          <h3>The transport learns the write verb</h3>
+          <p>
+            The private <code>request</code> helper takes a fixed set of methods.
+            A write needs <code>POST</code> added to that union — and since the
+            rest of this series needs the other verbs too, widen it once, to the
+            four this API actually serves.
+          </p>
+          <div class="file">
+            <span class="file-path">client/src/lib/api.ts (the options type)</span>
+            <pre><code>    method?: "GET" | "POST" | "PATCH" | "DELETE";</code></pre>
+          </div>
+          <p>
+            Then the named call. Note it is the same <code>request</code> as the
+            reads, so it inherits the envelope and the <code>401</code> rule for
+            free: a dead session during a create is announced app-wide, exactly as
+            it would be on a read.
+          </p>
+          <div class="file">
+            <span class="file-path">client/src/lib/api.ts (additions)</span>
+            <pre><code>export function createPerson(
+  slug: string,
+  input: CreatePersonRequest,
+): Promise&lt;PersonResource&gt; {
+  return request&lt;PersonResource&gt;(
+    `/api/families/${encodeURIComponent(slug)}/people`,
+    { method: "POST", body: input },
+  );
+}</code></pre>
+          </div>
+          <p>
+            Add <code>CreatePersonRequest</code> to the type import.
+          </p>
+        </li>
+
+        <li>
+          <h3>A mutation and its invalidation</h3>
+          <p>
+            <code>useMutation</code> runs the write. <code>onSuccess</code> is
+            where the cache is told the truth changed. That is the entire
+            mechanism — there is no manual <code>setState</code> of the list, and
+            that absence is the design.
+          </p>
+          <div class="file">
+            <span class="file-path">client/src/PeoplePage.tsx (the form)</span>
+            <pre><code>import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useState } from "react";
+import type { FormEvent } from "react";
+import type { Gender } from "./contracts";
+import { ApiError, createPerson, getPeople } from "./lib/api";
+
+const GENDERS = ["male", "female", "other", "unknown"] as const;
+
+function isGender(value: unknown): value is Gender {
+  return typeof value === "string" && (GENDERS as readonly string[]).includes(value);
+}
+
+function AddPersonForm({ slug }: { slug: string }) {
+  const queryClient = useQueryClient();
+  const [name, setName] = useState("");
+  const [gender, setGender] = useState&lt;Gender&gt;("unknown");
+  const [error, setError] = useState&lt;string | null&gt;(null);
+
+  const add = useMutation({
+    mutationFn: (input: { name: string; gender: Gender }) =&gt;
+      createPerson(slug, input),
+    onSuccess: () =&gt; {
+      setName("");
+      setError(null);
+      void queryClient.invalidateQueries({ queryKey: peopleKey(slug) });
+    },
+    onError: () =&gt; setError("That did not work. Try again."),
+  });
+
+  const submit = (event: FormEvent) =&gt; {
+    event.preventDefault();
+    const trimmed = name.trim();
+    if (trimmed === "") {
+      setError("A name is required.");
+      return;
+    }
+    add.mutate({ name: trimmed, gender });
+  };
+
+  return (
+    &lt;form onSubmit={submit}&gt;
+      &lt;input
+        value={name}
+        onChange={(event) =&gt; setName(event.target.value)}
+        placeholder="Name"
+      /&gt;
+      &lt;select
+        value={gender}
+        onChange={(event) =&gt; {
+          if (isGender(event.target.value)) setGender(event.target.value);
+        }}
+      &gt;
+        {GENDERS.map((option) =&gt; (
+          &lt;option key={option} value={option}&gt;
+            {option}
+          &lt;/option&gt;
+        ))}
+      &lt;/select&gt;
+      &lt;button type="submit" disabled={add.isPending}&gt;
+        {add.isPending ? "Adding…" : "Add person"}
+      &lt;/button&gt;
+      {error &amp;&amp; &lt;span role="alert"&gt; {error}&lt;/span&gt;}
+    &lt;/form&gt;
+  );
+}</code></pre>
+          </div>
+          <p>Mount it above the list, so the list below it stays the read:</p>
+          <div class="file">
+            <span class="file-path">client/src/PeoplePage.tsx (PeopleList body)</span>
+            <pre><code>      &lt;AddPersonForm slug={slug} /&gt;
+
+      {query.isPending &amp;&amp; &lt;p&gt;Loading…&lt;/p&gt;}</code></pre>
+          </div>
+          <div class="callout">
+            <span class="callout-title">Why invalidate, and not "just add the row"</span>
+            <p>
+              The tempting shortcut is to push the created person into local
+              state. It works for the screen that created it and lies to every
+              other reader — the tree view, a second tab, the person's own page.
+              Invalidating the key says one true thing ("this data is stale") and
+              lets every reader re-fetch. It also handles what the client cannot
+              know: server-set fields, other people's concurrent edits, ordering.
+            </p>
+          </div>
+        </li>
+      </ol>
+
+      <h2>Verify after</h2>
+      <pre><code>npm run typecheck     # exit 0
+npm run build:client  # exit 0</code></pre>
+      <p>
+        Then do it by hand, because this is a behaviour and not just a compile.
+        Sign in, open the family's people screen, add a name, and watch the list
+        grow without a reload. Add two in a row — the input clears after each, and
+        the list keeps up. Now open the same screen in a second tab and add a name
+        in the first: the second tab does <em>not</em> update until it re-focuses
+        or reloads. That is expected, and worth saying out loud — a cache on one
+        client cannot see another client's writes.
+      </p>
+
+      <div class="callout warn">
+        <span class="callout-title">Break it on purpose — predict first</span>
+        <p>
+          Delete the <code>invalidateQueries</code> line from
+          <code>onSuccess</code>. Predict what the screen does after a successful
+          create. Then run it: the person <em>is</em> created — check
+          <code>curl</code> or the next reload — but the list does not move.
+          The write succeeded and the read is stale, and no error tells you. That
+          silent half-truth is the exact bug the cache exists to prevent; put the
+          line back and watch it disappear.
+        </p>
+      </div>
+
+      <h2>Decisions carried into the next sittings</h2>
+      <ul>
+        <li>
+          <strong>No optimistic update yet.</strong> An optimistic update paints
+          the row before the server confirms it, then rolls back on failure. It is
+          the right tool when a round trip is slow enough to see — which this is
+          not, on localhost, with one row. It is also the tool that produces
+          "ghost" rows when the rollback is wrong. Add it when a measured
+          round-trip is annoying, not because it looks clever.
+        </li>
+        <li>
+          <strong>Errors are minimal on purpose.</strong> The form shows
+          "That did not work" for any failure; the server's sentence ("name must be
+          a non-empty string…") reaches the client in the response body but is not
+          shown yet. That is a real gap, and a small one: <code>ApiError</code>
+          would need to carry the body. Decide whether KinLink shows raw server
+          prose or maps <code>status</code> to its own copy — do not half-do both.
+        </li>
+        <li>
+          <strong>The mutation key is not the query key.</strong>
+          <code>useMutation</code> needs no key; only the query does. If you find
+          yourself naming a mutation key, check you are not reaching for
+          <code>setQueryData</code>.
+        </li>
+      </ul>
+
+      <h2>Primary sources</h2>
+      <div class="callout win">
+        <span class="callout-title">Read these against the code</span>
+        <p>
+          <a href="https://tanstack.com/query/latest/docs/framework/react/guides/mutations">TanStack Query — Mutations</a>
+          for <code>useMutation</code>, <code>isPending</code> and the callbacks ·
+          <a href="https://tanstack.com/query/latest/docs/framework/react/guides/query-invalidation">TanStack Query — Query Invalidation</a>
+          for why <code>invalidateQueries({ queryKey })</code> matches by prefix,
+          and what <code>refetchType</code> changes ·
+          <a href="../reference/0013-server-state-and-the-screen.html">Reference 13</a>
+          for the "who owns this data" question underneath all of it.
+        </p>
+      </div>
+
+      <p>
+        If the list does not update, bring me the network tab and the console — the
+        three usual causes are a mismatched key, a swallowed error, or a
+        <code>queryFn</code> that throws before returning. Ask about optimistic
+        updates, error bodies, or <code>staleTime</code> — anything unclear is
+        worth the minute.
+      </p>
+
+      <h2>Log it</h2>
+      <ul>
+        <li>Minutes: _</li>
+        <li>One line — what fought back, or what you could not recall: _</li>
+        <li>Committed: <code>&lt;hash&gt;</code></li>
+      </ul>
+      <p>
+        Add it to this week's block in <a href="../PROGRESS.md">PROGRESS.md</a>.
+        Commit this sitting on its own.
+      </p>
+
+      <footer class="lesson-footer">
+        <p class="next-up">
+          <strong>Next:</strong> Lesson 16d — editing a person, and a column
+          called <code>updated_at</code> that has never once updated.
+        </p>
+        <p>
+          <a href="../MISSION.md">MISSION.md</a> ·
+          <a href="../ROADMAP.md">ROADMAP.md</a> ·
+          <a href="../GLOSSARY.md">GLOSSARY.md</a> ·
+          <a href="0016b-the-screen-and-the-cache.html">Lesson 16b</a> ·
+          <a href="0016f-practice.html">Lesson 16f</a> ·
+          <a href="../reference/0013-server-state-and-the-screen.html">Reference 13</a>
+        </p>
+      </footer>
+    </div>
+    <script src="../assets/quiz.js"></script>
+  </body>
+</html>

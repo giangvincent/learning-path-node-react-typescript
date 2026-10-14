@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lesson 16f — Practice: people, writes and the cache</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="lesson-header">
+        <p class="eyebrow">Lesson 16f · a later day · retrieval only</p>
+        <h1>Practice: people, writes and the cache</h1>
+        <p class="lede">
+          The drills for the whole 16 series — <a href="0016a-a-write-through-every-layer.html">16a</a>,
+          <a href="0016b-the-screen-and-the-cache.html">16b</a>,
+          <a href="0016c-the-mutation-that-invalidates.html">16c</a>,
+          <a href="0016d-the-column-that-never-updated.html">16d</a>,
+          <a href="0016e-the-row-that-leaves.html">16e</a>. Run this on a
+          <em>different day</em> from the builds, from memory where you can.
+        </p>
+        <div class="meta-row">
+          <span>Mission: ship KinLink</span>
+          <span>Covers: <a href="0016a-a-write-through-every-layer.html">16a</a> · <a href="0016b-the-screen-and-the-cache.html">16b</a> · <a href="0016c-the-mutation-that-invalidates.html">16c</a> · <a href="0016d-the-column-that-never-updated.html">16d</a> · <a href="0016e-the-row-that-leaves.html">16e</a></span>
+          <span>Prior practice: <a href="0015f-practice.html">Lesson 15f</a></span>
+        </div>
+      </header>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Defend it out loud</h2>
+      <ol>
+        <li>
+          Walk <code>POST /api/families/:slug/people</code> from the URL to the
+          JSON response, naming the decision each of the six layers makes. Say it
+          without looking at a file.
+        </li>
+        <li>
+          <code>familyId</code> reaches the model from <code>familyContext</code>,
+          never from the request body. Which type makes the alternative
+          <em>unrepresentable</em>, not merely discouraged?
+        </li>
+        <li>
+          Why does the model use <code>updateMany</code> where a reader would expect
+          <code>update</code>? What does the returned <code>count</code> let the
+          controller decide?
+        </li>
+        <li>
+          The client caches server data instead of holding it in
+          <code>useState</code>. Give the argument to a sceptic in two sentences,
+          then name the counter-case (when <code>useState</code> really is right).
+        </li>
+        <li>
+          All three mutations end in the same <code>invalidateQueries</code> call.
+          Why is one call enough for a create, an edit and a delete?
+        </li>
+        <li>
+          <code>peopleKey</code> is exported and shared. What breaks the day a
+          second screen fetches people under its own literal key?
+        </li>
+        <li>
+          The <code>updated_at</code> repair went in as its own commit before the
+          edit path. Why does the sequencing matter more than the one-line diff?
+        </li>
+      </ol>
+
+      <h2>Retrieval practice</h2>
+      <div class="quiz" data-quiz>
+        <script type="application/json">
+          [
+            {
+              "q": "Which layer is the only place Prisma may appear?",
+              "options": [
+                "The model layer, and no others",
+                "The service layer, and no others",
+                "The controller layer, and no others",
+                "The view layer, and no others"
+              ],
+              "answer": 0,
+              "why": "The model owns data access; the service owns the rules; a query anywhere else is the leak this layering exists to prevent."
+            },
+            {
+              "q": "What makes a cross-family update match no row?",
+              "options": [
+                "The where clause names the family",
+                "The service re-reads the role first",
+                "The view strips the family id out",
+                "The route narrows the person id"
+              ],
+              "answer": 0,
+              "why": "updateMany filters on both id and familyId. Delete the familyId and the same update reaches a stranger's row -- the break-it in 16a."
+            },
+            {
+              "q": "What does invalidateQueries do to the cache?",
+              "options": [
+                "Marks the key stale, then refetches",
+                "Writes the new row into the cache",
+                "Clears every query key it knows",
+                "Runs every mounted query again now"
+              ],
+              "answer": 0,
+              "why": "It marks matching keys stale and refetches the active ones. Copying the row in by hand is what it replaces -- and what makes every other reader wrong."
+            },
+            {
+              "q": "Why does a 204 have no body to parse?",
+              "options": [
+                "The operation leaves nothing to say",
+                "The envelope is dropped for speed",
+                "The client already holds the row",
+                "The server omits it for safety"
+              ],
+              "answer": 0,
+              "why": "204 No Content says the request succeeded and there is nothing to return. The transport must return early, or response.json() throws on the empty body."
+            },
+            {
+              "q": "Why is a second DELETE a 404, not an error?",
+              "options": [
+                "DELETE is idempotent by definition",
+                "The person may be restored later",
+                "The route ignores repeated calls",
+                "The client retries it safely twice"
+              ],
+              "answer": 0,
+              "why": "Repeating a delete leaves the same end state, so it is idempotent; the 404 reports the row is absent, which is not a failure of the caller."
+            }
+          ]
+        </script>
+      </div>
+
+      <h2>Break it on purpose</h2>
+      <ol>
+        <li>
+          <strong>Unscope the update.</strong> Drop <code>familyId</code> from the
+          <code>where</code> in <code>person.model.update</code>. Predict, then run
+          <code>check:people</code>. Expected: the cross-family update succeeds and
+          the check exits 1. The scope lived in the WHERE clause and nowhere else.
+        </li>
+        <li>
+          <strong>Silence the create's invalidation.</strong> Remove the
+          <code>invalidateQueries</code> from the add form's <code>onSuccess</code>.
+          Predict the screen, then create a person: the row is written and the list
+          does not move. Same drill, same result, on the delete.
+        </li>
+        <li>
+          <strong>Lie about <code>updated_at</code>.</strong> Revert the schema to
+          <code>@default(now())</code>, regenerate, edit a person, and read the row.
+          The timestamp is frozen and nothing errors — the worst shape a defect can
+          take.
+        </li>
+        <li>
+          <strong>Return 200 instead of 204 on the delete.</strong> Change the
+          handler to <code>res.status(200).end()</code> and delete a person from the
+          screen. Predict first: <code>request&lt;void&gt;</code> now skips its 204
+          branch and calls <code>response.json()</code> on an empty body, so the
+          delete <em>succeeds on the server</em> and <em>throws on the client</em>.
+          The status code is part of the contract.
+        </li>
+        <li>
+          <strong>Leak the family id from the view.</strong> Put <code>familyId</code>
+          back into <code>toPersonResource</code>'s return. See whether the compiler
+          or the check catches it first, and note which one is allowed to miss it.
+        </li>
+      </ol>
+
+      <h2>Primary sources</h2>
+      <div class="callout win">
+        <span class="callout-title">Read these again, slowly</span>
+        <p>
+          <a href="../reference/0002-express-mvc.html">Reference 02</a> — the six
+          layers, now with a write as well as reads ·
+          <a href="../reference/0004-ids-and-tenancy.html">Reference 04</a> — "a
+          client may name a resource; the server must prove access to it" ·
+          <a href="../reference/0013-server-state-and-the-screen.html">Reference 13</a>
+          — the whole series on one page: the write path, the cache, the key, and
+          the invariant table with a proof per row.
+        </p>
+      </div>
+
+      <h2>Ask your teacher</h2>
+      <p>
+        Bring the exact output when a prediction differs. Ask about optimistic
+        updates and when they earn their keep, letting <code>ApiError</code> carry
+        the server's prose, soft deletes versus the cascade that relationships will
+        force, or whether people writes should be a privileged role after all.
+      </p>
+
+      <h2>Log it</h2>
+      <ul>
+        <li>Minutes: _</li>
+        <li>One line — what fought back, or what you could not recall: _</li>
+        <li>Committed: <code>&lt;hash&gt;</code> (if you changed code while breaking it)</li>
+      </ul>
+      <p>
+        Add it to this week's block in <a href="../PROGRESS.md">PROGRESS.md</a>,
+        then fill the week's three signals — can explain, can extend, can break.
+      </p>
+
+      <footer class="lesson-footer">
+        <p class="next-up">
+          <strong>Next:</strong> relationships — the first feature where a person
+          stops being a row and becomes a node in a graph.
+        </p>
+        <p>
+          <a href="../MISSION.md">MISSION.md</a> ·
+          <a href="../ROADMAP.md">ROADMAP.md</a> ·
+          <a href="../GLOSSARY.md">GLOSSARY.md</a> ·
+          <a href="0016a-a-write-through-every-layer.html">Lesson 16a</a> ·
+          <a href="0015f-practice.html">Lesson 15f</a> ·
+          <a href="../reference/0013-server-state-and-the-screen.html">Reference 13</a>
+        </p>
+      </footer>
+    </div>
+    <script src="../assets/quiz.js"></script>
+  </body>
+</html>

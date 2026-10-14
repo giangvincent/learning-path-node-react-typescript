@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lesson 15d — The page that stopped lying</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="lesson-header">
+        <p class="eyebrow">Lesson 15d · Week 5 · ≈ one session · one new thing</p>
+        <h1>The page that stopped lying</h1>
+        <p class="lede">
+          <code>AcceptPage</code> is the last component that talks to
+          <code>fetch</code> directly, and it collapses every failure into "This
+          link doesn't work." But a <code>401</code> is not that: it means "sign
+          in first." Today it joins the transport, and learns to tell the two
+          apart.
+        </p>
+        <div class="meta-row">
+          <span>Mission: ship KinLink</span>
+          <span>Requires: <a href="0015c-revoke-and-resend.html">Lesson 15c</a></span>
+          <span>References: <a href="../reference/0010-client-identity.html">10</a> · <a href="../reference/0006-authorisation-chains.html">06</a></span>
+          <span>Practice: <a href="0015f-practice.html">Lesson 15f</a></span>
+        </div>
+      </header>
+
+      <div class="callout win">
+        <span class="callout-title">The win</span>
+        <p>
+          <code>AcceptPage</code> calls one named function in
+          <code>lib/api.ts</code>. A signed-out visitor reads "Sign in to accept
+          this invitation"; a used or expired link reads "This link doesn't
+          work." <code>grep -rn "fetch(" client/src</code> now matches only the
+          transport.
+        </p>
+      </div>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Warm-up: the third meaning of a 401</h2>
+      <p>
+        You already know two: a wrong password (a verdict) and a dead session
+        (an eviction). The accept route sits under <code>requireAuth</code>, and
+        the person clicking an invite link is often <em>not signed in at all</em>.
+        What does a <code>401</code> mean here? Answer before you read the code.
+      </p>
+
+      <h2>Build it</h2>
+      <ol class="steps">
+        <li>
+          <h3>Verify the baseline</h3>
+          <pre><code>npm run typecheck       # exit 0
+npm run build:client    # builds
+npm run check:session   # still green</code></pre>
+          <p>
+            Read <code>client/src/AcceptPage.tsx</code>: it calls
+            <code>fetch</code> directly with its own <code>credentials:
+            "include"</code>, and maps everything that is not <code>204</code> to
+            one message. That single message is the lie.
+          </p>
+        </li>
+
+        <li>
+          <h3>One named function in the transport</h3>
+          <p>
+            Add the accept call beside <code>getInvitations</code>. It is
+            <code>expectsSession: false</code> on purpose: a <code>401</code> here
+            is not an eviction of an existing session — there may be no session at
+            all — so the transport must not broadcast "your session ended." The
+            page handles this one itself.
+          </p>
+          <div class="file">
+            <span class="file-path">client/src/lib/api.ts (addition)</span>
+            <pre><code>export function acceptInvitation(token: string): Promise&lt;void&gt; {
+  return request&lt;void&gt;(
+    `/api/invitations/${encodeURIComponent(token)}/accept`,
+    { method: "POST", expectsSession: false },
+  );
+}</code></pre>
+          </div>
+          <p>
+            <code>request</code> already sends <code>credentials: "include"</code>
+            and returns <code>undefined</code> on <code>204</code>, so nothing
+            else is needed.
+          </p>
+        </li>
+
+        <li>
+          <h3>Rewrite the page: two failures, two messages</h3>
+          <div class="file">
+            <span class="file-path">client/src/AcceptPage.tsx (rewritten)</span>
+            <pre><code>import { useEffect, useState } from "react";
+import { useParams } from "react-router-dom";
+import { ApiError, acceptInvitation } from "./lib/api";
+
+type Status = "idle" | "ok" | "needs-sign-in" | "err";
+
+export default function AcceptPage() {
+  const { token } = useParams&lt;{ token: string }&gt;();
+  const [status, setStatus] = useState&lt;Status&gt;("idle");
+
+  useEffect(() =&gt; {
+    if (!token) return;
+    acceptInvitation(token)
+      .then(() =&gt; setStatus("ok"))
+      .catch((cause: unknown) =&gt; {
+        if (cause instanceof ApiError &amp;&amp; cause.status === 401) {
+          setStatus("needs-sign-in");
+          return;
+        }
+        setStatus("err");
+      });
+  }, [token]);
+
+  if (status === "ok") return &lt;p&gt;You're in — go to the family.&lt;/p&gt;;
+  if (status === "needs-sign-in")
+    return &lt;p&gt;Sign in to accept this invitation.&lt;/p&gt;;
+  if (status === "err") return &lt;p&gt;This link doesn't work.&lt;/p&gt;;
+  return &lt;p&gt;Accepting…&lt;/p&gt;;
+}</code></pre>
+          </div>
+          <p>
+            The <code>409</code> stays collapsed — used, expired, revoked and
+            already-member are one fact to a stranger holding a stale link
+            (Reference 09 §5). Only the <code>401</code> is split out, because
+            only its fix is different: signing in.
+          </p>
+        </li>
+      </ol>
+
+      <h2>Verify after</h2>
+      <pre><code>npm run typecheck        # expected: exit 0
+npm run build:client     # expected: builds
+grep -rn "fetch(" client/src
+                         # expected: only lib/api.ts matches now</code></pre>
+      <p>
+        Then cause both cases in the browser (this is the real proof, because the
+        branch is a UI decision):
+      </p>
+      <ol>
+        <li>
+          <strong>Signed out.</strong> In a fresh private window with no cookie,
+          open <code>/invite/&lt;any-token&gt;</code>. Expected: "Sign in to accept
+          this invitation."
+        </li>
+        <li>
+          <strong>Dead link.</strong> Sign in, mint an invite (curl is fine), open
+          its link once to spend it, then open it again. Expected: "This link
+          doesn't work."
+        </li>
+      </ol>
+
+      <div class="callout warn">
+        <span class="callout-title">Why not announce on the 401 here?</span>
+        <p>
+          If <code>expectsSession</code> were left at its default
+          <code>true</code>, a signed-out invitee's <code>401</code> would
+          announce a dead session to an app that never had one. Defaults fail
+          safe, and this is the caller that must opt out — same reasoning as
+          <code>login</code> in lesson 14a, one route over.
+        </p>
+      </div>
+
+      <h2>Primary sources</h2>
+      <div class="callout win">
+        <span class="callout-title">Read these against the code</span>
+        <p>
+          <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-401-unauthorized">RFC 9110 §15.5.2 — 401 Unauthorized</a>
+          ("no valid credentials" — a state, not a failure) ·
+          <a href="../reference/0010-client-identity.html">Reference 10</a> §1–2
+          (anonymous is a place with a screen) ·
+          <a href="../reference/0009-invitation-protocol.html">Reference 09</a> §5
+          (collapse on the wire).
+        </p>
+      </div>
+
+      <p>
+        Ask follow-up questions about extracting the status-to-message mapping so
+        it can be checked without a DOM, or about what the page should offer
+        besides "sign in."
+      </p>
+
+      <h2>Log it</h2>
+      <ul>
+        <li>Minutes: _</li>
+        <li>One line — what fought back, or what you could not recall: _</li>
+        <li>Committed: <code>&lt;hash&gt;</code></li>
+      </ul>
+      <p>
+        Add it to this week's block in <a href="../PROGRESS.md">PROGRESS.md</a>.
+      </p>
+
+      <footer class="lesson-footer">
+        <p class="next-up">
+          <strong>Next:</strong> Lesson 15e — the mint UI. Delete the dead
+          <code>InviteDialog</code> and rebuild it as a real screen that posts
+          through the transport — which uncovers a route that forgot the
+          envelope.
+        </p>
+        <p>
+          <a href="../MISSION.md">MISSION.md</a> ·
+          <a href="../ROADMAP.md">ROADMAP.md</a> ·
+          <a href="../GLOSSARY.md">GLOSSARY.md</a> ·
+          <a href="0015c-revoke-and-resend.html">Lesson 15c</a> ·
+          <a href="0015e-the-mint-ui.html">Lesson 15e</a> ·
+          <a href="../reference/0010-client-identity.html">Reference 10</a>
+        </p>
+      </footer>
+    </div>
+    <script src="../assets/quiz.js"></script>
+  </body>
+</html>

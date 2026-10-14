@@ -1,0 +1,320 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lesson 15e — The mint UI</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="lesson-header">
+        <p class="eyebrow">Lesson 15e · Week 5 · ≈ one session · one new thing</p>
+        <h1>The mint UI, through the transport</h1>
+        <p class="lede">
+          The server can mint, list, revoke and resend. The client can only list.
+          <code>InviteDialog</code> was supposed to be the mint screen, but it is
+          imported by nothing and posts to a route that does not exist. Delete it
+          and build the real one — posting through the transport, which uncovers a
+          route that skipped the response envelope.
+        </p>
+        <div class="meta-row">
+          <span>Mission: ship KinLink</span>
+          <span>Requires: <a href="0015d-the-page-that-stopped-lying.html">Lesson 15d</a></span>
+          <span>References: <a href="../reference/0012-map-of-kinlink.html">12</a> · <a href="../reference/0009-invitation-protocol.html">09</a></span>
+          <span>Practice: <a href="0015f-practice.html">Lesson 15f</a></span>
+        </div>
+      </header>
+
+      <div class="callout win">
+        <span class="callout-title">The win</span>
+        <p>
+          An owner fills a small form, the server mints, and the invite link is
+          shown <strong>once</strong> — the only time that credential will ever
+          exist. The dead <code>InviteDialog</code> is gone, and every client
+          request now goes through <code>lib/api.ts</code>.
+        </p>
+      </div>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Warm-up: what does the transport expect back?</h2>
+      <p>
+        From memory: after a successful request, what exact JSON shape does
+        <code>request&lt;T&gt;</code> unwrap? Then read the mint handler in
+        <code>invitation.routes.ts</code>. Do this before the first step — there
+        is a mismatch.
+      </p>
+
+      <h2>Build it</h2>
+      <ol class="steps">
+        <li>
+          <h3>Verify the baseline, and find the envelope bug</h3>
+          <pre><code>npm run typecheck        # exit 0
+grep -rn "InviteDialog" client/src   # imported by nothing (dead)
+grep -rn "fetch(" client/src         # only lib/api.ts after 15d
+</code></pre>
+          <p>
+            Now look at what the mint and resend routes return:
+            <code>res.status(201).json({ token })</code> — a bare body. But
+            <code>request&lt;T&gt;</code> does
+            <code>(await response.json()).data</code>. Through the transport, that
+            call returns <code>undefined</code>. Every other route wraps its
+            payload in <code>{ data: … }</code>; these two forgot. The transport
+            owns the envelope — a route that skips it is a bug the client cannot
+            fix.
+          </p>
+        </li>
+
+        <li>
+          <h3>Put the two routes back under the envelope</h3>
+          <div class="file">
+            <span class="file-path">server/src/routes/invitation.routes.ts (mint and resend responses)</span>
+            <pre><code>    // mint handler:
+    res.status(201).json({ data: { token: result.token } });
+
+    // resend handler:
+    res.status(201).json({ data: { token: result.token } });</code></pre>
+          </div>
+          <p>
+            Then name the shape in the contract so both sides compile against it
+            — and register it, because the client's re-export list is explicit,
+            not a wildcard:
+          </p>
+          <div class="file">
+            <span class="file-path">shared/contracts/invitation.ts (addition)</span>
+            <pre><code>/** The raw token, returned exactly once at mint and resend. Never stored. */
+export interface CreatedInvitation {
+  token: string;
+}</code></pre>
+          </div>
+          <div class="file">
+            <span class="file-path">client/src/contracts.ts (addition)</span>
+            <pre><code>export type { CreatedInvitation } from "../../shared/contracts/invitation";</code></pre>
+          </div>
+          <p>
+            Skip that re-export and <code>typecheck</code> fails with
+            <code>TS2305: Module '"../contracts"' has no exported member
+            'CreatedInvitation'</code> — the compiler catching the missing wire,
+            which is the whole point of an explicit list.
+          </p>
+        </li>
+
+        <li>
+          <h3>Delete the dead dialog, add the transport call</h3>
+          <div class="file">
+            <span class="file-path">terminal</span>
+            <pre><code>rm client/src/InviteDialog.tsx</code></pre>
+          </div>
+          <div class="file">
+            <span class="file-path">client/src/lib/api.ts (addition)</span>
+            <pre><code>// Add CreatedInvitation to the existing type import from "../contracts", then:
+
+export function createInvitation(
+  slug: string,
+  input: { email: string | null; role: "member" | "admin" },
+): Promise&lt;CreatedInvitation&gt; {
+  return request&lt;CreatedInvitation&gt;(
+    `/api/families/${encodeURIComponent(slug)}/invitations`,
+    { method: "POST", body: input },
+  );
+}</code></pre>
+          </div>
+          <p>
+            Note what this fixes by construction: the old dialog posted to
+            <code>/api/invitations</code> (no <code>POST /</code> handler → 404)
+            and used a raw <code>fetch</code>. The real path is family-scoped, and
+            the transport adds the credentials and the envelope.
+          </p>
+        </li>
+
+        <li>
+          <h3>The form, and the one-time link</h3>
+          <p>
+            Replace <code>InvitesPage.tsx</code> with a version that renders the
+            list plus a mint form. Give the list a reload counter so minting
+            refreshes it without a full reload.
+          </p>
+          <div class="file">
+            <span class="file-path">client/src/InvitesPage.tsx (rewritten)</span>
+            <pre><code>import { useEffect, useState } from "react";
+import type { FormEvent } from "react";
+import { useParams } from "react-router-dom";
+import type { InvitationResource } from "./contracts";
+import { ApiError, createInvitation, getInvitations } from "./lib/api";
+
+function addressee(invitation: InvitationResource): string {
+  return invitation.email ?? "Anyone with the link";
+}
+
+function MintInvite({
+  slug,
+  onMinted,
+}: {
+  slug: string;
+  onMinted: () =&gt; void;
+}) {
+  const [email, setEmail] = useState("");
+  const [role, setRole] = useState&lt;"member" | "admin"&gt;("member");
+  const [token, setToken] = useState&lt;string | null&gt;(null);
+  const [error, setError] = useState&lt;string | null&gt;(null);
+
+  const submit = async (event: FormEvent) =&gt; {
+    event.preventDefault();
+    setError(null);
+    try {
+      const created = await createInvitation(slug, {
+        email: email.trim() === "" ? null : email.trim(),
+        role,
+      });
+      setToken(created.token);
+      onMinted();
+    } catch (cause) {
+      if (cause instanceof ApiError &amp;&amp; cause.status === 409) {
+        setError("That email already has a pending invitation.");
+      } else if (cause instanceof ApiError &amp;&amp; cause.status === 403) {
+        setError("You need to be an owner to invite.");
+      } else {
+        setError("Could not send the invitation.");
+      }
+    }
+  };
+
+  return (
+    &lt;form onSubmit={submit}&gt;
+      &lt;input
+        value={email}
+        onChange={(e) =&gt; setEmail(e.target.value)}
+        placeholder="email (blank = shareable link)"
+      /&gt;
+      &lt;select
+        value={role}
+        onChange={(e) =&gt; setRole(e.target.value as "member" | "admin")}
+      &gt;
+        &lt;option value="member"&gt;member&lt;/option&gt;
+        &lt;option value="admin"&gt;admin&lt;/option&gt;
+      &lt;/select&gt;
+      &lt;button type="submit"&gt;Send invite&lt;/button&gt;
+
+      {error &amp;&amp; &lt;p role="alert"&gt;{error}&lt;/p&gt;}
+      {token &amp;&amp; (
+        &lt;p&gt;
+          Share once — this is the only time it is shown:{" "}
+          &lt;code&gt;{window.location.origin}/invite/{token}&lt;/code&gt;
+        &lt;/p&gt;
+      )}
+    &lt;/form&gt;
+  );
+}
+
+export default function InvitesPage() {
+  const { slug } = useParams&lt;{ slug: string }&gt;();
+  const [invitations, setInvitations] = useState&lt;InvitationResource[] | null&gt;(
+    null,
+  );
+  const [error, setError] = useState&lt;string | null&gt;(null);
+  const [nonce, setNonce] = useState(0);
+
+  useEffect(() =&gt; {
+    if (!slug) return;
+    getInvitations(slug)
+      .then(setInvitations)
+      .catch((cause: unknown) =&gt;
+        setError(cause instanceof Error ? cause.message : "Unknown error"),
+      );
+  }, [slug, nonce]);
+
+  if (!slug) return &lt;p&gt;No family in the URL.&lt;/p&gt;;
+
+  return (
+    &lt;main style={{ fontFamily: "system-ui, sans-serif", padding: "2rem" }}&gt;
+      &lt;h1&gt;Pending invitations&lt;/h1&gt;
+      &lt;MintInvite slug={slug} onMinted={() =&gt; setNonce((n) =&gt; n + 1)} /&gt;
+      {error &amp;&amp; &lt;p role="alert"&gt;Failed to load: {error}&lt;/p&gt;}
+      {!error &amp;&amp; invitations === null &amp;&amp; &lt;p&gt;Loading…&lt;/p&gt;}
+      {invitations?.length === 0 &amp;&amp; &lt;p&gt;No pending invitations.&lt;/p&gt;}
+      {invitations &amp;&amp; invitations.length &gt; 0 &amp;&amp; (
+        &lt;ul&gt;
+          {invitations.map((invitation) =&gt; (
+            &lt;li key={invitation.id}&gt;
+              {addressee(invitation)} — {invitation.role} — sent{" "}
+              {new Date(invitation.createdAt).toLocaleDateString()}
+            &lt;/li&gt;
+          ))}
+        &lt;/ul&gt;
+      )}
+    &lt;/main&gt;
+  );
+}</code></pre>
+          </div>
+          <div class="callout warn">
+            <span class="callout-title">The token is shown once, and only a link</span>
+            <p>
+              The raw token exists for this one response. Do not stash it in a
+              store, a query cache, or <code>localStorage</code> — a persisted raw
+              credential is exactly what hash-at-rest avoided. If the owner loses
+              the link, the answer is resend (15c), not "show it again."
+            </p>
+          </div>
+        </li>
+      </ol>
+
+      <h2>Verify after</h2>
+      <pre><code>npm run typecheck        # expected: exit 0
+npm run build:client     # expected: builds
+grep -rn "InviteDialog" client/src   # expected: no matches
+grep -rn "fetch(" client/src         # expected: only lib/api.ts</code></pre>
+      <p>
+        Then in the browser, signed in as an owner at
+        <code>/family/&lt;slug&gt;/invites</code>: send an invite, confirm the link
+        appears once and the list grows by one. Send the same email again and
+        confirm the <code>409</code> message.
+      </p>
+
+      <h2>Primary sources</h2>
+      <div class="callout win">
+        <span class="callout-title">Read these against the code</span>
+        <p>
+          <a href="../reference/0012-map-of-kinlink.html">Reference 12</a> §7
+          ("components render and ask <code>lib/api.ts</code> for data") ·
+          <a href="../reference/0009-invitation-protocol.html">Reference 09</a> §1
+          (the token is a credential, shown once) ·
+          <a href="https://react.dev/learn/you-might-not-need-an-effect">react.dev — You Might Not Need an Effect</a>
+          (why the list refetches on a counter rather than on the mint).
+        </p>
+      </div>
+
+      <p>
+        Ask follow-up questions about where revoke and resend buttons belong on
+        this page, whether the mint form should be a dialog, and how the form
+        should disable itself while a request is in flight.
+      </p>
+
+      <h2>Log it</h2>
+      <ul>
+        <li>Minutes: _</li>
+        <li>One line — what fought back, or what you could not recall: _</li>
+        <li>Committed: <code>&lt;hash&gt;</code></li>
+      </ul>
+      <p>
+        Add it to this week's block in <a href="../PROGRESS.md">PROGRESS.md</a>.
+      </p>
+
+      <footer class="lesson-footer">
+        <p class="next-up">
+          <strong>Next:</strong> <a href="0015f-practice.html">Lesson 15f</a> —
+          the practice for the whole 15 series, on a later day.
+        </p>
+        <p>
+          <a href="../MISSION.md">MISSION.md</a> ·
+          <a href="../ROADMAP.md">ROADMAP.md</a> ·
+          <a href="../GLOSSARY.md">GLOSSARY.md</a> ·
+          <a href="0015d-the-page-that-stopped-lying.html">Lesson 15d</a> ·
+          <a href="0015f-practice.html">Lesson 15f</a> ·
+          <a href="../reference/0012-map-of-kinlink.html">Reference 12</a>
+        </p>
+      </footer>
+    </div>
+    <script src="../assets/quiz.js"></script>
+  </body>
+</html>

@@ -2,6 +2,10 @@
 
 Working notes and preferences. Not a lesson — a scratchpad for me (the teacher).
 
+**Forward plan:** the lesson-series board for 17–20 (breakdowns, open questions,
+sources still to find) lives in [PLAN.md](./PLAN.md). This file is the record;
+that one is the plan.
+
 ## Who I'm teaching
 
 - **Goal:** senior-level software engineering role. KinLink is the proof, not the hobby.
@@ -390,6 +394,54 @@ Working notes and preferences. Not a lesson — a scratchpad for me (the teacher
   (`got 2` announcements; `TS2353`), `shasum -c` **5/5 OK**, `git status --short`
   **byte-identical**, probe and `client/src/scripts/` removed.
 
+## Session 15 — the people series, and a probe that paid for itself
+
+- **Lesson 16 = People CRUD, authored as one series, 16a–16f.** 16a the write
+  through every layer (`POST /families/:slug/people`, validation at the boundary,
+  `check:people`); 16b the people screen on **TanStack Query** (install,
+  `QueryClientProvider`, `useQuery`); 16c the add form — the **first mutation that
+  invalidates a read**, which is the trigger the notes have carried for TanStack
+  Query since session 5; 16d the edit **plus the `updated_at` repair** (its own
+  commit, first); 16e delete (`204`, no body); 16f the practice. **Reference 13** =
+  server state and the screen.
+- **Verify-first was applied to a whole series, not one lesson, and it caught a
+  real error.** An rsync'd copy of `kinlink/` in the scratchpad, dependencies
+  installed once, the lesson's verbatim code compiled (`tsc --noEmit`, both
+  programs, exit 0) **and run**: `check:people` exit 0; `build:client` 0, **70
+  modules**; `@tanstack/react-query` **5.104.2**. The typecheck failed first on
+  `req.params.personId` (`string | string[] | undefined` under Express 5) — the
+  existing `family.controller.ts` already narrows `membershipId` the same way, so
+  the lesson now copies that shape. **Written from memory, that error ships.**
+- **The HTTP boundary was walked, because a route that is not mounted fails
+  silently in the wrong content type** (lesson 13's finding). Probe server on
+  **port 4100** — the user's own API holds 4000, never kill it. Measured:
+  `201` create · `400` bad gender (`gender must be one of …`) · `200` list · `200`
+  patch · `404` unknown person · `401` unauthenticated **JSON** · `204` delete ·
+  `404` second delete.
+- **The `updated_at` repair is designed and probed, not guessed.** `@default(now())`
+  → `@updatedAt`; `prisma validate` valid; `migrate dev --create-only` planned
+  exactly `ALTER TABLE people ALTER COLUMN updated_at DROP DEFAULT;` —
+  metadata-only, no table rebuild. The "does dropping the default break inserts?"
+  fear is answered by the `users` table, which has had `@updatedAt` with no default
+  since lesson 04. **`migrate dev --create-only` is the honest probe for any schema
+  change** — it writes the migration file without applying it.
+- **Two design decisions the lessons argue rather than assume.** (1) A people
+  write's authorisation is `loadFamily`'s membership proof; `requireRole("member")`
+  would be a check that can never fail, so it is deliberately absent. (2)
+  `updateMany`, not `update`, because Prisma's `update` needs a unique `where` and
+  so cannot also filter on `familyId`; the returned `count` is the "not yours"
+  signal.
+- **New open decisions, all raised in the lessons and none implemented:** who may
+  write people (default any member; delete could be admin-only); hard delete vs
+  soft delete (relationships will force it); should `ApiError` carry the server's
+  prose; should `useSession` migrate to TanStack Query once login/logout are
+  mutations. **Zod gets a named trigger** — a third resource needing shape
+  validation.
+- **Probe hygiene held:** the user's `kinlink/` tree is unchanged by this session
+  (its five modified files are lesson 14's, already applied and uncommitted); the
+  probe server was killed, port 4100 closed, and the probe rows created by the
+  smoke test were deleted from the dev database.
+
 ## Open questions
 
 - Deployment target (Fly.io / Railway / VPS). Needed before week 8.
@@ -418,13 +470,37 @@ Working notes and preferences. Not a lesson — a scratchpad for me (the teacher
   notifier; `request()` announces on a `401` unless the caller says it is a sign-in; `useSession`
   subscribes. Proof: `npm run check:session`.
 - **`AcceptPage.tsx` bypasses `lib/api.ts`** and calls `fetch` directly, so it is outside the
-  announce and outside the envelope. Route it through a named transport function.
+  announce and outside the envelope. Route it through a named transport function. `InviteDialog.tsx`
+  also uses raw `fetch`, but is dead and targets a nonexistent mint route; delete or rebuild it
+  when the mint UI arrives. The transport audit should leave `lib/api.ts` as the only live fetch.
 - ~~Should `PersonResource` keep `familyId`?~~ — **removed (session 13)** from the contract and
   the view; `grep -rn familyId client/src` had already proven nothing consumed it. Now both
   resources drop the family id. Apply the same test to `InvitationResource` and any new one.
-- **Resend / revoke are designed but unbuilt** (session 13, Reference 12 §5): mint + revoke in
-  one transaction, `revokedAt` as its own column, role re-read inside the lock, no auto-retry.
-  Scheduled as lesson 15, together with the mint UI and the missing `check:mint`.
+- **Invitation lifecycle is one lesson series (15a–15e, practice 15f), not one lesson.** The
+  series shape is the standing pattern: builds lettered `a`, `b`, `c`… and **one** practice file
+  as the last file of the series (cf. 13a–d → 13e-practice, 14a–c → 14d-practice). A practice is
+  never created mid-series.
+  - **15a** — restore the mint invariant (family lock, membership re-read, pending-email
+    refusal) and `check:mint`.
+  - **15b** — `revokedAt` as a nullable column; move *both* "pending" definitions (list and
+    accept claim) together.
+  - **15c** — revoke and resend (mint-new-kill-old in one transaction behind `lockFamily`).
+  - **15d** — `AcceptPage` onto the transport with the 401/403/409 split.
+  - **15e** — the mint UI replacing the dead `InviteDialog`; fixes the routes that skipped the
+    `{ data }` envelope.
+  - **15f** — the series practice.
+  These are lesson plans, not shipped code. No notes may describe any of this as implemented until
+  its code and runnable proof have been verified against the tree.
+- **People CRUD is the next series (16a–16e, practice 16f), authored and verified (session 15).**
+  16a write through every layer + `check:people`; 16b the screen on TanStack Query; 16c the mutation
+  that invalidates (the trigger the notes have carried since session 5, now fired); 16d edit +
+  the `updated_at` repair; 16e delete. **Verify-first was actually done this time** — the series'
+  verbatim code was compiled and run in an rsync'd copy, `check:people` exit 0, `build:client` 70
+  modules, and the HTTP boundary walked on port 4100 (`201/400/200/200/404/401/204/404`). It is
+  authored-but-unapplied: the tree is still at lesson 14. Reference 13 is its companion.
+- **Root cause of the false `check:mint` claim:** the earlier plan and intended probe were recorded
+  in past tense without being reproduced against the live tree. This is a verification/process
+  debt, not a typo; code notes must distinguish proposed, implemented, and actually verified.
 
 ## Facts about this machine (checked in session 3)
 
@@ -490,6 +566,11 @@ Working notes and preferences. Not a lesson — a scratchpad for me (the teacher
   (`--name fix_person_updated_at`); a migration should do one thing. **Still open at
   session 7** — the schema was touched again (`family_members`) and it was correctly *not*
   folded in, but it is now the oldest known defect.
+  → **Addressed by lesson 16d (session 15), not yet applied.** The repair is
+  `@default(now())` → `@updatedAt` as its own commit; probed: `prisma validate` valid and
+  `migrate dev --create-only` plans exactly `ALTER TABLE people ALTER COLUMN updated_at
+  DROP DEFAULT;` (metadata-only). Safe because Prisma stamps `@updatedAt` client-side on
+  create — the `users` table has proved that since lesson 04.
 - **First-attempt mistake worth remembering (it cost a round trip):** the declaration file
   was created at `server/types/express.d.ts` — one level above `server/src` — so it fell
   outside `tsconfig.json`'s `include: ["server/src", "shared"]`. TypeScript silently

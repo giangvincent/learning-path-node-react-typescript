@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Reference 13 — Server state and the screen</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="lesson-header">
+        <p class="eyebrow">Reference 13 · a write, a cache, and who owns the truth</p>
+        <h1>Server state and the screen</h1>
+        <p class="lede">
+          Lessons 16a–16e added the first full CRUD to KinLink: four verbs for
+          people, a screen that shows them, and a cache that keeps up with writes.
+          This is the compressed version — the path a write takes, the shape it
+          sends and returns, and the rule that decides when a client caches
+          anything at all.
+        </p>
+        <div class="meta-row">
+          <span>Used by: <a href="../lessons/0016a-a-write-through-every-layer.html">Lesson 16a–16f</a></span>
+          <span>Companions: <a href="0002-express-mvc.html">Reference 02</a> (layers) · <a href="0004-ids-and-tenancy.html">04</a> (tenancy) · <a href="0012-map-of-kinlink.html">12</a> (the map)</span>
+          <span>Vocabulary: <a href="../GLOSSARY.md">GLOSSARY.md</a></span>
+        </div>
+      </header>
+
+      <h2>1. A write through every layer</h2>
+
+      <p>
+        A read and a write travel the same six layers. What changes is who decides
+        the <em>scope</em> and who decides the <em>outcome</em>.
+      </p>
+
+      <pre><code>POST /api/families/nguyen/people   {"name":"Nguyễn Văn A","gender":"male"}
+  ▼
+routes/index       /families/:slug  →  loadFamily (proves membership, else 404)
+routes/family      /people          →  createFamilyPerson
+  ▼
+controller         parseCreate(req.body)      -- untrusted → typed, or 400
+                   familyContext(req)         -- the family, already proven
+                   addPerson(family.id, input)
+                   res.status(201).json({ data: toPersonResource(person) })
+  ▼
+service            addPerson: wire dates → Date; no HTTP in sight
+  ▼
+model              create(familyId, …)  -- familyId is a required argument
+  ▼
+MySQL
+  ▲
+view               toPersonResource: row → { id, name, living }, a whitelist
+  ▲
+response           { "data": { "id": "…", "name": "Nguyễn Văn A", "living": true } }</code></pre>
+
+      <div class="callout">
+        <span class="callout-title">The one line that matters</span>
+        <p>
+          <code>familyId</code> comes from <code>familyContext(req)</code> — a fact
+          the middleware <em>proved</em> — and never from the body. The contract
+          has no field for it, so a client cannot even ask to write into another
+          family. The type makes the bug unrepresentable, which is stronger than
+          any check.
+        </p>
+      </div>
+
+      <h2>2. The shapes on the wire</h2>
+
+      <table>
+        <thead><tr><th>Type</th><th>Fields</th><th>Rule it encodes</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><code>CreatePersonRequest</code></td>
+            <td><code>name</code>, <code>gender</code>, optional <code>birthDate</code> / <code>deathDate</code></td>
+            <td>Everything a client may set — and no <code>id</code>, no <code>familyId</code>.</td>
+          </tr>
+          <tr>
+            <td><code>UpdatePersonRequest</code></td>
+            <td><code>Partial&lt;CreatePersonRequest&gt;</code></td>
+            <td>An edit sends only what changed. <code>undefined</code> means "leave it"; <code>null</code> means "clear it".</td>
+          </tr>
+          <tr>
+            <td><code>PersonResource</code></td>
+            <td><code>id</code>, <code>name</code>, <code>living</code></td>
+            <td>What a client may <em>see</em>. <code>living</code> is derived (<code>deathDate === null</code>); gender and dates are withheld until a screen needs them.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p>
+        The resource intentionally carries no <code>familyId</code> — the same rule
+        <code>FamilyResource</code> follows since lesson 13. A client should never
+        hold an id it cannot safely hand back to a route that might trust it.
+      </p>
+
+      <h2>3. The four verbs, and what each answers</h2>
+
+      <table>
+        <thead><tr><th>Verb</th><th>Route</th><th>Success</th><th>Refusals</th></tr></thead>
+        <tbody>
+          <tr><td><code>GET</code></td><td><code>/families/:slug/people</code></td><td><code>200 { data: [...] }</code></td><td><code>401</code> no session · <code>404</code> not a member</td></tr>
+          <tr><td><code>POST</code></td><td><code>/families/:slug/people</code></td><td><code>201 { data: {...} }</code></td><td><code>400</code> bad shape · <code>404</code> not a member</td></tr>
+          <tr><td><code>PATCH</code></td><td><code>/families/:slug/people/:personId</code></td><td><code>200 { data: {...} }</code></td><td><code>400</code> bad shape · <code>404</code> not this family's person</td></tr>
+          <tr><td><code>DELETE</code></td><td><code>/families/:slug/people/:personId</code></td><td><code>204</code> (no body)</td><td><code>404</code> not this family's person</td></tr>
+        </tbody>
+      </table>
+
+      <div class="callout warn">
+        <span class="callout-title">404 covers two facts, on purpose</span>
+        <p>
+          "No such person" and "not a person in <em>your</em> family" answer
+          identically, because a 403 would confirm the row exists. The server may
+          still tell them apart in its logs; the wire must not. This is the same
+          collapse lesson 06 chose for families, applied to a child resource.
+        </p>
+      </div>
+
+      <h2>4. Validation belongs at the boundary</h2>
+
+      <p>
+        A request body is untrusted input from outside the program. It becomes a
+        typed value in the <strong>controller</strong> — above the service call, so
+        a malformed body never reaches the database and never becomes a
+        <code>500</code>.
+      </p>
+
+      <ul>
+        <li><code>name</code> — a non-empty string, trimmed, at most 200 characters.</li>
+        <li><code>gender</code> — one of <code>male · female · other · unknown</code> (the Prisma enum).</li>
+        <li><code>birthDate</code> / <code>deathDate</code> — an ISO-parseable string, or <code>null</code>/<code>""</code> for "no date".</li>
+      </ul>
+
+      <p>
+        Two rules are worth internalising. First, a <em>partial</em> edit validates
+        only the fields that are <strong>present</strong> — an absent field is not a
+        wrong field. Second, the conversion from the wire's
+        <code>"YYYY-MM-DD"</code> string to a <code>Date</code> happens in the
+        <strong>service</strong>: the model should not know about JSON, and the
+        controller owns HTTP, not domain shape.
+      </p>
+
+      <p>
+        This is hand-rolled for exactly two shapes. <strong>The trigger to adopt a
+        schema validator (<a href="https://zod.dev/">Zod</a>) is a third
+        resource</strong> needing the same treatment — then it becomes one parser
+        per resource at the boundary, not one per handler.
+      </p>
+
+      <h2>5. Server state is not client state</h2>
+
+      <p>
+        The single question that decides where data lives: <em>who owns the
+        truth?</em> The people in a family live on the server. The client holds a
+        <strong>cache</strong> of them — a copy with an expiry, not an owner.
+      </p>
+
+      <table>
+        <thead><tr><th></th><th>Server state</th><th>Client state</th></tr></thead>
+        <tbody>
+          <tr><td>Owner</td><td>The database</td><td>This browser, this session</td></tr>
+          <tr><td>Examples</td><td>people, families, invitations, the session</td><td>tree layout, current selection, form inputs, the edit toggle</td></tr>
+          <tr><td>Can be stale?</td><td>Yes — that is the defining problem</td><td>No; the client just changed it</td></tr>
+          <tr><td>Tool</td><td>TanStack Query (a keyed cache + invalidation)</td><td><code>useState</code>, or a store once it is shared and complex</td></tr>
+        </tbody>
+      </table>
+
+      <div class="callout">
+        <span class="callout-title">The rule that decides when TanStack Query earns its keep</span>
+        <p>
+          <strong>Adopt it on the first screen where a mutation must invalidate a
+          read.</strong> Before that, a cache is a store whose most valuable feature
+          has nothing to invalidate. KinLink's read-only screens (session,
+          families, invitations) still fetch by hand for exactly this reason — and
+          that is a decision with a trigger, not a deferral.
+        </p>
+      </div>
+
+      <h2>6. The cache model, in four lines</h2>
+
+      <ul>
+        <li><strong>Key</strong> — <code>peopleKey(slug) = ["people", slug]</code>. A key is a <em>name two components must spell the same way</em>, which is why it is exported, not written inline.</li>
+        <li><strong>Query</strong> — <code>useQuery({ queryKey, queryFn })</code> gives you <code>isPending</code>, <code>isError</code> and <code>data</code>, so no screen re-implements those three states and gets them subtly wrong.</li>
+        <li><strong>Mutation</strong> — <code>useMutation({ mutationFn, onSuccess })</code> runs the write. It takes no key; only reads are keyed.</li>
+        <li><strong>Invalidation</strong> — <code>invalidateQueries({ queryKey })</code> marks matching keys stale and refetches the active ones. One create, edit and delete all end here, because all three change what the read would return.</li>
+      </ul>
+
+      <div class="callout win">
+        <span class="callout-title">The shortest version of the whole series</span>
+        <p>
+          A write does not put the new row in the list. It tells the cache
+          <em>this data is stale</em> and lets every reader re-fetch. Copying the
+          row by hand is correct for one screen and lies to every other —
+          the second tab, the tree, the person's own page.
+        </p>
+      </div>
+
+      <h2>7. Invariants, and where each is enforced</h2>
+
+      <table>
+        <thead><tr><th>Invariant</th><th>Enforced in</th><th>Proof</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>every family read is scoped to the caller</td>
+            <td><code>personModel.findByFamily(familyId)</code> — a required argument</td>
+            <td><code>npm run check:people</code></td>
+          </tr>
+          <tr>
+            <td>every family write is scoped to the caller</td>
+            <td><code>personModel.update</code> / <code>remove</code> — <code>where: { id, familyId }</code></td>
+            <td><code>npm run check:people</code></td>
+          </tr>
+          <tr>
+            <td>the family id never crosses the view</td>
+            <td><code>toPersonResource</code> — an annotated return type the compiler checks</td>
+            <td><code>check:people</code> asserts no <code>familyId</code> in the resource</td>
+          </tr>
+          <tr>
+            <td>a person's <code>updated_at</code> reflects the last write</td>
+            <td><code>@updatedAt</code> in <code>schema.prisma</code> (client-side stamping)</td>
+            <td>none — a known gap; no check compares two columns</td>
+          </tr>
+          <tr>
+            <td>the client's list agrees with the server after a write</td>
+            <td><code>invalidateQueries(peopleKey)</code> in every mutation's <code>onSuccess</code></td>
+            <td>none — a browser behaviour; verified by hand in 16c–16e</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p>
+        Two rows have no runnable proof. That is stated rather than hidden: an
+        invariant with no proof is a belief, and lesson 13's whole finding was a
+        belief that had been filed as a fact.
+      </p>
+
+      <h2>8. "Which file do I touch?" — the people feature</h2>
+
+      <table>
+        <thead><tr><th>I want to…</th><th>Files, in order</th></tr></thead>
+        <tbody>
+          <tr><td>expose a new person field</td><td><code>shared/contracts/person.ts</code> → <code>server/src/views/person.view.ts</code> → the model query if the column is not loaded → <code>client/src/contracts.ts</code></td></tr>
+          <tr><td>add a rule to creating a person</td><td><code>server/src/services/people.service.ts</code>; if it needs an atomic check, <code>models/</code> + <code>transact</code></td></tr>
+          <tr><td>change what a bad body answers</td><td><code>server/src/controllers/people.controller.ts</code> (the <code>parse*</code> helpers)</td></tr>
+          <tr><td>add a person action to the screen</td><td><code>client/src/PeoplePage.tsx</code> + a named function in <code>client/src/lib/api.ts</code></td></tr>
+          <tr><td>make a write refresh the list</td><td>the mutation's <code>onSuccess</code>: <code>invalidateQueries({ queryKey: peopleKey(slug) })</code></td></tr>
+          <tr><td>prove scoping still holds</td><td><code>server/src/scripts/checkPeople.ts</code></td></tr>
+        </tbody>
+      </table>
+
+      <h2>9. Primary sources</h2>
+
+      <div class="callout win">
+        <span class="callout-title">All trusted, all read against the code</span>
+        <p>
+          <a href="https://www.prisma.io/docs/orm/prisma-client/queries/crud">Prisma Client — CRUD</a>
+          (<code>create</code>, <code>updateMany</code>, the unique-<code>where</code> rule) ·
+          <a href="https://tanstack.com/query/latest/docs/framework/react/overview">TanStack Query — Overview</a>
+          (keys, states, the cache) ·
+          <a href="https://tanstack.com/query/latest/docs/framework/react/guides/mutations">Mutations</a> and
+          <a href="https://tanstack.com/query/latest/docs/framework/react/guides/query-invalidation">Query Invalidation</a>
+          (the three lines the whole series turns on) ·
+          <a href="https://react.dev/learn/you-might-not-need-an-effect">react.dev — You Might Not Need an Effect</a>
+          (why the hand-rolled fetch was the wrong shape) ·
+          <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-204-no-content">RFC 9110 §15.3.5</a>
+          (204, and why the transport must return before <code>json()</code>) ·
+          <a href="../reference/0002-express-mvc.html">Reference 02</a> and
+          <a href="../reference/0004-ids-and-tenancy.html">Reference 04</a> for the layer
+          vocabulary and the tenancy law this feature obeys.
+        </p>
+      </div>
+
+      <footer class="lesson-footer">
+        <p>
+          If any table here has drifted from the code, the table is wrong — correct
+          it the moment you notice. This document is the one you reopen; it must
+          not become a second place the truth lives.
+        </p>
+      </footer>
+    </div>
+  </body>
+</html>

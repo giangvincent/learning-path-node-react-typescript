@@ -1,0 +1,514 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lesson 15a — The invariant the notes claimed</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="lesson-header">
+        <p class="eyebrow">Lesson 15a · Week 4–5 · ≈ one session · one new thing</p>
+        <h1>The invariant the notes claimed</h1>
+        <p class="lede">
+          The notes say two invitations for the same email cannot be pending at
+          once. The code says otherwise. Today, make that sentence true under
+          concurrent requests, then make the database prove it on demand.
+        </p>
+        <div class="meta-row">
+          <span>Mission: ship KinLink</span>
+          <span>Requires: <a href="0014d-practice.html">Lesson 14d</a></span>
+          <span>References: <a href="../reference/0008-races-locks-and-refusals.html">08</a> · <a href="../reference/0009-invitation-protocol.html">09</a> · <a href="../reference/0012-map-of-kinlink.html">12</a></span>
+          <span>Practice: <a href="0015f-practice.html">Lesson 15f</a></span>
+        </div>
+      </header>
+
+      <div class="callout win">
+        <span class="callout-title">The win</span>
+        <p>
+          An owner cannot create a second active invitation for the same
+          database-equal non-null email in one family, even when two requests
+          collide. The mint rule is
+          enforced inside the transaction, after a family lock and a fresh role
+          read; <code>npm run check:mint</code> forces and checks that race.
+        </p>
+      </div>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Warm-up: retrieve before rereading</h2>
+      <p>
+        Five minutes, from memory. In what order does the ownership service take
+        the lock, read the fact, decide, and write? What does its check assert
+        while the second transaction waits? Compare with
+        <a href="../reference/0008-races-locks-and-refusals.html">Reference 08</a>
+        only after you have answered.
+      </p>
+
+      <h2>Build it</h2>
+      <ol class="steps">
+        <li>
+          <h3>Verify the baseline before editing</h3>
+          <p>These are measured on the current tree. The claimed mint check is absent.</p>
+          <pre><code>npm run typecheck          # exit 0
+npm run check:invites      # 2 rows; pending filter and view mapping held
+npm run check:ownership    # 1 refusal; 1 owner remains</code></pre>
+          <p>
+            In <code>package.json</code>, confirm there is no
+            <code>check:mint</code> script. That absence is the bug report: this
+            lesson must add both the invariant and the evidence for it.
+          </p>
+        </li>
+
+        <li>
+          <h3>State exactly what “one per email” means</h3>
+          <p>
+            For this build, the rule is: <strong>within one family, at most one
+            unexpired, unclaimed invitation with the same non-null email value.</strong>
+            A shareable invitation (<code>email: null</code>) has no recipient to
+            deduplicate. “Pending” currently means <code>usedAt: null</code> and
+            <code>expiresAt &gt; now</code>; revocation is not in this sitting.
+          </p>
+          <p>
+            The lookup uses the database's email comparison rules; this lesson
+            adds no case-folding or whitespace normalization. Decide canonical
+            email handling at the request boundary in a separate change, rather
+            than implying this query normalizes addresses.
+          </p>
+        </li>
+
+        <li>
+          <h3>Keep database operations in the model</h3>
+          <p>
+            The current mint calls Prisma from the service. While changing its
+            transaction boundary, move the create and pending-email lookup into
+            <code>invitation.model.ts</code>; the service coordinates policy, and
+            the model owns queries. Add these functions:
+          </p>
+          <div class="file">
+            <span class="file-path">server/src/models/invitation.model.ts (additions)</span>
+            <pre><code>export async function findPendingByEmail(
+  familyId: string,
+  email: string,
+  database: Db = prisma,
+): Promise&lt;Invitation | null&gt; {
+  return database.invitation.findFirst({
+    where: { familyId, email, usedAt: null, expiresAt: { gt: new Date() } },
+  });
+}
+
+export async function createInvitation(
+  input: {
+    familyId: string;
+    role: Role;
+    email: string | null;
+    tokenHash: string;
+    expiresAt: Date;
+    createdBy: string;
+  },
+  database: Db = prisma,
+): Promise&lt;void&gt; {
+  await database.invitation.create({ data: input });
+}</code></pre>
+          </div>
+          <p>
+            Add <code>import type { Role } from "./membership.model.js";</code>
+            to this model's imports. Use the existing <code>Db</code> type so
+            both functions can join the service's transaction. The existing list
+            function stays the single definition of the family-wide pending list.
+          </p>
+        </li>
+
+        <li>
+          <h3>Make mint one serialized decision</h3>
+          <p>
+            The route's owner check is necessary, but it ran before this write.
+            An owner can be demoted after the request passes that middleware.
+            Re-read the membership inside the lock, then check for a pending
+            duplicate, then insert — all in one transaction. Update
+            <code>createInvitation</code> in the service to this shape:
+          </p>
+          <div class="file">
+            <span class="file-path">server/src/services/invitation.service.ts (mint changes)</span>
+            <pre><code>import * as membershipModel from "../models/membership.model.js";
+
+export type CreateInvitationResult =
+  | { ok: true; token: string }
+  | {
+      ok: false;
+      reason: "not-owner" | "insufficient-role" | "duplicate-email";
+    };
+
+export interface MintWindow {
+  afterDuplicateCheck?: () =&gt; Promise&lt;void&gt;;
+}
+
+export async function createInvitation(
+  input: {
+    familyId: string;
+    inviterMembershipId: string;
+    role: Role;
+    email?: string | null;
+  },
+  window: MintWindow = {},
+): Promise&lt;CreateInvitationResult&gt; {
+  if (!ROLES.includes(input.role)) throw new Error("Invalid role");
+
+  return transact(async (tx) =&gt; {
+    await membershipModel.lockFamily(input.familyId, tx);
+
+    const inviter = await membershipModel.findByFamily(
+      input.familyId,
+      input.inviterMembershipId,
+      tx,
+    );
+    if (!inviter || inviter.role !== "owner") {
+      return { ok: false, reason: "not-owner" };
+    }
+    if (RANK[input.role] &gt; RANK[inviter.role]) {
+      return { ok: false, reason: "insufficient-role" };
+    }
+
+    const email = input.email ?? null;
+    if (
+      email !== null &amp;&amp;
+      (await invitationModel.findPendingByEmail(input.familyId, email, tx))
+    ) {
+      return { ok: false, reason: "duplicate-email" };
+    }
+    await window.afterDuplicateCheck?.();
+
+    const token = randomBytes(32).toString("base64url");
+    await invitationModel.createInvitation(
+      {
+        familyId: input.familyId,
+        role: input.role,
+        email,
+        tokenHash: hashToken(token),
+        expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+        createdBy: inviter.userId,
+      },
+      tx,
+    );
+    return { ok: true, token };
+  });
+}</code></pre>
+          </div>
+          <p>
+            Keep <code>InvitationResult</code> for acceptance; mint has a
+            different result type. Add the membership-model namespace import and
+            remove the service's direct <code>prisma</code> import. Keep
+            <code>randomBytes</code>, <code>createHash</code>,
+            <code>hashToken</code>, <code>RANK</code>, <code>ROLES</code>, and
+            <code>transact</code>. The membership id and creator id now come
+            from the proven family context and locked database read — not a stale
+            role snapshot or caller-supplied user id.
+          </p>
+          <div class="callout warn">
+            <span class="callout-title">Why the hook is here</span>
+            <p>
+              <code>afterDuplicateCheck</code> is an inert-by-default seam. The
+              check parks the first transaction after its read, then proves the
+              second cannot reach the same point while the lock is held. Without
+              the hook, a race test would hope the scheduler hits the vulnerable
+              gap; with it, the check chooses the interleaving.
+            </p>
+          </div>
+        </li>
+
+        <li>
+          <h3>Pass the membership and render each refusal honestly</h3>
+          <p>
+            In <code>invitation.routes.ts</code>, destructure
+            <code>{ family, membership }</code> from
+            <code>familyContext(req)</code>. Remove the old
+            <code>Insufficient role</code> catch branch: role refusals are now
+            values returned by the service. Keep the outer <code>try/catch</code>
+            that forwards unexpected failures to <code>next(e)</code>. Handle
+            the result before sending success:
+          </p>
+          <div class="file">
+            <span class="file-path">server/src/routes/invitation.routes.ts (inside POST handler)</span>
+            <pre><code>const { family, membership } = familyContext(req);
+const { email, role } = req.body as { email?: string; role?: string };
+if (role !== "member" &amp;&amp; role !== "admin") {
+  res.status(400).json({ message: "role must be 'member' or 'admin'" });
+  return;
+}
+
+const result = await createInvitation({
+  familyId: family.id,
+  inviterMembershipId: membership.id,
+  role,
+  email: email ?? null,
+});
+
+if (!result.ok) {
+  const status = result.reason === "duplicate-email" ? 409 : 403;
+  const message =
+    result.reason === "duplicate-email"
+      ? "A pending invitation already exists for this email"
+      : "Insufficient role";
+  res.status(status).json({ message });
+  return;
+}
+
+res.status(201).json({ token: result.token });</code></pre>
+          </div>
+          <p>
+            <code>409</code> means “not in this state yet”: the existing invite
+            must be accepted, expire, or be revoked before another is minted.
+            <code>403</code> means the caller is authenticated but no longer has
+            mint authority. The client can distinguish them using
+            <code>ApiError.status</code>; neither is a session-ending
+            <code>401</code>.
+          </p>
+        </li>
+
+        <li>
+          <h3>Restore the proof: force the collision</h3>
+          <p>
+            Add this complete <code>server/src/scripts/checkMint.ts</code>. It
+            uses the same gate technique as <code>checkOwnership.ts</code>: the
+            first mint parks after finding no duplicate, and the second must
+            remain blocked before it can make that same observation.
+          </p>
+          <div class="file">
+            <span class="file-path">server/src/scripts/checkMint.ts (new)</span>
+            <pre><code>import "dotenv/config";
+import { randomUUID } from "node:crypto";
+import { prisma } from "../config/database.js";
+import { createInvitation } from "../services/invitation.service.js";
+
+function gate(): {
+  afterDuplicateCheck: () =&gt; Promise&lt;void&gt;;
+  arrived: Promise&lt;void&gt;;
+  open: () =&gt; void;
+} {
+  let arrive!: () =&gt; void;
+  let open!: () =&gt; void;
+  const arrived = new Promise&lt;void&gt;((resolve) =&gt; (arrive = resolve));
+  const opened = new Promise&lt;void&gt;((resolve) =&gt; (open = resolve));
+  return {
+    afterDuplicateCheck: async () =&gt; {
+      arrive();
+      await opened;
+    },
+    arrived,
+    open: () =&gt; open(),
+  };
+}
+
+async function main(): Promise&lt;void&gt; {
+  const slug = `mint-${randomUUID().slice(0, 8)}`;
+  const email = `${slug}@probe.invalid`;
+  const family = await prisma.family.create({
+    data: { slug, name: "Mint probe" },
+  });
+  const user = await prisma.user.create({
+    data: { email, passwordHash: "probe" },
+  });
+
+  try {
+    const membership = await prisma.familyMember.create({
+      data: { userId: user.id, familyId: family.id, role: "owner" },
+    });
+    const firstGate = gate();
+    const secondGate = gate();
+    const input = {
+      familyId: family.id,
+      inviterMembershipId: membership.id,
+      role: "member" as const,
+      email: "same@probe.invalid",
+    };
+
+    const first = createInvitation(input, {
+      afterDuplicateCheck: firstGate.afterDuplicateCheck,
+    });
+    await firstGate.arrived;
+
+    const second = createInvitation(input, {
+      afterDuplicateCheck: secondGate.afterDuplicateCheck,
+    });
+    let timer: ReturnType&lt;typeof setTimeout&gt;;
+    const secondReachedCheck = await Promise.race([
+      secondGate.arrived.then(() =&gt; true),
+      new Promise&lt;boolean&gt;((resolve) =&gt; {
+        timer = setTimeout(() =&gt; resolve(false), 400);
+      }),
+    ]);
+    clearTimeout(timer!);
+
+    firstGate.open();
+    secondGate.open();
+    const results = await Promise.all([first, second]);
+    const pending = await prisma.invitation.count({
+      where: {
+        familyId: family.id,
+        email: input.email,
+        usedAt: null,
+        expiresAt: { gt: new Date() },
+      },
+    });
+    const successes = results.filter((result) =&gt; result.ok).length;
+    const duplicates = results.filter(
+      (result) =&gt; !result.ok &amp;&amp; result.reason === "duplicate-email",
+    ).length;
+
+    console.log(`second reached check while locked: ${secondReachedCheck}`);
+    console.log(`successful mints: ${successes}`);
+    console.log(`duplicate refusals: ${duplicates}`);
+    console.log(`pending matching rows: ${pending}`);
+
+    if (secondReachedCheck) {
+      throw new Error("RACE NOT SERIALIZED: second mint passed the family lock");
+    }
+    if (successes !== 1 || duplicates !== 1 || pending !== 1) {
+      throw new Error(
+        `INVARIANT BROKEN: successes=${successes}, duplicates=${duplicates}, rows=${pending}`,
+      );
+    }
+
+    await prisma.familyMember.update({
+      where: { id: membership.id },
+      data: { role: "member" },
+    });
+    const demoted = await createInvitation({
+      ...input,
+      email: "after-demotion@probe.invalid",
+    });
+    if (demoted.ok || demoted.reason !== "not-owner") {
+      throw new Error("STALE AUTHORITY: demoted inviter minted an invitation");
+    }
+
+    console.log("\nmint invariant held; demoted inviter refused");
+  } finally {
+    await prisma.family.delete({ where: { id: family.id } });
+    await prisma.user.delete({ where: { id: user.id } });
+    await prisma.$disconnect();
+  }
+}
+
+main().catch((error: unknown) =&gt; {
+  console.error(error);
+  process.exitCode = 1;
+});</code></pre>
+          </div>
+          <p>
+            Add <code>"check:mint": "tsx server/src/scripts/checkMint.ts"</code>
+            to the root manifest. This asserts both the forced race and the
+            transaction's fresh authority check; fixture cleanup runs even when
+            an assertion fails.
+          </p>
+        </li>
+      </ol>
+
+      <h2>Verify after</h2>
+      <p>
+        The figures below are <strong>expected, not pre-measured</strong>;
+        record the actual output in your session log after running the code.
+      </p>
+      <pre><code>npm run typecheck          # expected: exit 0
+npm run check:invites      # expected: existing list proof still passes
+npm run check:ownership    # expected: 1 refusal; 1 owner remains
+npm run check:mint         # expected: one success, one refusal, one row;
+                           # demoted inviter refused inside the lock</code></pre>
+      <p>
+        Break it once: comment out the <code>lockFamily</code> call, run
+        <code>check:mint</code>, and predict first. The second gate should be
+        reached; after both are released, two creates can succeed and the check
+        must exit non-zero. Restore the lock, rerun, and keep the green result.
+      </p>
+
+      <div class="callout">
+        <span class="callout-title">The notes were not wrong because of a typo</span>
+        <p>
+          They described a transaction, lock, duplicate refusal, and check as
+          finished facts. The service had none of them and the manifest had no
+          <code>check:mint</code>. A design recorded in past tense is still only
+          a design until its code exists and its proof runs. The debt was the
+          missing invariant and the missing evidence; this build closes both.
+        </p>
+      </div>
+
+      <h2>Decisions carried into the next sittings</h2>
+      <ul>
+        <li>
+          <strong><code>revokedAt</code> comes first.</strong> Give the nullable
+          column its own migration before writing resend; existing rows truthfully
+          remain <code>NULL</code>. Resend later updates the one pending
+          definition to also require <code>revokedAt: null</code>.
+        </li>
+        <li>
+          <strong><code>AcceptPage</code> should use a named function in
+          <code>lib/api.ts</code>.</strong> It is the only live component that
+          bypasses the transport. <code>InviteDialog</code> also calls
+          <code>fetch</code>, but it is dead and posts to a nonexistent mint
+          route; delete or rebuild it as the client work lands.
+        </li>
+        <li>
+          <strong>Do not collapse every “no” into the same UI state.</strong>
+          <code>401</code> means missing/invalid authentication; a
+          session-carrying request announces it app-wide, while login's
+          credential verdict and AcceptPage's sign-in requirement are local
+          exceptions. <code>403</code> means authenticated but not permitted;
+          keep the session and show a local permission response. The server's
+          intentional 404/409 collapses remain collapsed in the client.
+        </li>
+      </ul>
+
+      <h2>Primary sources</h2>
+      <div class="callout win">
+        <span class="callout-title">Read these against the code</span>
+        <p>
+          <a href="https://dev.mysql.com/doc/refman/8.0/en/innodb-locking-reads.html">MySQL 8.0 — Locking Reads</a>
+          for why <code>FOR UPDATE</code> must precede the reads the decision
+          depends on ·
+          <a href="https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html">OWASP — Authorization Cheat Sheet</a>
+          for checking permission on every request ·
+          <a href="../reference/0008-races-locks-and-refusals.html">Reference 08</a>
+          for the forced-interleaving technique ·
+          <a href="../reference/0012-map-of-kinlink.html">Reference 12</a>
+          for the rule that every invariant names its enforcement and proof.
+        </p>
+      </div>
+
+      <p>
+        If a snippet or check fails when you run it, stop there and bring me the
+        exact command and output. Ask follow-up questions wherever the lock,
+        result union, or proof feels unclear.
+      </p>
+
+      <h2>Log it</h2>
+      <ul>
+        <li>Minutes: _</li>
+        <li>One line — what fought back, or what you could not recall: _</li>
+        <li>Committed: <code>&lt;hash&gt;</code></li>
+      </ul>
+      <p>
+        Add it to this week's block in <a href="../PROGRESS.md">PROGRESS.md</a>.
+        Commit this sitting on its own; the next sitting starts from this green
+        invariant.
+      </p>
+
+      <footer class="lesson-footer">
+        <p class="next-up">
+          <strong>Next:</strong> Lesson 15b — add <code>revokedAt</code> in its
+          own migration, then update the one pending definition. Resend comes
+          only after that schema contract exists.
+        </p>
+        <p>
+          <a href="../MISSION.md">MISSION.md</a> ·
+          <a href="../ROADMAP.md">ROADMAP.md</a> ·
+          <a href="../GLOSSARY.md">GLOSSARY.md</a> ·
+          <a href="0015f-practice.html">Lesson 15f</a> ·
+          <a href="0014d-practice.html">Lesson 14d</a> ·
+          <a href="../reference/0009-invitation-protocol.html">Reference 09</a> ·
+          <a href="../reference/0012-map-of-kinlink.html">Reference 12</a>
+        </p>
+      </footer>
+    </div>
+    <script src="../assets/quiz.js"></script>
+  </body>
+</html>

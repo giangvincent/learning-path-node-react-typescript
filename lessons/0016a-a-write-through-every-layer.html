@@ -1,0 +1,741 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lesson 16a — A write through every layer</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="lesson-header">
+        <p class="eyebrow">Lesson 16a · Week 4 · ≈ one session · one new thing</p>
+        <h1>A write through every layer</h1>
+        <p class="lede">
+          Every route in KinLink has been a read. Today the server writes a row
+          for the first time — and it does so through the same six layers the
+          reads use, with the same rule: the family comes from the proven
+          request context, never from the body.
+        </p>
+        <div class="meta-row">
+          <span>Mission: ship KinLink</span>
+          <span>Requires: <a href="0015f-practice.html">Lesson 15f</a></span>
+          <span>References: <a href="../reference/0002-express-mvc.html">02</a> · <a href="../reference/0004-ids-and-tenancy.html">04</a> · <a href="../reference/0012-map-of-kinlink.html">12</a> · <a href="../reference/0013-server-state-and-the-screen.html">13</a></span>
+          <span>Practice: <a href="0016f-practice.html">Lesson 16f</a></span>
+        </div>
+      </header>
+
+      <div class="callout win">
+        <span class="callout-title">The win</span>
+        <p>
+          <code>POST /api/families/:slug/people</code> creates a person in the
+          caller's family and answers <code>201</code> with the resource. A bad
+          body is a <code>400</code> with a sentence explaining it; a family the
+          caller does not belong to is a <code>404</code>; an unauthenticated
+          caller is a <code>401</code>. <code>npm run check:people</code> proves
+          the row lands in the right family and nowhere else.
+        </p>
+      </div>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Warm-up: retrieve before rereading</h2>
+      <p>
+        Five minutes, from memory. In the request path
+        <strong>route → middleware → controller → service → model → view</strong>,
+        which layer is allowed to import Prisma? Which layer decides the status
+        code? Which layer turns a database row into the JSON the client sees? Say
+        each answer out loud, then check against
+        <a href="../reference/0002-express-mvc.html">Reference 02</a>.
+      </p>
+
+      <h2>Build it</h2>
+      <ol class="steps">
+        <li>
+          <h3>Verify the baseline before editing</h3>
+          <p>
+            These two commands were run against the tree this lesson starts from.
+            The second one failing to match is the point: the write path does not
+            exist yet.
+          </p>
+          <pre><code>npm run typecheck                 # exit 0
+grep -n "check:people" package.json   # no match -- the proof is not there yet</code></pre>
+          <p>
+            <code>grep</code> exits <code>1</code> when it finds nothing, which is
+            the expected result here. Read that emptiness as the task: the read
+            path exists, and this lesson adds the write path beside it.
+          </p>
+        </li>
+
+        <li>
+          <h3>State the shape on both sides of the wire</h3>
+          <p>
+            The contract is the one file both programs compile against. Today it
+            grows two types: what a client may <em>send</em> to create a person,
+            and what a client may send to <em>edit</em> one. The second is the
+            first, all fields optional — an edit sends only what changed.
+          </p>
+          <div class="file">
+            <span class="file-path">shared/contracts/person.ts (additions)</span>
+            <pre><code>/** The body of a create: every field the client may set, and nothing else. */
+export interface CreatePersonRequest {
+  name: string;
+  gender: Gender;
+  birthDate?: string | null;
+  deathDate?: string | null;
+}
+
+/** A partial edit: send only the fields that changed. */
+export type UpdatePersonRequest = Partial&lt;CreatePersonRequest&gt;;</code></pre>
+          </div>
+          <p>
+            Note what is <strong>not</strong> here: no <code>familyId</code>, no
+            <code>id</code>. The client cannot ask for a person to live somewhere
+            else, because the type gives it no way to say so.
+          </p>
+          <p>
+            Add the two names to the server's window on the contract, so the
+            layers below can import them from one place:
+          </p>
+          <div class="file">
+            <span class="file-path">server/src/contracts.ts (the person line)</span>
+            <pre><code>export type {
+  CreatePersonRequest,
+  Gender,
+  PersonResource,
+  UpdatePersonRequest,
+} from "../../shared/contracts/person.js";</code></pre>
+          </div>
+        </li>
+
+        <li>
+          <h3>The model owns the query — and the scope</h3>
+          <p>
+            Three writes join <code>findByFamily</code>. Each takes
+            <code>familyId</code> as a required argument, and each takes a
+            <code>Db</code> so a service could compose them in one transaction.
+            The interesting one is <code>update</code>: a Prisma
+            <code>update</code> must name a <em>unique</em> row, so it cannot
+            filter on <code>familyId</code> at the same time. <code>updateMany</code>
+            can, and its <code>count</code> is how the caller learns a person was
+            <em>not</em> theirs.
+          </p>
+          <div class="file">
+            <span class="file-path">server/src/models/person.model.ts</span>
+            <pre><code>import { prisma } from "../config/database.js";
+import type { Db } from "./db.js";
+import type {
+  Gender,
+  Person as PrismaPerson,
+} from "../../generated/prisma/client.js";
+
+export type Person = PrismaPerson;
+
+/** The columns a create or an edit is allowed to set. */
+export interface PersonInput {
+  displayName: string;
+  gender: Gender;
+  birthDate?: Date | null;
+  deathDate?: Date | null;
+}
+
+// familyId is a required argument. There is no way to call this function
+// without saying whose rows you want, which is what makes the isolation bug
+// impossible to introduce by accident.
+export async function findByFamily(
+  familyId: string,
+  database: Db = prisma,
+): Promise&lt;Person[]&gt; {
+  return database.person.findMany({
+    where: { familyId },
+    orderBy: { createdAt: "asc" },
+  });
+}
+
+export async function create(
+  familyId: string,
+  input: PersonInput,
+  database: Db = prisma,
+): Promise&lt;Person&gt; {
+  return database.person.create({
+    data: {
+      familyId,
+      displayName: input.displayName,
+      gender: input.gender,
+      birthDate: input.birthDate ?? null,
+      deathDate: input.deathDate ?? null,
+    },
+  });
+}
+
+/**
+ * A scoped update. `updateMany` filters on BOTH id and familyId, so a person
+ * from another family matches no row -- and `count` is how the caller learns
+ * there was nothing to change, rather than a 500 from an unscoped `update`.
+ */
+export async function update(
+  id: string,
+  familyId: string,
+  patch: Partial&lt;PersonInput&gt;,
+  database: Db = prisma,
+): Promise&lt;Person | null&gt; {
+  const { count } = await database.person.updateMany({
+    where: { id, familyId },
+    data: patch,
+  });
+  if (count === 0) return null;
+  return database.person.findUnique({ where: { id } });
+}
+
+export async function remove(
+  id: string,
+  familyId: string,
+  database: Db = prisma,
+): Promise&lt;boolean&gt; {
+  const { count } = await database.person.deleteMany({ where: { id, familyId } });
+  return count &gt; 0;
+}</code></pre>
+          </div>
+        </li>
+
+        <li>
+          <h3>The service owns the rule — including the wire's dates</h3>
+          <p>
+            The database stores a <code>Date</code>; the wire carries a
+            <code>"YYYY-MM-DD"</code> string. Somebody has to translate, and it is
+            not the model (which should not know about JSON) and not the
+            controller (which owns HTTP, not domain shape). It is the service.
+          </p>
+          <div class="file">
+            <span class="file-path">server/src/services/people.service.ts</span>
+            <pre><code>import type { Gender } from "../contracts.js";
+import * as personModel from "../models/person.model.js";
+import type { Person, PersonInput } from "../models/person.model.js";
+
+/** Forward the call through to the model. The model enforces scoping. */
+export async function listPeople(familyId: string): Promise&lt;Person[]&gt; {
+  return personModel.findByFamily(familyId);
+}
+
+/** A create or an edit as the wire describes it: dates are ISO strings or null. */
+export interface NewPerson {
+  name: string;
+  gender: Gender;
+  birthDate?: string | null;
+  deathDate?: string | null;
+}
+
+export async function addPerson(
+  familyId: string,
+  input: NewPerson,
+): Promise&lt;Person&gt; {
+  return personModel.create(familyId, {
+    displayName: input.name,
+    gender: input.gender,
+    birthDate: toDate(input.birthDate),
+    deathDate: toDate(input.deathDate),
+  });
+}
+
+export async function editPerson(
+  familyId: string,
+  personId: string,
+  patch: Partial&lt;NewPerson&gt;,
+): Promise&lt;Person | null&gt; {
+  const changes: Partial&lt;PersonInput&gt; = {};
+  if (patch.name !== undefined) changes.displayName = patch.name;
+  if (patch.gender !== undefined) changes.gender = patch.gender;
+  // `!== undefined` and not truthiness: sending null is how a date is cleared.
+  if (patch.birthDate !== undefined) changes.birthDate = toDate(patch.birthDate);
+  if (patch.deathDate !== undefined) changes.deathDate = toDate(patch.deathDate);
+
+  return personModel.update(personId, familyId, changes);
+}
+
+export async function removePerson(
+  familyId: string,
+  personId: string,
+): Promise&lt;boolean&gt; {
+  return personModel.remove(personId, familyId);
+}
+
+/** An ISO date string from the wire as a `Date`, or null for "no date". */
+function toDate(value: string | null | undefined): Date | null {
+  return value == null || value === "" ? null : new Date(value);
+}</code></pre>
+          </div>
+        </li>
+
+        <li>
+          <h3>Validate at the boundary, then call exactly one service</h3>
+          <p>
+            A request body is untrusted input from outside the program. The
+            controller is where it stops being <code>unknown</code> and becomes a
+            typed request — so the validation lives here, above the call, and a
+            failure never reaches the database as a <code>500</code>.
+          </p>
+          <div class="file">
+            <span class="file-path">server/src/controllers/people.controller.ts (top of file)</span>
+            <pre><code>import type { NextFunction, Request, Response } from "express";
+import type {
+  ApiResponse,
+  CreatePersonRequest,
+  Gender,
+  PersonResource,
+  UpdatePersonRequest,
+} from "../contracts.js";
+import { familyContext } from "../middlewares/family.js";
+import {
+  addPerson,
+  editPerson,
+  listPeople,
+  removePerson,
+} from "../services/people.service.js";
+import { toPersonResource } from "../views/person.view.js";
+
+const GENDERS = ["male", "female", "other", "unknown"] as const;
+
+function isRecord(value: unknown): value is Record&lt;string, unknown&gt; {
+  return typeof value === "object" && value !== null;
+}
+
+function isGender(value: unknown): value is Gender {
+  return typeof value === "string" && (GENDERS as readonly string[]).includes(value);
+}
+
+/** A `YYYY-MM-DD` string, or a null/"" that means "no date". */
+function parseDate(
+  value: unknown,
+): { ok: true; value: string | null } | { ok: false } {
+  if (value === undefined || value === null || value === "") {
+    return { ok: true, value: null };
+  }
+  if (typeof value !== "string" || Number.isNaN(Date.parse(value))) {
+    return { ok: false };
+  }
+  return { ok: true, value };
+}
+
+/** Validate a create body, or name the first thing wrong with it. */
+function parseCreate(
+  body: unknown,
+): { input: CreatePersonRequest } | { error: string } {
+  if (!isRecord(body)) return { error: "Body must be a JSON object" };
+
+  const { name, gender } = body;
+  if (typeof name !== "string" || name.trim() === "" || name.trim().length &gt; 200) {
+    return { error: "name must be a non-empty string of at most 200 characters" };
+  }
+  if (!isGender(gender)) {
+    return { error: `gender must be one of ${GENDERS.join(", ")}` };
+  }
+  const birthDate = parseDate(body.birthDate);
+  const deathDate = parseDate(body.deathDate);
+  if (!birthDate.ok || !deathDate.ok) {
+    return { error: "birthDate and deathDate must be ISO dates or null" };
+  }
+  return {
+    input: {
+      name: name.trim(),
+      gender,
+      birthDate: birthDate.value,
+      deathDate: deathDate.value,
+    },
+  };
+}
+
+/** Validate a partial edit: only the fields present are checked. */
+function parseUpdate(
+  body: unknown,
+): { patch: UpdatePersonRequest } | { error: string } {
+  if (!isRecord(body)) return { error: "Body must be a JSON object" };
+
+  const patch: UpdatePersonRequest = {};
+  if (body.name !== undefined) {
+    if (
+      typeof body.name !== "string" ||
+      body.name.trim() === "" ||
+      body.name.trim().length &gt; 200
+    ) {
+      return { error: "name must be a non-empty string of at most 200 characters" };
+    }
+    patch.name = body.name.trim();
+  }
+  if (body.gender !== undefined) {
+    if (!isGender(body.gender)) {
+      return { error: `gender must be one of ${GENDERS.join(", ")}` };
+    }
+    patch.gender = body.gender;
+  }
+  for (const key of ["birthDate", "deathDate"] as const) {
+    const value = body[key];
+    if (value === undefined) continue;
+    const parsed = parseDate(value);
+    if (!parsed.ok) return { error: `${key} must be an ISO date or null` };
+    patch[key] = parsed.value;
+  }
+  if (Object.keys(patch).length === 0) {
+    return { error: "No editable fields were provided" };
+  }
+  return { patch };
+}</code></pre>
+          </div>
+          <p>
+            Then the handlers. Read the first one as the rule for the other two:
+            take the family from <code>familyContext</code> — the fact the
+            middleware already proved — call one service, choose a status.
+          </p>
+          <div class="file">
+            <span class="file-path">server/src/controllers/people.controller.ts (handlers)</span>
+            <pre><code>export async function getFamilyPeople(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise&lt;void&gt; {
+  try {
+    // The controller does not name a family and does not read the session. It asks
+    // for the family the request was authorised against -- already proven.
+    const { family } = familyContext(req);
+    const people = await listPeople(family.id);
+
+    const body: ApiResponse&lt;PersonResource[]&gt; = {
+      data: people.map(toPersonResource),
+    };
+
+    res.status(200).json(body);
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function createFamilyPerson(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise&lt;void&gt; {
+  try {
+    const { family } = familyContext(req);
+    const parsed = parseCreate(req.body);
+    if ("error" in parsed) {
+      res.status(400).json({ message: parsed.error });
+      return;
+    }
+
+    const person = await addPerson(family.id, parsed.input);
+
+    const body: ApiResponse&lt;PersonResource&gt; = { data: toPersonResource(person) };
+    res.status(201).json(body);
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function updateFamilyPerson(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise&lt;void&gt; {
+  try {
+    const { family } = familyContext(req);
+    // Express 5: a param is `string | string[] | undefined` until narrowed.
+    const { personId } = req.params;
+    const parsed = parseUpdate(req.body);
+    if ("error" in parsed) {
+      res.status(400).json({ message: parsed.error });
+      return;
+    }
+    if (typeof personId !== "string") {
+      res.status(404).json({ message: "Person not found" });
+      return;
+    }
+
+    const person = await editPerson(family.id, personId, parsed.patch);
+    if (person === null) {
+      res.status(404).json({ message: "Person not found" });
+      return;
+    }
+
+    const body: ApiResponse&lt;PersonResource&gt; = { data: toPersonResource(person) };
+    res.status(200).json(body);
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function deleteFamilyPerson(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise&lt;void&gt; {
+  try {
+    const { family } = familyContext(req);
+    const { personId } = req.params;
+    if (typeof personId !== "string") {
+      res.status(404).json({ message: "Person not found" });
+      return;
+    }
+
+    const removed = await removePerson(family.id, personId);
+    if (!removed) {
+      res.status(404).json({ message: "Person not found" });
+      return;
+    }
+
+    res.status(204).end();
+  } catch (error) {
+    next(error);
+  }
+}</code></pre>
+          </div>
+        </li>
+
+        <li>
+          <h3>Mount the routes — and notice the check you do not write</h3>
+          <p>
+            The router is already mounted behind <code>loadFamily</code>, so every
+            handler here runs only after the caller has been proved a member of
+            <code>:slug</code>. That proof is the authorisation. Writing
+            <code>requireRole("member")</code> would be a check that cannot fail —
+            every member is at least a member — so it is left out.
+          </p>
+          <div class="file">
+            <span class="file-path">server/src/routes/family.routes.ts (the people band)</span>
+            <pre><code>familyRouter.get("/people", getFamilyPeople);
+
+// loadFamily proved membership, so no requireRole here: a check that can never
+// fail is not a check, it is decoration.
+familyRouter.post("/people", createFamilyPerson);
+familyRouter.patch("/people/:personId", updateFamilyPerson);
+familyRouter.delete("/people/:personId", deleteFamilyPerson);</code></pre>
+          </div>
+          <p>
+            Update the import at the top of the file to bring in the three new
+            handlers alongside <code>getFamilyPeople</code>.
+          </p>
+        </li>
+
+        <li>
+          <h3>Make the claim runnable</h3>
+          <p>
+            A write path is only as good as its scoping, and scoping is exactly
+            the thing a mocked test cannot check. Like the other checks in
+            <code>scripts/</code>, this one talks to a real database, asserts, and
+            exits non-zero when the claim is false.
+          </p>
+          <div class="file">
+            <span class="file-path">server/src/scripts/checkPeople.ts (new)</span>
+            <pre><code>import "dotenv/config";
+import { randomUUID } from "node:crypto";
+import { prisma } from "../config/database.js";
+import * as personModel from "../models/person.model.js";
+import { addPerson, listPeople } from "../services/people.service.js";
+import { toPersonResource } from "../views/person.view.js";
+
+// Two families. A person written into one must be readable in that one and
+// invisible in the other, and the same familyId scope that protects the read
+// must protect the write.
+async function main(): Promise&lt;void&gt; {
+  const suffix = randomUUID().slice(0, 8);
+  const mine = await prisma.family.create({
+    data: { slug: `probe-people-${suffix}`, name: "People probe" },
+  });
+  const theirs = await prisma.family.create({
+    data: { slug: `probe-elsewhere-${suffix}`, name: "Elsewhere probe" },
+  });
+
+  try {
+    await addPerson(mine.id, {
+      name: "Nguyễn Văn A",
+      gender: "male",
+      birthDate: "1980-04-12",
+      deathDate: null,
+    });
+
+    const resources = (await listPeople(mine.id)).map(toPersonResource);
+    const elsewhere = await listPeople(theirs.id);
+    const first = resources[0];
+
+    console.log(`people in the family:  ${resources.length}`);
+    console.log(`name:                  ${JSON.stringify(first?.name)}`);
+    console.log(`living (no death date): ${first?.living}`);
+
+    if (resources.length !== 1) {
+      throw new Error(`EXPECTED 1 person, got ${resources.length}`);
+    }
+    if (!first) throw new Error("MISSING: the created person was not listed");
+    if (first.name !== "Nguyễn Văn A") {
+      throw new Error("NAME: the display name did not round-trip");
+    }
+    if (!first.living) {
+      throw new Error("LIVING: a person with no death date must be living");
+    }
+    if (elsewhere.length !== 0) {
+      throw new Error("LEAK: another family saw this person");
+    }
+    if (resources.some((row) =&gt; "familyId" in row)) {
+      throw new Error("LEAK: the family id crossed the view");
+    }
+
+    // The scoped write: a person in another family is not updatable or
+    // removable, and the answer is "no such row", not a 500.
+    const stolen = await personModel.update(first.id, theirs.id, {
+      displayName: "stolen",
+    });
+    if (stolen !== null) {
+      throw new Error("LEAK: a cross-family update succeeded");
+    }
+    const removed = await personModel.remove(first.id, theirs.id);
+    if (removed) {
+      throw new Error("LEAK: a cross-family delete succeeded");
+    }
+
+    console.log("\npeople scoping, view mapping and scoped writes all held");
+  } finally {
+    await prisma.family.deleteMany({
+      where: { id: { in: [mine.id, theirs.id] } },
+    });
+    await prisma.$disconnect();
+  }
+}
+
+main().catch((error: unknown) =&gt; {
+  console.error(error);
+  process.exitCode = 1;
+});</code></pre>
+          </div>
+          <p>Add one line to the root manifest, beside the other checks:</p>
+          <div class="file">
+            <span class="file-path">package.json (scripts)</span>
+            <pre><code>"check:people": "tsx server/src/scripts/checkPeople.ts",</code></pre>
+          </div>
+        </li>
+      </ol>
+
+      <h2>Verify after</h2>
+      <p>
+        These outputs were <strong>measured on this exact code before you typed
+        it</strong>, so a difference means something drifted — stop and bring me
+        the output rather than moving on.
+      </p>
+      <pre><code>npm run typecheck          # exit 0
+npm run check:people       # exit 0
+#   people in the family:  1
+#   name:                  "Nguyễn Văn A"
+#   living (no death date): true
+#   people scoping, view mapping and scoped writes all held</code></pre>
+      <p>
+        Then prove the HTTP boundary, not just the service. With
+        <code>npm run dev</code> running, register a throwaway account and walk
+        the new route (the same shape lesson 12 used):
+      </p>
+      <pre><code># after POST /api/auth/register (201) and GET /api/families -&gt; slug
+POST /api/families/&lt;slug&gt;/people   {"name":"Nguyễn Văn A","gender":"male"}
+#   -&gt; 201 {"data":{"id":"...","name":"Nguyễn Văn A","living":true}}
+POST /api/families/&lt;slug&gt;/people   {"name":"X"}
+#   -&gt; 400 {"message":"gender must be one of male, female, other, unknown"}
+GET  /api/families/&lt;slug&gt;/people
+#   -&gt; 200, one person
+PATCH /api/families/&lt;slug&gt;/people/&lt;id&gt;  {"name":"Nguyễn Văn B"}
+#   -&gt; 200 {"data":{"id":"...","name":"Nguyễn Văn B","living":true}}
+PATCH /api/families/&lt;slug&gt;/people/does-not-exist  {"name":"x"}
+#   -&gt; 404 {"message":"Person not found"}
+GET  /api/families/&lt;slug&gt;/people   (no cookie)   -&gt; 401 {"message":"Authentication required"}
+DELETE /api/families/&lt;slug&gt;/people/&lt;id&gt;          -&gt; 204
+DELETE /api/families/&lt;slug&gt;/people/&lt;id&gt;  (again) -&gt; 404</code></pre>
+
+      <div class="callout warn">
+        <span class="callout-title">Break it on purpose — predict first</span>
+        <p>
+          In <code>person.model.update</code>, delete <code>familyId</code> from
+          the <code>where</code> so it reads <code>where: { id }</code>. Before you
+          run anything, write down what <code>check:people</code> will print. Then
+          run it. The cross-family update now succeeds and the check exits
+          non-zero: <strong>the scope was in the WHERE clause, and nowhere
+          else</strong>. Put it back and watch the check go green.
+        </p>
+      </div>
+
+      <h2>Decisions carried into the next sittings</h2>
+      <ul>
+        <li>
+          <strong>Who may write a person is a product question, and the default
+          is "any member".</strong> Counter-case: deleting a person is
+          destructive, so a stricter rule — <code>requireRole("admin")</code> on
+          <code>DELETE</code> — is defensible. It costs a little client work: the
+          screen would need the caller's role (it is on
+          <code>FamilyResource</code>, from lesson 13) to avoid showing a button
+          the server will refuse. Decide it once, then change the route and the
+          button in the same commit.
+        </li>
+        <li>
+          <strong>The resource still hides <code>gender</code> and the dates.</strong>
+          <code>PersonResource</code> is <code>{ id, name, living }</code>. The
+          create form can send a gender and a birth date; the list cannot show
+          them yet. That is deliberate — a view is a whitelist, and you widen it
+          when a screen needs the field, not before. The profile screen is where
+          this widens.
+        </li>
+        <li>
+          <strong>Shape validation lives in the controller for now.</strong> It is
+          hand-rolled for exactly two shapes. When a third resource needs the same
+          treatment, that is the moment to adopt a schema validator
+          (<a href="https://zod.dev/">Zod</a>) at the boundary — one parser per
+          resource, not one per handler. Not before.
+        </li>
+      </ul>
+
+      <h2>Primary sources</h2>
+      <div class="callout win">
+        <span class="callout-title">Read these against the code</span>
+        <p>
+          <a href="https://www.prisma.io/docs/orm/prisma-client/queries/crud">Prisma Client — CRUD</a>
+          for <code>create</code>, <code>updateMany</code> and why <code>update</code>
+          insists on a unique <code>where</code> ·
+          <a href="https://expressjs.com/en/guide/routing.html">Express — Routing</a>
+          for <code>Router</code> and mount paths ·
+          <a href="../reference/0002-express-mvc.html">Reference 02</a> for the six
+          layers, and <a href="../reference/0004-ids-and-tenancy.html">Reference 04</a>
+          for the rule this whole lesson hangs on: a client may name a resource, the
+          server must prove access to it.
+        </p>
+      </div>
+
+      <p>
+        If any listing here fails to compile or the check prints something other
+        than the figures above, stop and bring me the exact command and output.
+        Ask follow-up questions about the <code>updateMany</code> trick, where
+        validation belongs, or the write role — anything unclear is worth the
+        minute.
+      </p>
+
+      <h2>Log it</h2>
+      <ul>
+        <li>Minutes: _</li>
+        <li>One line — what fought back, or what you could not recall: _</li>
+        <li>Committed: <code>&lt;hash&gt;</code></li>
+      </ul>
+      <p>
+        Add it to this week's block in <a href="../PROGRESS.md">PROGRESS.md</a>.
+        Commit this sitting on its own; the client starts from this green write
+        path.
+      </p>
+
+      <footer class="lesson-footer">
+        <p class="next-up">
+          <strong>Next:</strong> Lesson 16b — the screen that shows these people,
+          and the first use of a cache for state the client does not own.
+        </p>
+        <p>
+          <a href="../MISSION.md">MISSION.md</a> ·
+          <a href="../ROADMAP.md">ROADMAP.md</a> ·
+          <a href="../GLOSSARY.md">GLOSSARY.md</a> ·
+          <a href="0016f-practice.html">Lesson 16f</a> ·
+          <a href="0015f-practice.html">Lesson 15f</a> ·
+          <a href="../reference/0012-map-of-kinlink.html">Reference 12</a> ·
+          <a href="../reference/0013-server-state-and-the-screen.html">Reference 13</a>
+        </p>
+      </footer>
+    </div>
+    <script src="../assets/quiz.js"></script>
+  </body>
+</html>

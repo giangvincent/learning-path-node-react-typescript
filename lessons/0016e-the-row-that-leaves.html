@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lesson 16e — The row that leaves</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="lesson-header">
+        <p class="eyebrow">Lesson 16e · Week 4 · ≈ one session · one new thing</p>
+        <h1>The row that leaves</h1>
+        <p class="lede">
+          The last of the four verbs, and the only one that answers with no body
+          at all. It also raises the question CRUD quietly avoids: when a person
+          is removed from a family tree, what happens to everything that pointed
+          at them?
+        </p>
+        <div class="meta-row">
+          <span>Mission: ship KinLink</span>
+          <span>Requires: <a href="0016d-the-column-that-never-updated.html">Lesson 16d</a></span>
+          <span>References: <a href="../reference/0003-prisma-data-layer.html">03</a> · <a href="../reference/0013-server-state-and-the-screen.html">13</a></span>
+          <span>Practice: <a href="0016f-practice.html">Lesson 16f</a></span>
+        </div>
+      </header>
+
+      <div class="callout win">
+        <span class="callout-title">The win</span>
+        <p>
+          A person can be removed from the family, and the list agrees.
+          <code>DELETE /api/families/:slug/people/:personId</code> answers
+          <code>204 No Content</code> on success and <code>404</code> for a person
+          who is not in <em>this</em> family — the same scoped-<code>WHERE</code>
+          rule as the update, in a second verb.
+        </p>
+      </div>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Warm-up: retrieve before rereading</h2>
+      <p>
+        Five minutes, from memory. The create and the update both ended by calling
+        <code>invalidateQueries</code>. What exactly does that call do to the
+        cache, and why is it the same call for a write of either kind? Answer
+        before you look at <a href="../reference/0013-server-state-and-the-screen.html">Reference 13</a>.
+      </p>
+
+      <h2>Build it</h2>
+      <ol class="steps">
+        <li>
+          <h3>Verify the baseline</h3>
+          <pre><code>npm run typecheck        # exit 0
+npm run check:people     # exit 0 -- the scoped delete already exists in the model
+grep -n "delete" client/src/lib/api.ts   # no match: the client cannot delete yet</code></pre>
+          <p>
+            Note what is already there. <code>personModel.remove</code> and
+            <code>removePerson</code> were written in <code>16a</code>, and the
+            route was mounted then too — <code>check:people</code> already asserts a
+            cross-family delete is refused. This lesson is the client half plus the
+            button; the server was finished four sittings ago.
+          </p>
+        </li>
+
+        <li>
+          <h3>The transport learns <code>DELETE</code> and expects no body</h3>
+          <p>
+            <code>request&lt;T&gt;</code> already returns <code>undefined</code>
+            early for a <code>204</code>, before it tries to parse JSON. So the
+            delete call types its result as <code>void</code> and reads as an
+            action, not a fetch:
+          </p>
+          <div class="file">
+            <span class="file-path">client/src/lib/api.ts (additions)</span>
+            <pre><code>export function deletePerson(slug: string, personId: string): Promise&lt;void&gt; {
+  return request&lt;void&gt;(
+    `/api/families/${encodeURIComponent(slug)}/people/${encodeURIComponent(personId)}`,
+    { method: "DELETE" },
+  );
+}</code></pre>
+          </div>
+          <div class="callout">
+            <span class="callout-title">Why 204 and not the deleted object</span>
+            <p>
+              A delete that returns the removed resource pretends the caller still
+              has something to act on. <code>204 No Content</code> says the true
+              thing: the operation succeeded and there is nothing left to say. It
+              is also why the transport must special-case it — calling
+              <code>response.json()</code> on an empty body throws, and that is
+              exactly the bug this guard prevents.
+            </p>
+          </div>
+        </li>
+
+        <li>
+          <h3>A button, a confirmation, an invalidation</h3>
+          <div class="file">
+            <span class="file-path">client/src/PeoplePage.tsx (PersonRow additions)</span>
+            <pre><code>import { ApiError, createPerson, deletePerson, getPeople, updatePerson } from "./lib/api";
+// ...inside PersonRow, beside the rename mutation:
+
+  const remove = useMutation({
+    mutationFn: () =&gt; deletePerson(slug, person.id),
+    onSuccess: () =&gt; void invalidate(),
+  });
+// ...and in the non-editing return, after the Edit button:
+
+      &lt;button
+        type="button"
+        disabled={remove.isPending}
+        onClick={() =&gt; {
+          if (window.confirm(`Delete ${person.name}?`)) remove.mutate();
+        }}
+      &gt;
+        Delete
+      &lt;/button&gt;</code></pre>
+          </div>
+          <p>
+            The confirmation is not decoration. This is the first destructive
+            action in the product and there is no undo — so the cheapest correct
+            thing is to ask. It is also a boundary: <code>window.confirm</code>
+            blocks, which is fine for a dev-stage UI and is the kind of thing a
+            real design replaces with an inline "Delete? / Cancel".
+          </p>
+        </li>
+      </ol>
+
+      <h2>Verify after</h2>
+      <pre><code>npm run typecheck        # exit 0
+npm run build:client     # exit 0</code></pre>
+      <p>
+        Then walk it by hand, and watch the list, not just the status code:
+      </p>
+      <pre><code># with a valid cookie and a real &lt;id&gt;
+DELETE /api/families/&lt;slug&gt;/people/&lt;id&gt;            -&gt; 204
+DELETE /api/families/&lt;slug&gt;/people/&lt;id&gt;  (again)   -&gt; 404 {"message":"Person not found"}</code></pre>
+      <p>
+        In the browser: add a person, delete it, and confirm the row disappears
+        without a reload. Then delete the same person from a second tab and watch
+        the first tab <em>not</em> move until it refetches — the same
+        cross-client blind spot you measured in 16c.
+      </p>
+
+      <div class="callout warn">
+        <span class="callout-title">Break it on purpose — predict first</span>
+        <p>
+          Remove the <code>onSuccess</code> invalidation and delete a person.
+          Predict the screen, then look: the row stays, even though the server
+          answered <code>204</code> and the row is gone. Refresh and it vanishes.
+          A successful write with a stale read is the same failure you produced in
+          16c — which is the point: <strong>the invalidation is the feature</strong>,
+          and all three verbs depend on the one key. Restore it.
+        </p>
+      </div>
+
+      <h2>Decisions carried into the next sittings</h2>
+      <ul>
+        <li>
+          <strong>This is a hard delete, and that is a decision to revisit.</strong>
+          When relationships arrive, a deleted person must take their edges with
+          them or the graph breaks. And a genealogy product may not want a
+          remembered relative to be <em>gone</em> — a soft delete
+          (<code>deleted_at</code>) keeps the row and hides it, at the cost of every
+          read growing a <code>WHERE</code>. Do not choose now; decide when the
+          first relationship edge exists and the cost is concrete.
+        </li>
+        <li>
+          <strong>Only members may delete, same as create and edit.</strong>
+          <code>loadFamily</code> is the authorisation. If you later decide
+          deletion is privileged, the change is one <code>requireRole("admin")</code>
+          on the route plus the caller's role on the screen — not a redesign.
+          Decide once, keep client and server in the same commit.
+        </li>
+        <li>
+          <strong>The client still shows no server prose.</strong> A refused delete
+          (a future rule, a stale id) currently surfaces as "nothing happened". The
+          fix is the same one 16c deferred: let <code>ApiError</code> carry the
+          response body. Do it once, for all three verbs, when a refusal a user can
+          act on actually exists.
+        </li>
+      </ul>
+
+      <h2>Primary sources</h2>
+      <div class="callout win">
+        <span class="callout-title">Read these against the code</span>
+        <p>
+          <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-204-no-content">RFC 9110 §15.3.5 — 204 No Content</a>
+          for why the success response carries no body (and what a client must do
+          with it) ·
+          <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-delete">RFC 9110 §9.3.5 — DELETE</a>
+          for idempotence, which is exactly why a second delete is a
+          <code>404</code> and not an error to fear ·
+          <a href="https://tanstack.com/query/latest/docs/framework/react/guides/query-invalidation">TanStack Query — Query Invalidation</a>
+          for the call that makes the list agree.
+        </p>
+      </div>
+
+      <p>
+        If the row does not disappear, or a <code>204</code> logs a JSON parse
+        error, bring me the console — those are the two failure modes this lesson
+        is built around. Ask about soft deletes, idempotence, or what should happen
+        to a person's relationships — anything unclear is worth the minute.
+      </p>
+
+      <h2>Log it</h2>
+      <ul>
+        <li>Minutes: _</li>
+        <li>One line — what fought back, or what you could not recall: _</li>
+        <li>Committed: <code>&lt;hash&gt;</code></li>
+      </ul>
+      <p>
+        Add it to this week's block in <a href="../PROGRESS.md">PROGRESS.md</a>.
+        Commit this sitting on its own — the people screen is now CRUD-complete,
+        and the next series builds relationships on top of it.
+      </p>
+
+      <footer class="lesson-footer">
+        <p class="next-up">
+          <strong>Next:</strong> Lesson 16f — the series practice. Then
+          relationships: the first feature where a person is not a row but a node.
+        </p>
+        <p>
+          <a href="../MISSION.md">MISSION.md</a> ·
+          <a href="../ROADMAP.md">ROADMAP.md</a> ·
+          <a href="../GLOSSARY.md">GLOSSARY.md</a> ·
+          <a href="0016d-the-column-that-never-updated.html">Lesson 16d</a> ·
+          <a href="0016f-practice.html">Lesson 16f</a> ·
+          <a href="../reference/0003-prisma-data-layer.html">Reference 03</a>
+        </p>
+      </footer>
+    </div>
+    <script src="../assets/quiz.js"></script>
+  </body>
+</html>

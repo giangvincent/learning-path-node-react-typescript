@@ -1,0 +1,471 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lesson 15c — Revoke and resend</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="lesson-header">
+        <p class="eyebrow">Lesson 15c · Week 5 · ≈ one session · one new thing</p>
+        <h1>Revoke, and resend the only way it can work</h1>
+        <p class="lede">
+          The raw token was never stored — storing it would be a plaintext
+          credential at rest — so "resend the link" is impossible. Resend must
+          mean something else: mint a brand-new credential and kill the old one,
+          in one transaction. Today builds that, plus the plain revoke it reuses.
+        </p>
+        <div class="meta-row">
+          <span>Mission: ship KinLink</span>
+          <span>Requires: <a href="0015b-revoked-invitations.html">Lesson 15b</a></span>
+          <span>References: <a href="../reference/0009-invitation-protocol.html">09</a> · <a href="../reference/0008-races-locks-and-refusals.html">08</a></span>
+          <span>Practice: <a href="0015f-practice.html">Lesson 15f</a></span>
+        </div>
+      </header>
+
+      <div class="callout win">
+        <span class="callout-title">The win</span>
+        <p>
+          <code>POST /api/families/:slug/invitations/:id/revoke</code> ends a
+          pending invite, and <code>…/:id/resend</code> returns a fresh token
+          while the old one stops working — both owner-only, both inside the
+          family lock. <code>npm run check:resend</code> proves the old token is
+          dead and the new one is live.
+        </p>
+      </div>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Warm-up: why can't resend show the link again?</h2>
+      <p>
+        Answer before reading on. Then state the consequence in one sentence:
+        what must resend actually do instead? (Reference 09 §1 if you are stuck.)
+      </p>
+
+      <h2>Build it</h2>
+      <ol class="steps">
+        <li>
+          <h3>Verify the baseline</h3>
+          <pre><code>npm run typecheck        # exit 0
+npm run check:invites    # the revoked row is absent (from 15b)
+npm run check:mint       # still green</code></pre>
+          <p>
+            There is no revoke and no resend route yet. Both are new operations
+            on an existing invitation, and both belong under the family router.
+          </p>
+        </li>
+
+        <li>
+          <h3>Model: find one invite, and end it</h3>
+          <p>
+            Add two functions beside the existing ones. Both take the
+            <code>familyId</code> in the <code>WHERE</code> clause, so an id from
+            a URL can never reach a row belonging to another family.
+          </p>
+          <div class="file">
+            <span class="file-path">server/src/models/invitation.model.ts (additions)</span>
+            <pre><code>export async function findById(
+  familyId: string,
+  invitationId: string,
+  database: Db = prisma,
+): Promise&lt;Invitation | null&gt; {
+  return database.invitation.findFirst({
+    where: { id: invitationId, familyId },
+  });
+}
+
+/** End a pending invite. Returns rows changed: 0 means it was not pending. */
+export async function revoke(
+  familyId: string,
+  invitationId: string,
+  database: Db = prisma,
+): Promise&lt;number&gt; {
+  const result = await database.invitation.updateMany({
+    where: { id: invitationId, familyId, usedAt: null, revokedAt: null },
+    data: { revokedAt: new Date() },
+  });
+  return result.count;
+}</code></pre>
+          </div>
+          <p>
+            Note the shape: revocation is a conditional write, not
+            find-then-set. The <code>usedAt: null, revokedAt: null</code> guard is
+            what makes <code>count !== 1</code> mean "someone else already ended
+            this" — the same compare-and-set idea as the accept path.
+          </p>
+        </li>
+
+        <li>
+          <h3>Service: two transitions, one lock</h3>
+          <p>
+            Both operations re-read the inviter's membership <em>inside</em> the
+            lock. The route's <code>requireRole("owner")</code> ran when the
+            request arrived; an owner demoted since then must not act.
+          </p>
+          <div class="file">
+            <span class="file-path">server/src/services/invitation.service.ts (additions)</span>
+            <pre><code>import * as membershipModel from "../models/membership.model.js";
+
+export type RevokeResult =
+  | { ok: true }
+  | { ok: false; reason: "not-owner" | "not-pending" };
+
+export type ResendResult =
+  | { ok: true; token: string }
+  | { ok: false; reason: "not-owner" | "not-pending" | "insufficient-role" };
+
+export interface InviteActionWindow {
+  afterLookup?: () =&gt; Promise&lt;void&gt;;
+}
+
+export async function revokeInvitation(input: {
+  familyId: string;
+  inviterMembershipId: string;
+  invitationId: string;
+}): Promise&lt;RevokeResult&gt; {
+  return transact(async (tx) =&gt; {
+    await membershipModel.lockFamily(input.familyId, tx);
+
+    const inviter = await membershipModel.findByFamily(
+      input.familyId,
+      input.inviterMembershipId,
+      tx,
+    );
+    if (!inviter || inviter.role !== "owner") {
+      return { ok: false, reason: "not-owner" };
+    }
+
+    const revoked = await invitationModel.revoke(
+      input.familyId,
+      input.invitationId,
+      tx,
+    );
+    if (revoked !== 1) return { ok: false, reason: "not-pending" };
+    return { ok: true };
+  });
+}
+
+export async function resendInvitation(
+  input: {
+    familyId: string;
+    inviterMembershipId: string;
+    invitationId: string;
+  },
+  window: InviteActionWindow = {},
+): Promise&lt;ResendResult&gt; {
+  return transact(async (tx) =&gt; {
+    await membershipModel.lockFamily(input.familyId, tx);
+
+    const inviter = await membershipModel.findByFamily(
+      input.familyId,
+      input.inviterMembershipId,
+      tx,
+    );
+    if (!inviter || inviter.role !== "owner") {
+      return { ok: false, reason: "not-owner" };
+    }
+
+    const old = await invitationModel.findById(
+      input.familyId,
+      input.invitationId,
+      tx,
+    );
+    if (
+      !old ||
+      old.usedAt !== null ||
+      old.revokedAt !== null ||
+      old.expiresAt &lt;= new Date()
+    ) {
+      return { ok: false, reason: "not-pending" };
+    }
+    // Defense in depth: never reissue a role above the inviter's rank.
+    if (RANK[old.role] &gt; RANK[inviter.role]) {
+      return { ok: false, reason: "insufficient-role" };
+    }
+
+    await window.afterLookup?.();
+
+    const token = randomBytes(32).toString("base64url");
+    await invitationModel.revoke(input.familyId, input.invitationId, tx);
+    await invitationModel.createInvitation(
+      {
+        familyId: input.familyId,
+        role: old.role,
+        email: old.email,
+        tokenHash: hashToken(token),
+        expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+        createdBy: inviter.userId,
+      },
+      tx,
+    );
+    return { ok: true, token };
+  });
+}</code></pre>
+          </div>
+          <div class="callout">
+            <span class="callout-title">Why one transaction, and why the lock</span>
+            <p>
+              "Kill the old, mint the new" is one fact. Two concurrent resends
+              would otherwise each mint and each revoke — leaving two live
+              credentials and an emailed link that is already dead. That is
+              lesson 11's duplicate-mint race in a new costume, so the same
+              answer applies: <code>lockFamily</code> first, then read, decide,
+              write.
+            </p>
+          </div>
+        </li>
+
+        <li>
+          <h3>Routes: two new owner-only actions</h3>
+          <p>
+            Mount both under the family-scoped router, beside the existing list
+            route, so the slug still names the family and <code>loadFamily</code>
+            still proves access.
+          </p>
+          <div class="file">
+            <span class="file-path">server/src/routes/invitation.routes.ts (additions)</span>
+            <pre><code>invitationRouter.post(
+  "/:invitationId/revoke",
+  requireRole("owner"),
+  async (req, res, next) =&gt; {
+    try {
+      const { family, membership } = familyContext(req);
+      const result = await revokeInvitation({
+        familyId: family.id,
+        inviterMembershipId: membership.id,
+        invitationId: req.params.invitationId,
+      });
+      if (!result.ok) {
+        const status = result.reason === "not-owner" ? 403 : 409;
+        const message =
+          result.reason === "not-owner"
+            ? "Insufficient role"
+            : "That invitation is no longer pending";
+        res.status(status).json({ message });
+        return;
+      }
+      res.status(204).end();
+    } catch (e) {
+      next(e);
+    }
+  },
+);
+
+invitationRouter.post(
+  "/:invitationId/resend",
+  requireRole("owner"),
+  async (req, res, next) =&gt; {
+    try {
+      const { family, membership } = familyContext(req);
+      const result = await resendInvitation({
+        familyId: family.id,
+        inviterMembershipId: membership.id,
+        invitationId: req.params.invitationId,
+      });
+      if (!result.ok) {
+        const status = result.reason === "not-pending" ? 409 : 403;
+        const message =
+          result.reason === "not-pending"
+            ? "That invitation is no longer pending"
+            : "Insufficient role";
+        res.status(status).json({ message });
+        return;
+      }
+      // Informal body: the client lesson (15e) moves this under { data: … }.
+      res.status(201).json({ token: result.token });
+    } catch (e) {
+      next(e);
+    }
+  },
+);</code></pre>
+          </div>
+          <p>
+            <code>409</code> for "not pending" is the honest code: retrying after
+            the invite is re-minted (or once the clock passes) will succeed. It is
+            not a permission failure, so it is not <code>403</code>.
+          </p>
+        </li>
+
+        <li>
+          <h3>Proof: the old token dies, the new one lives</h3>
+          <p>
+            Add <code>server/src/scripts/checkResend.ts</code> and a
+            <code>check:resend</code> script. It mints an invite, resends it, and
+            asserts the consequence the whole design rests on.
+          </p>
+          <div class="file">
+            <span class="file-path">server/src/scripts/checkResend.ts (new)</span>
+            <pre><code>import "dotenv/config";
+import { randomUUID } from "node:crypto";
+import { prisma } from "../config/database.js";
+import {
+  createInvitation,
+  resendInvitation,
+  acceptInvitation,
+} from "../services/invitation.service.js";
+
+async function main(): Promise&lt;void&gt; {
+  const slug = `resend-${randomUUID().slice(0, 8)}`;
+  const family = await prisma.family.create({
+    data: { slug, name: "Resend probe" },
+  });
+  const ownerEmail = `${slug}-owner@probe.invalid`;
+  const inviteeEmail = `${slug}-invitee@probe.invalid`;
+  const owner = await prisma.user.create({
+    data: { email: ownerEmail, passwordHash: "probe" },
+  });
+  const invitee = await prisma.user.create({
+    data: { email: inviteeEmail, passwordHash: "probe" },
+  });
+
+  try {
+    const membership = await prisma.familyMember.create({
+      data: { userId: owner.id, familyId: family.id, role: "owner" },
+    });
+
+    const first = await createInvitation({
+      familyId: family.id,
+      inviterMembershipId: membership.id,
+      role: "member",
+      email: "target@probe.invalid",
+    });
+    if (!first.ok) throw new Error("SETUP: first mint failed");
+
+    const pendingBefore = await prisma.invitation.findFirst({
+      where: { familyId: family.id, revokedAt: null, usedAt: null },
+    });
+    if (!pendingBefore) throw new Error("SETUP: no pending row to resend");
+
+    const resent = await resendInvitation({
+      familyId: family.id,
+      inviterMembershipId: membership.id,
+      invitationId: pendingBefore.id,
+    });
+    if (!resent.ok) throw new Error(`RESEND REFUSED: ${resent.reason}`);
+
+    const oldRow = await prisma.invitation.findUnique({
+      where: { id: pendingBefore.id },
+    });
+    const pending = await prisma.invitation.count({
+      where: {
+        familyId: family.id,
+        usedAt: null,
+        revokedAt: null,
+        expiresAt: { gt: new Date() },
+      },
+    });
+
+    const oldAccept = await acceptInvitation(first.token, invitee.id);
+    const newAccept = await acceptInvitation(resent.token, invitee.id);
+
+    console.log(`old token revoked: ${oldRow?.revokedAt !== null}`);
+    console.log(`pending row count: ${pending}`);
+    console.log(`old token accepted: ${oldAccept.ok}`);
+    console.log(`new token accepted: ${newAccept.ok}`);
+
+    if (oldRow?.revokedAt === null) {
+      throw new Error("OLD CREDENTIAL ALIVE: resend did not revoke the original");
+    }
+    if (pending !== 1) {
+      throw new Error(`EXPECTED exactly 1 pending row, got ${pending}`);
+    }
+    if (oldAccept.ok) {
+      throw new Error("OLD TOKEN STILL WORKS after resend");
+    }
+    if (!newAccept.ok) {
+      throw new Error("NEW TOKEN REJECTED after resend");
+    }
+
+    console.log("\nresend revoked the old credential and issued a live one");
+  } finally {
+    await prisma.family.delete({ where: { id: family.id } });
+    await prisma.user.deleteMany({
+      where: { email: { in: [ownerEmail, inviteeEmail] } },
+    });
+    await prisma.$disconnect();
+  }
+}
+
+main().catch((error: unknown) =&gt; {
+  console.error(error);
+  process.exitCode = 1;
+});</code></pre>
+          </div>
+          <div class="file">
+            <span class="file-path">package.json (scripts, addition)</span>
+            <pre><code>"check:resend": "tsx server/src/scripts/checkResend.ts"</code></pre>
+          </div>
+        </li>
+      </ol>
+
+      <h2>Verify after</h2>
+      <p>
+        Figures below are <strong>expected, not pre-measured</strong>; record the
+        real output.
+      </p>
+      <pre><code>npm run typecheck       # expected: exit 0
+npm run check:resend    # expected: revoked true, pending 1, old false, new true
+npm run check:invites   # expected: unchanged, still green</code></pre>
+
+      <div class="callout warn">
+        <span class="callout-title">A retry is not safe — say it out loud</span>
+        <p>
+          A retried resend mints a second credential and revokes the first, so the
+          link the user was emailed is dead. This is lesson 08's non-idempotence
+          again: either the UI never auto-retries, or it needs an idempotency key
+          (week 8's asynchrony thread). Do not quietly retry this endpoint, and do
+          not add a client <code>retry</code> to it later without reading this.
+        </p>
+      </div>
+
+      <h2>Primary sources</h2>
+      <div class="callout win">
+        <span class="callout-title">Read these against the code</span>
+        <p>
+          <a href="https://cheatsheetseries.owasp.org/cheatsheets/Forgot_Password_Cheat_Sheet.html">OWASP — Forgot Password</a>
+          (single-use tokens, and why the old credential must die) ·
+          <a href="../reference/0009-invitation-protocol.html">Reference 09</a> §3
+          (the compare-and-set shape reused here) ·
+          <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-409-conflict">RFC 9110 §15.5.10 — 409 Conflict</a>
+          (why "not pending" is 409, not 403).
+        </p>
+      </div>
+
+      <p>
+        Bring me the exact output if the check fails. Ask follow-up questions
+        about idempotency keys, whether revoke should be its own audit record, or
+        how the UI should refuse to double-resend.
+      </p>
+
+      <h2>Log it</h2>
+      <ul>
+        <li>Minutes: _</li>
+        <li>One line — what fought back, or what you could not recall: _</li>
+        <li>Committed: <code>&lt;hash&gt;</code></li>
+      </ul>
+      <p>
+        Add it to this week's block in <a href="../PROGRESS.md">PROGRESS.md</a>.
+        Commit the two operations and their proof together.
+      </p>
+
+      <footer class="lesson-footer">
+        <p class="next-up">
+          <strong>Next:</strong> Lesson 15d — the accept page stops lying. Route
+          <code>AcceptPage</code> through the transport and render a
+          <code>401</code> and a <code>409</code> as the different facts they are.
+        </p>
+        <p>
+          <a href="../MISSION.md">MISSION.md</a> ·
+          <a href="../ROADMAP.md">ROADMAP.md</a> ·
+          <a href="../GLOSSARY.md">GLOSSARY.md</a> ·
+          <a href="0015b-revoked-invitations.html">Lesson 15b</a> ·
+          <a href="0015d-the-page-that-stopped-lying.html">Lesson 15d</a> ·
+          <a href="../reference/0009-invitation-protocol.html">Reference 09</a>
+        </p>
+      </footer>
+    </div>
+    <script src="../assets/quiz.js"></script>
+  </body>
+</html>

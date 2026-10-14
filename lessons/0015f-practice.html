@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lesson 15f — Practice: the invitation lifecycle</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="lesson-header">
+        <p class="eyebrow">Lesson 15f · a later day · retrieval only</p>
+        <h1>Practice: the invitation lifecycle</h1>
+        <p class="lede">
+          The drills for the whole 15 series — <a href="0015a-the-invariant-the-notes-claimed.html">15a</a>,
+          <a href="0015b-revoked-invitations.html">15b</a>,
+          <a href="0015c-revoke-and-resend.html">15c</a>,
+          <a href="0015d-the-page-that-stopped-lying.html">15d</a>,
+          <a href="0015e-the-mint-ui.html">15e</a>. Run this on a
+          <em>different day</em> from the builds, from memory where you can.
+        </p>
+        <div class="meta-row">
+          <span>Mission: ship KinLink</span>
+          <span>Covers: <a href="0015a-the-invariant-the-notes-claimed.html">15a</a> · <a href="0015b-revoked-invitations.html">15b</a> · <a href="0015c-revoke-and-resend.html">15c</a> · <a href="0015d-the-page-that-stopped-lying.html">15d</a> · <a href="0015e-the-mint-ui.html">15e</a></span>
+          <span>Prior practice: <a href="0014d-practice.html">Lesson 14d</a></span>
+        </div>
+      </header>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Defend it out loud</h2>
+      <ol>
+        <li>
+          An invitation can end three ways. Name all three columns, and the one
+          place that decides "pending".
+        </li>
+        <li>
+          Why does the lock have to be taken before <em>both</em> the pending
+          lookup and the insert?
+        </li>
+        <li>
+          Why can't resend simply show the original link again, and what does it
+          do instead?
+        </li>
+        <li>
+          Why is a retried resend dangerous, and where have we seen that same
+          non-idempotence before?
+        </li>
+        <li>
+          A signed-out visitor opens an invite link and gets a <code>401</code>.
+          Why must that <em>not</em> end the session app-wide?
+        </li>
+        <li>
+          Why did the mint route have to change when the client started using the
+          transport?
+        </li>
+      </ol>
+
+      <h2>Retrieval practice</h2>
+      <div class="quiz" data-quiz>
+        <script type="application/json">
+          [
+            {
+              "q": "What does the family lock protect in concurrent minting?",
+              "options": [
+                "The check then insert decision",
+                "The token and expiry creation",
+                "The request and role validation",
+                "The response and token values"
+              ],
+              "answer": 0,
+              "why": "The lock serializes the read-then-write decision. Without it, two transactions both observe no pending invite and both create one."
+            },
+            {
+              "q": "What does resend do to the original invitation?",
+              "options": [
+                "It revokes the old credential",
+                "It reissues a fresh credential",
+                "It extends the old credential",
+                "It keeps both old credentials"
+              ],
+              "answer": 0,
+              "why": "The raw token was never stored, so resend cannot show it again. It mints a new credential and revokes the old one in a single transaction."
+            },
+            {
+              "q": "Why is a 401 on the accept page different?",
+              "options": [
+                "No session might exist at all",
+                "The link might be already spent",
+                "The role might be too low",
+                "The server might be quite down"
+              ],
+              "answer": 0,
+              "why": "An invitee is often signed out, so a 401 means \"sign in\", not \"your session ended\". The page opts out of the announce and renders a sign-in message."
+            },
+            {
+              "q": "What must a route do to work with the transport?",
+              "options": [
+                "Wrap the payload inside the envelope",
+                "Return the raw object without data",
+                "Send the token inside a header",
+                "Skip the credentials on the call"
+              ],
+              "answer": 0,
+              "why": "request<T> unwraps the response's data field. A route that returns a bare object hands the client undefined — the envelope is not optional."
+            }
+          ]
+        </script>
+      </div>
+
+      <h2>Break it on purpose</h2>
+      <ol>
+        <li>
+          <strong>Remove <code>lockFamily</code> from the mint.</strong> Predict,
+          then run <code>check:mint</code>. Expected: the second gate is reached,
+          and two creates can succeed — exit 1.
+        </li>
+        <li>
+          <strong>Drop <code>revokedAt: null</code> from the accept claim.</strong>
+          The list still hides the row, but a revoked token is claimed anyway.
+          Which definition lied?
+        </li>
+        <li>
+          <strong>Drop <code>revokedAt: null</code> from the list.</strong> Now the
+          list shows a withdrawn invite that accept will refuse. Which direction
+          is worse, and why?
+        </li>
+        <li>
+          <strong>Make resend skip the revoke.</strong> Run
+          <code>check:resend</code>. Expected: the old token still works — the one
+          property the whole design exists to guarantee.
+        </li>
+        <li>
+          <strong>Return a bare <code>{ token }</code> from the mint.</strong> Mint
+          from the UI. Predict what the screen shows before you look: a link with
+          <code>undefined</code> where the token should be.
+        </li>
+      </ol>
+
+      <h2>Primary sources</h2>
+      <div class="callout win">
+        <span class="callout-title">Read these again, slowly</span>
+        <p>
+          <a href="../reference/0009-invitation-protocol.html">Reference 09</a> —
+          the whole protocol, end to end, including the collapse on the wire ·
+          <a href="../reference/0008-races-locks-and-refusals.html">Reference 08</a>
+          — the seam and gate, now used twice ·
+          <a href="../reference/0012-map-of-kinlink.html">Reference 12</a> §5 —
+          the invariant table: every row should now have a proof.
+        </p>
+      </div>
+
+      <h2>Ask your teacher</h2>
+      <p>
+        Bring the exact output when a prediction differs. Ask about idempotency
+        keys for resend, whether revoke deserves its own audit row, how the list
+        should render a revoked-then-reissued pair, or where revoke and resend
+        buttons belong.
+      </p>
+
+      <h2>Log it</h2>
+      <ul>
+        <li>Minutes: _</li>
+        <li>One line — what fought back, or what you could not recall: _</li>
+        <li>Committed: <code>&lt;hash&gt;</code> (if you changed code while breaking it)</li>
+      </ul>
+      <p>
+        Add it to this week's block in <a href="../PROGRESS.md">PROGRESS.md</a>,
+        then fill the week's three signals.
+      </p>
+
+      <footer class="lesson-footer">
+        <p class="next-up">
+          <strong>Next:</strong> the people screen — the first screen where a
+          mutation must invalidate a read, and therefore where TanStack Query
+          finally earns its place.
+        </p>
+        <p>
+          <a href="../MISSION.md">MISSION.md</a> ·
+          <a href="../ROADMAP.md">ROADMAP.md</a> ·
+          <a href="../GLOSSARY.md">GLOSSARY.md</a> ·
+          <a href="0015a-the-invariant-the-notes-claimed.html">Lesson 15a</a> ·
+          <a href="0014d-practice.html">Lesson 14d</a> ·
+          <a href="../reference/0012-map-of-kinlink.html">Reference 12</a>
+        </p>
+      </footer>
+    </div>
+    <script src="../assets/quiz.js"></script>
+  </body>
+</html>

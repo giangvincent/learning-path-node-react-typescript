@@ -1,0 +1,352 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lesson 16b — The screen and its cache</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="lesson-header">
+        <p class="eyebrow">Lesson 16b · Week 4 · ≈ one session · one new thing</p>
+        <h1>The screen and its cache</h1>
+        <p class="lede">
+          A screen that fetches with <code>useEffect</code> and <code>useState</code>
+          works — until a second screen needs the same data, or a write changes it.
+          Today the client adopts a cache for state it does not own: the server's.
+        </p>
+        <div class="meta-row">
+          <span>Mission: ship KinLink</span>
+          <span>Requires: <a href="0016a-a-write-through-every-layer.html">Lesson 16a</a></span>
+          <span>References: <a href="../reference/0010-client-identity.html">10</a> · <a href="../reference/0013-server-state-and-the-screen.html">13</a></span>
+          <span>Practice: <a href="0016f-practice.html">Lesson 16f</a></span>
+        </div>
+      </header>
+
+      <div class="callout win">
+        <span class="callout-title">The win</span>
+        <p>
+          <code>/family/:slug/people</code> renders the family's people, read
+          through TanStack Query. The component names a <em>key</em> and a
+          function; the library owns loading, error and cached data — the three
+          states every hand-rolled fetch re-implements and gets subtly wrong.
+        </p>
+      </div>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Warm-up: retrieve before rereading</h2>
+      <p>
+        Five minutes, from memory. In lesson 13, why did <code>useSession</code>
+        fetch the identity from the server instead of storing it in a client
+        store? What four states did it have? Say it out loud, then compare with
+        <a href="../reference/0010-client-identity.html">Reference 10</a>. Today's
+        lesson is the same argument, applied to a list.
+      </p>
+
+      <h2>Build it</h2>
+      <ol class="steps">
+        <li>
+          <h3>Verify the baseline, then install the one new module</h3>
+          <p>
+            The library is not in this project yet, and this lesson is where it
+            arrives. Name it, install it, and prove it resolved before writing a
+            line that imports it.
+          </p>
+          <pre><code>npm run typecheck                       # exit 0
+npm ls @tanstack/react-query            # empty: not installed yet
+npm i @tanstack/react-query@^5          # resolves to 5.104.2 on this machine
+npm ls @tanstack/react-query            # now shows the version</code></pre>
+          <div class="callout">
+            <span class="callout-title">Why a library, and why this one</span>
+            <p>
+              Server state is not client state. It lives somewhere else, it can be
+              stale, and two screens showing it must agree. TanStack Query's whole
+              job is that problem: a keyed cache, stale-while-revalidate, and —
+              the part we will use in the very next lesson —
+              <em>invalidation</em>. It is worth a dependency because the thing it
+              replaces (a store plus hand-written refetch logic) is where the bugs
+              live.
+            </p>
+          </div>
+        </li>
+
+        <li>
+          <h3>One cache for the whole app</h3>
+          <p>
+            A <code>QueryClient</code> is the cache. It is created once, outside
+            the component tree, and handed down by a provider. Creating it inside
+            a component would build a new cache on every render.
+          </p>
+          <div class="file">
+            <span class="file-path">client/src/main.tsx</span>
+            <pre><code>import { StrictMode } from "react";
+import { createRoot } from "react-dom/client";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { BrowserRouter } from "react-router-dom";
+import App from "./App";
+
+const container = document.getElementById("root");
+if (!container) throw new Error("Missing #root element");
+
+// One cache for the whole app, created once. A component asks for data by key;
+// this client is what remembers the answer and, on invalidation, forgets it.
+const queryClient = new QueryClient();
+
+createRoot(container).render(
+  &lt;StrictMode&gt;
+    &lt;QueryClientProvider client={queryClient}&gt;
+      &lt;BrowserRouter&gt;
+        &lt;App /&gt;
+      &lt;/BrowserRouter&gt;
+    &lt;/QueryClientProvider&gt;
+  &lt;/StrictMode&gt;,
+);</code></pre>
+          </div>
+        </li>
+
+        <li>
+          <h3>The window on the contract grows</h3>
+          <div class="file">
+            <span class="file-path">client/src/contracts.ts</span>
+            <pre><code>export type { ApiErrorBody, ApiResponse } from "../../shared/contracts/api";
+export type {
+  CreatePersonRequest,
+  Gender,
+  PersonResource,
+  UpdatePersonRequest,
+} from "../../shared/contracts/person";
+export type { AuthResponse } from "../../shared/contracts/auth";
+export type { FamilyResource } from "../../shared/contracts/family";
+export type { InvitationResource } from "../../shared/contracts/invitation";</code></pre>
+          </div>
+        </li>
+
+        <li>
+          <h3>Teach the transport the people URL</h3>
+          <p>
+            Components never build a URL. Add one named function beside
+            <code>getFamilies</code> and <code>getInvitations</code>:
+          </p>
+          <div class="file">
+            <span class="file-path">client/src/lib/api.ts (additions)</span>
+            <pre><code>export function getPeople(slug: string): Promise&lt;PersonResource[]&gt; {
+  return request&lt;PersonResource[]&gt;(
+    `/api/families/${encodeURIComponent(slug)}/people`,
+  );
+}</code></pre>
+          </div>
+          <p>
+            Add <code>PersonResource</code> to the type import at the top of the
+            file.
+          </p>
+        </li>
+
+        <li>
+          <h3>The screen: a key, a function, three states</h3>
+          <p>
+            Everything that fetches one family's people agrees on one key.
+            Exporting it is what will let the <em>next</em> lesson invalidate it
+            from another component.
+          </p>
+          <div class="file">
+            <span class="file-path">client/src/PeoplePage.tsx (new)</span>
+            <pre><code>import { useQuery } from "@tanstack/react-query";
+import { Link, useParams } from "react-router-dom";
+import { ApiError, getPeople } from "./lib/api";
+
+/**
+ * The key every query and mutation for one family's people shares. A mutation
+ * that invalidates this exact key is what turns "the server changed" into "the
+ * list re-fetched" -- the whole reason a cache exists.
+ */
+export const peopleKey = (slug: string) =&gt; ["people", slug] as const;
+
+export default function PeoplePage() {
+  const { slug } = useParams&lt;{ slug: string }&gt;();
+  if (!slug) return &lt;p role="alert"&gt;No family in this URL.&lt;/p&gt;;
+  return &lt;PeopleList slug={slug} /&gt;;
+}
+
+function PeopleList({ slug }: { slug: string }) {
+  const query = useQuery({
+    queryKey: peopleKey(slug),
+    queryFn: () =&gt; getPeople(slug),
+  });
+
+  return (
+    &lt;main style={{ fontFamily: "system-ui, sans-serif", padding: "2rem" }}&gt;
+      &lt;h1&gt;People&lt;/h1&gt;
+      &lt;p&gt;
+        &lt;Link to={`/family/${slug}/invites`}&gt;Invitations&lt;/Link&gt;
+      &lt;/p&gt;
+
+      {query.isPending &amp;&amp; &lt;p&gt;Loading…&lt;/p&gt;}
+      {query.isError &amp;&amp; (
+        &lt;p role="alert"&gt;
+          {query.error instanceof ApiError
+            ? `Failed to load (${query.error.status}).`
+            : "Failed to load."}
+        &lt;/p&gt;
+      )}
+      {query.data?.length === 0 &amp;&amp; &lt;p&gt;No people yet.&lt;/p&gt;}
+      {query.data &amp;&amp; query.data.length &gt; 0 &amp;&amp; (
+        &lt;ul&gt;
+          {query.data.map((person) =&gt; (
+            &lt;li key={person.id}&gt;
+              {person.name} {person.living ? "· living" : "· deceased"}
+            &lt;/li&gt;
+          ))}
+        &lt;/ul&gt;
+      )}
+    &lt;/main&gt;
+  );
+}</code></pre>
+          </div>
+          <p>
+            Two details worth dwelling on. The outer component narrows
+            <code>slug</code> to a <code>string</code> and only then renders the
+            inner one — that is why the query function needs no
+            <code>slug!</code> or <code>as string</code>. And
+            <code>query.isPending</code> is the library's name for "no data yet";
+            v5 renamed the old <code>isLoading</code>, which now means something
+            narrower (a fetch <em>in flight</em>), so copy the names rather than
+            the older tutorials.
+          </p>
+        </li>
+
+        <li>
+          <h3>Give it a route, and a way in</h3>
+          <div class="file">
+            <span class="file-path">client/src/App.tsx (additions)</span>
+            <pre><code>import PeoplePage from "./PeoplePage";
+// ...
+      &lt;Route path="/family/:slug/people" element={&lt;PeoplePage /&gt;} /&gt;</code></pre>
+          </div>
+          <p>
+            And in <code>FamilyList</code>, make the family name point at the new
+            screen instead of the invitations screen, keeping invitations one link
+            deeper:
+          </p>
+          <div class="file">
+            <span class="file-path">client/src/App.tsx (FamilyList body)</span>
+            <pre><code>&lt;li key={family.slug}&gt;
+  &lt;Link to={`/family/${family.slug}/people`}&gt;{family.name}&lt;/Link&gt; —
+  you are {family.role} (
+  &lt;Link to={`/family/${family.slug}/invites`}&gt;invitations&lt;/Link&gt;)
+&lt;/li&gt;</code></pre>
+          </div>
+        </li>
+      </ol>
+
+      <h2>Verify after</h2>
+      <p>
+        Both commands were measured on this exact code before you typed it.
+      </p>
+      <pre><code>npm run typecheck     # exit 0
+npm run build:client  # exit 0 -- 70 modules transformed (was 23 in lesson 13)</code></pre>
+      <p>
+        Then look at it. <code>npm run dev</code>, sign in, follow the family name,
+        and confirm the address is <code>/family/&lt;slug&gt;/people</code>. The
+        list is empty — nothing has been created in the browser yet, and the check
+        script cleans up after itself. "No people yet." is the correct, complete
+        answer; the form that fills it is the next lesson.
+      </p>
+
+      <div class="callout warn">
+        <span class="callout-title">Break it on purpose — predict first</span>
+        <p>
+          Two failures arrive as different status codes, and the client must treat
+          them differently. Predict both, then test both. First delete
+          <code>kinlink.sid</code> in DevTools and reload the people screen: the
+          request answers <code>401</code>, the transport announces a dead session
+          (lesson 14), and you land on the sign-in form. Now put a wrong slug in
+          the address bar with a valid cookie: the server answers
+          <code>404 Family not found</code> — an ordinary <code>ApiError</code>,
+          <em>not</em> a session event — so the screen shows
+          <code>Failed to load (404).</code> and stays put. Same component, one
+          status that ends the session and one that does not.
+        </p>
+      </div>
+
+      <h2>Decisions carried into the next sittings</h2>
+      <ul>
+        <li>
+          <strong><code>useSession</code> stays hand-rolled — for now.</strong>
+          TanStack Query could fetch the identity too, but <code>useSession</code>
+          carries a rule the library does not know: a <code>401</code> means
+          <em>anonymous</em>, and any other failure means <em>error</em>. That is
+          session policy, not caching. The trigger to revisit is written down:
+          migrate it when the session needs to be invalidated by a mutation —
+          login and logout are exactly that, so this is a genuine open question,
+          not a settled one.
+        </li>
+        <li>
+          <strong>No client store was added.</strong> The temptation is a Zustand
+          store named <code>people</code> holding the fetched array. Resist it:
+          the array's owner is the server. A client store filled by a fetch is a
+          stale copy with extra steps. A client store earns its place for
+          client-owned state — the tree's layout, a current selection — not for a
+          cache of someone else's truth.
+        </li>
+        <li>
+          <strong>The key is the invalidation contract.</strong> Every reader and
+          every writer of "one family's people" must name
+          <code>peopleKey(slug)</code>. If a second screen ever fetches people
+          with its own literal key, invalidation will silently miss it. Grep for
+          <code>"people"</code> the day that screen appears.
+        </li>
+      </ul>
+
+      <h2>Primary sources</h2>
+      <div class="callout win">
+        <span class="callout-title">Read these against the code</span>
+        <p>
+          <a href="https://tanstack.com/query/latest/docs/framework/react/overview">TanStack Query — Overview</a>
+          for the query-key/cache model and the state names ·
+          <a href="https://react.dev/learn/you-might-not-need-an-effect">react.dev — You Might Not Need an Effect</a>
+          for what the old <code>useEffect</code>-plus-flag fetch was doing, and why
+          a library replaces it ·
+          <a href="../reference/0010-client-identity.html">Reference 10</a> for the
+          server-state argument you met in lesson 13.
+        </p>
+      </div>
+
+      <p>
+        If the install resolves to a different major, or a state name here does not
+        exist in your version, stop and bring me the <code>npm ls</code> output and
+        the error. Ask about keys, <code>staleTime</code>, or whether
+        <code>useSession</code> should move — anything unclear is worth the minute.
+      </p>
+
+      <h2>Log it</h2>
+      <ul>
+        <li>Minutes: _</li>
+        <li>One line — what fought back, or what you could not recall: _</li>
+        <li>Committed: <code>&lt;hash&gt;</code></li>
+      </ul>
+      <p>
+        Add it to this week's block in <a href="../PROGRESS.md">PROGRESS.md</a>.
+        Commit this sitting on its own; the mutation lesson starts from this
+        green read.
+      </p>
+
+      <footer class="lesson-footer">
+        <p class="next-up">
+          <strong>Next:</strong> Lesson 16c — a write from the browser, and the
+          invalidate call that makes the cache earn its dependency.
+        </p>
+        <p>
+          <a href="../MISSION.md">MISSION.md</a> ·
+          <a href="../ROADMAP.md">ROADMAP.md</a> ·
+          <a href="../GLOSSARY.md">GLOSSARY.md</a> ·
+          <a href="0016a-a-write-through-every-layer.html">Lesson 16a</a> ·
+          <a href="0016f-practice.html">Lesson 16f</a> ·
+          <a href="../reference/0013-server-state-and-the-screen.html">Reference 13</a>
+        </p>
+      </footer>
+    </div>
+    <script src="../assets/quiz.js"></script>
+  </body>
+</html>

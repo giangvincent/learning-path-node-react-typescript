@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lesson 15b — Revoked invitations</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="lesson-header">
+        <p class="eyebrow">Lesson 15b · Week 5 · ≈ one session · one new thing</p>
+        <h1>The third end-state</h1>
+        <p class="lede">
+          An invitation can end three ways: claimed, expired, or withdrawn by its
+          sender. The first two already have a shape. Today adds the third — a
+          <code>revokedAt</code> column — and, crucially, keeps the two places
+          that decide "pending" from drifting apart.
+        </p>
+        <div class="meta-row">
+          <span>Mission: ship KinLink</span>
+          <span>Requires: <a href="0015a-the-invariant-the-notes-claimed.html">Lesson 15a</a></span>
+          <span>References: <a href="../reference/0011-live-schema-and-growing-lists.html">11</a> · <a href="../reference/0009-invitation-protocol.html">09</a></span>
+          <span>Practice: <a href="0015f-practice.html">Lesson 15f</a></span>
+        </div>
+      </header>
+
+      <div class="callout win">
+        <span class="callout-title">The win</span>
+        <p>
+          <code>revokedAt</code> exists, and "pending" means three conditions —
+          <code>usedAt: null</code>, <code>revokedAt: null</code>, and
+          <code>expiresAt &gt; now</code> — in <em>both</em> the list and the
+          accept claim. A withdrawn invite disappears from the list and can no
+          longer be claimed; <code>npm run check:invites</code> grows a fifth row
+          and proves it.
+        </p>
+      </div>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Warm-up: two definitions of one word</h2>
+      <p>
+        From memory: which two places in the code decide whether an invitation can
+        still be used? Name both. The whole risk of today's change is that they
+        drift.
+      </p>
+
+      <h2>Build it</h2>
+      <ol class="steps">
+        <li>
+          <h3>Verify the baseline</h3>
+          <pre><code>npm run db:up
+npm run typecheck        # exit 0
+npm run check:mint       # from 15a: one success, one refusal, one row
+npm run check:invites    # 2 rows; pending filter and view mapping held</code></pre>
+          <p>
+            No <code>revoked_at</code> column exists, and no code mentions
+            revocation. Confirm that in the schema before you start.
+          </p>
+        </li>
+
+        <li>
+          <h3>Add the column — nullable, and truthful as <code>NULL</code></h3>
+          <p>
+            "Not revoked" is a real value for every existing row, so
+            <code>NULL</code> is honest rather than a placeholder. Adding a
+            nullable column is <code>INSTANT</code> in MySQL 8.0 (metadata only),
+            so there is nothing to backfill — unlike lesson 12's
+            <code>createdAt</code>, which needed a real value for old rows. One
+            statement, one migration, one thing.
+          </p>
+          <div class="file">
+            <span class="file-path">prisma/schema.prisma (Invitation, addition)</span>
+            <pre><code>  usedAt    DateTime? @map("used_at")
+  revokedAt DateTime? @map("revoked_at")
+  createdBy String    @map("created_by")</code></pre>
+          </div>
+          <div class="file">
+            <span class="file-path">terminal</span>
+            <pre><code>npx prisma migrate dev --name add_invitation_revoked_at</code></pre>
+          </div>
+          <p>
+            Read the generated <code>migration.sql</code> before applying it.
+            It should be a single <code>ALTER TABLE … ADD COLUMN revoked_at
+            DATETIME(3) NULL;</code> — no default, no rebuild.
+          </p>
+        </li>
+
+        <li>
+          <h3>Move both definitions together</h3>
+          <p>
+            Two places decide "can this invitation still be used": the list
+            (<code>findPendingByFamily</code>) and the accept path (the
+            compare-and-set in <code>acceptInvitation</code>). If you teach only
+            the list about revocation, a revoked link still joins the family —
+            the list lies and the token still works. Update <strong>both</strong>.
+          </p>
+          <div class="file">
+            <span class="file-path">server/src/models/invitation.model.ts</span>
+            <pre><code>    where: {
+      familyId,
+      usedAt: null,
+      revokedAt: null,
+      expiresAt: { gt: new Date() },
+    },</code></pre>
+          </div>
+          <div class="file">
+            <span class="file-path">server/src/services/invitation.service.ts (claim in acceptInvitation)</span>
+            <pre><code>    const claimed = await tx.invitation.updateMany({
+      where: {
+        tokenHash: hashToken(token),
+        usedAt: null,
+        revokedAt: null,
+        expiresAt: { gt: new Date() },
+      },
+      data: { usedAt: new Date() },
+    });</code></pre>
+          </div>
+          <p>
+            The model's own comment already warns that these two must not drift.
+            Today is that warning coming true: three conditions, two places, one
+            meaning.
+          </p>
+        </li>
+
+        <li>
+          <h3>Grow the proof: a revoked invite is absent</h3>
+          <p>
+            <code>checkInvites.ts</code> seeds four invitations and asserts that
+            exactly the claimable two survive. Give the seed a
+            <code>revokedAt</code>, add a fifth row that is revoked, and assert it
+            is gone — from the list at least.
+          </p>
+          <div class="file">
+            <span class="file-path">server/src/scripts/checkInvites.ts (seed helper, addition)</span>
+            <pre><code>    const seed = async (input: {
+      email: string | null;
+      usedAt: Date | null;
+      revokedAt: Date | null;
+      expiresAt: Date;
+      createdAt: Date;
+    }): Promise&lt;void&gt; =&gt; {
+      await prisma.invitation.create({
+        data: {
+          familyId: family.id,
+          role: "member",
+          email: input.email,
+          tokenHash: `${slug}-${randomUUID()}`,
+          createdAt: input.createdAt,
+          expiresAt: input.expiresAt,
+          usedAt: input.usedAt,
+          revokedAt: input.revokedAt,
+          createdBy: "probe",
+        },
+      });
+    };</code></pre>
+          </div>
+          <p>
+            Add <code>revokedAt: null</code> to the four existing seeds, then add
+            the fifth and a matching assertion:
+          </p>
+          <div class="file">
+            <span class="file-path">server/src/scripts/checkInvites.ts (fifth seed and assertion)</span>
+            <pre><code>    await seed({
+      email: "revoked@probe.invalid",
+      usedAt: null,
+      revokedAt: past,
+      expiresAt: future,
+      createdAt: new Date(t),
+    });
+
+    // ... after the existing checks:
+    if (emails.includes("revoked@probe.invalid")) {
+      throw new Error("NOT PENDING: a revoked invite was listed");
+    }</code></pre>
+          </div>
+          <p>
+            The count assertion stays <strong>2</strong> — five rows seeded, three
+            of them ended (used, expired, revoked), two still claimable.
+          </p>
+        </li>
+      </ol>
+
+      <h2>Verify after</h2>
+      <p>
+        Figures below are <strong>expected, not pre-measured</strong>; record the
+        real output in your session log.
+      </p>
+      <pre><code>npm run typecheck        # expected: exit 0
+npm run check:invites    # expected: 2 rows; the revoked row is absent
+npm run check:mint       # expected: unchanged, still green</code></pre>
+
+      <div class="callout warn">
+        <span class="callout-title">Break it once — and feel the drift</span>
+        <p>
+          Delete <code>revokedAt: null</code> from the accept claim only, then
+          walk a revoked token through <code>acceptInvitation</code>. Predict
+          first: the list still hides the row (it kept its condition), but the
+          token is claimed anyway — <code>ok: true</code>. That is the failure
+          this step exists to prevent: two definitions of one word, and only one
+          of them updated. Restore the line.
+        </p>
+      </div>
+
+      <h2>Primary sources</h2>
+      <div class="callout win">
+        <span class="callout-title">Read these against the code</span>
+        <p>
+          <a href="https://dev.mysql.com/doc/refman/8.0/en/innodb-online-ddl-operations.html">MySQL 8.0 — Online DDL Operations</a>
+          for why a nullable add is <code>INSTANT</code> ·
+          <a href="../reference/0011-live-schema-and-growing-lists.html">Reference 11</a>
+          §1 for expand/backfill/contract, and why this column needs none of it ·
+          <a href="../reference/0009-invitation-protocol.html">Reference 09</a> §5
+          for why the wire still answers one collapsed refusal even though the
+          server now has three end-states.
+        </p>
+      </div>
+
+      <p>
+        If the migration or check surprises you, stop and bring me the exact
+        command and output. Ask follow-up questions about collation, the collapse
+        on the wire, or what "revoked" should render as later.
+      </p>
+
+      <h2>Log it</h2>
+      <ul>
+        <li>Minutes: _</li>
+        <li>One line — what fought back, or what you could not recall: _</li>
+        <li>Committed: <code>&lt;hash&gt;</code></li>
+      </ul>
+      <p>
+        Add it to this week's block in <a href="../PROGRESS.md">PROGRESS.md</a>.
+        Commit the migration and the two definition changes together, then stop.
+      </p>
+
+      <footer class="lesson-footer">
+        <p class="next-up">
+          <strong>Next:</strong> Lesson 15c — revoke and resend. Give the new
+          end-state an operation, and make "resend" a fresh mint that kills the
+          old credential in one transaction.
+        </p>
+        <p>
+          <a href="../MISSION.md">MISSION.md</a> ·
+          <a href="../ROADMAP.md">ROADMAP.md</a> ·
+          <a href="../GLOSSARY.md">GLOSSARY.md</a> ·
+          <a href="0015a-the-invariant-the-notes-claimed.html">Lesson 15a</a> ·
+          <a href="0015c-revoke-and-resend.html">Lesson 15c</a> ·
+          <a href="../reference/0011-live-schema-and-growing-lists.html">Reference 11</a>
+        </p>
+      </footer>
+    </div>
+    <script src="../assets/quiz.js"></script>
+  </body>
+</html>

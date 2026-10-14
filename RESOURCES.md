@@ -28,7 +28,11 @@ teacher's memory. Every entry says what it is good for.
 ### Data & server state
 
 - [TanStack Query — Overview](https://tanstack.com/query/latest/docs/framework/react/overview)
-  The canonical server-state library. Use for: caching, invalidation, optimistic updates. **Not adopted yet, and the rule is now explicit (session 13): adopt it on the first screen where a mutation must invalidate a read** — a cache whose most valuable feature has nothing to invalidate is a store, not a tool. That is the people screen, not today's read-only three.
+  The canonical server-state library. Use for: caching, invalidation, optimistic updates. **Adopted in lessons 16b–16e**, where the trigger fired: the people screen is the first place a **mutation must invalidate a read**. A cache whose most valuable feature has nothing to invalidate is a store, not a tool.
+- [TanStack Query — Mutations](https://tanstack.com/query/latest/docs/framework/react/guides/mutations)
+  Use for: `useMutation`, `isPending`, and the `onSuccess`/`onError` callbacks. The three lines the whole people feature turns on.
+- [TanStack Query — Query Invalidation](https://tanstack.com/query/latest/docs/framework/react/guides/query-invalidation)
+  Use for: why `invalidateQueries({ queryKey })` matches by prefix, and what `refetchType` changes. Read with Reference 13 §6.
 - [React Libraries for 2026 — Robin Wieruch](https://www.robinwieruch.de/react-libraries/)
   Opinionated, well-maintained survey of the React ecosystem. Use for: "which library should I pick" decisions.
 
@@ -71,6 +75,8 @@ teacher's memory. Every entry says what it is good for.
   Use for: what `SERIALIZABLE` actually does ("implicitly converts all plain SELECT statements to SELECT … FOR SHARE if autocommit is disabled"), when MySQL itself recommends it (XA, deadlock troubleshooting), and the warning against mixing locking and non-locking reads in a REPEATABLE READ transaction — which is the counter-case Reference 08 §2 answers with a measurement.
 - [RFC 9110 §15.5.10 — 409 Conflict](https://www.rfc-editor.org/rfc/rfc9110.html#name-409-conflict)
   Use for: the difference between "you may never" (403) and "not in this state, not now" (409). Decides every last-owner refusal.
+- [RFC 9110 §15.3.5 — 204 No Content](https://www.rfc-editor.org/rfc/rfc9110.html#name-204-no-content) and [§9.3.5 — DELETE](https://www.rfc-editor.org/rfc/rfc9110.html#name-delete)
+  Use for: why a successful delete carries no body (and why the client transport must return before calling `json()`), and why DELETE is idempotent — which is why a second delete is a 404, not a failure. Lesson 16e.
 - [RFC 9457 — Problem Details for HTTP APIs](https://www.rfc-editor.org/rfc/rfc9457.html)
   Use for: the error body a client can act on. §3 defines `type`/`title`/`status`/`detail`/`instance` and extension members (`code`, `remediation`); the out-of-credit example is literally "why you were refused and where to fix it". Rules to quote: consumers "SHOULD NOT parse the detail member for information" and "MUST ignore any such extensions that they don't recognize".
 - [OWASP — Forgot Password](https://cheatsheetseries.owasp.org/cheatsheets/Forgot_Password_Cheat_Sheet.html)
@@ -82,6 +88,10 @@ teacher's memory. Every entry says what it is good for.
   Official MySQL path end-to-end. Use for: schema, migrations, client usage. Start here in week 2.
 - [Prisma docs — ORM](https://www.prisma.io/docs)
   Use for: relations, transactions, query performance, and the generated client's type behaviour.
+- [Prisma Client — CRUD](https://www.prisma.io/docs/orm/prisma-client/queries/crud)
+  Use for: `create`, and the scoped-write trick — `updateMany({ where: { id, familyId } })`, because `update` insists on a *unique* `where` and so cannot also filter on the tenant. Its `count` is the "not yours" signal.
+- [Prisma schema reference — `@updatedAt`, `@default`](https://www.prisma.io/docs/orm/reference/prisma-schema-reference)
+  Use for: why removing a database default is safe (the field is stamped by the client on create *and* update) and the `@updatedAt`-vs-`@default(now())` distinction that lesson 16d repairs.
 - [Prisma ORM v7 — Expand-and-contract migrations](https://www.prisma.io/docs/guides/v7/database/data-migration)
   Use for: changing a column that already has rows. Three steps — expand the schema and deploy, backfill with a typed `data-migration.ts`, contract in a second migration. The version-matched guide; Prisma cannot express the intermediate state, so the backfill is written by hand.
 - [MySQL 8.0 — Online DDL Operations](https://dev.mysql.com/doc/refman/8.0/en/innodb-online-ddl-operations.html)

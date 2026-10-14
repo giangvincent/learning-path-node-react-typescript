@@ -1,0 +1,315 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lesson 16d — The column that never updated</title>
+    <link rel="stylesheet" href="../assets/course.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="lesson-header">
+        <p class="eyebrow">Lesson 16d · Week 4 · ≈ one session · one new thing</p>
+        <h1>The column that never updated</h1>
+        <p class="lede">
+          KinLink has carried a defect since lesson 06: <code>people.updated_at</code>
+          is set once at creation and never again. It is a column named "updated"
+          that does not update. Today an edit screen needs it to tell the truth —
+          so today we repair it, then build the edit.
+        </p>
+        <div class="meta-row">
+          <span>Mission: ship KinLink</span>
+          <span>Requires: <a href="0016c-the-mutation-that-invalidates.html">Lesson 16c</a></span>
+          <span>References: <a href="../reference/0003-prisma-data-layer.html">03</a> · <a href="../reference/0011-live-schema-and-growing-lists.html">11</a> · <a href="../reference/0013-server-state-and-the-screen.html">13</a></span>
+          <span>Practice: <a href="0016f-practice.html">Lesson 16f</a></span>
+        </div>
+      </header>
+
+      <div class="callout win">
+        <span class="callout-title">The win</span>
+        <p>
+          <code>updated_at</code> changes on every write, and
+          <code>PATCH /api/families/:slug/people/:personId</code> renames a person
+          scoped to the caller's family. On the screen, a row turns into a form,
+          saves, and the list follows — the same invalidate rule as the create,
+          reused.
+        </p>
+      </div>
+
+      <div class="pixel-rule"></div>
+
+      <h2>Warm-up: retrieve before rereading</h2>
+      <p>
+        Five minutes, from memory. The model's <code>update</code> used
+        <code>updateMany</code>, not <code>update</code>. Why? And what does its
+        <code>count</code> let the controller decide? Say both, then check
+        <a href="../reference/0013-server-state-and-the-screen.html">Reference 13</a>.
+      </p>
+
+      <h2>Build it</h2>
+      <ol class="steps">
+        <li>
+          <h3>Verify the baseline — and see the defect plainly</h3>
+          <pre><code>npm run typecheck                       # exit 0
+grep -n "updatedAt" prisma/schema.prisma
+#   Person.updatedAt   DateTime @default(now()) @map("updated_at")
+#   User.updatedAt     DateTime @updatedAt      @map("updated_at")</code></pre>
+          <p>
+            Two models, two different declarations, side by side. The bug is that
+            the <code>Person</code> line says <code>@default(now())</code> — the
+            value is written once, at insert, and never touched again.
+            <code>@updatedAt</code> is the field that Prisma itself refreshes on
+            every write.
+          </p>
+        </li>
+
+        <li>
+          <h3>Repair first, on its own commit</h3>
+          <p>
+            This is a repair of shipped code, so it earns an isolated commit
+            <em>ahead</em> of the feature that depends on it — the sequencing rule
+            you set after the <code>whoami</code> fix. Do this step, commit it, and
+            only then start the edit path.
+          </p>
+          <div class="file">
+            <span class="file-path">prisma/schema.prisma (the Person model)</span>
+            <pre><code>  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")</code></pre>
+          </div>
+          <p>Then let Prisma plan and apply the migration:</p>
+          <pre><code>npx --no-install prisma migrate dev --name fix_person_updated_at</code></pre>
+          <p>
+            <code>--no-install</code> pins you to the project's own
+            <code>prisma</code> (7.10.0), never a freshly downloaded major. This
+            migration is one statement, and it is worth reading before you accept
+            it:
+          </p>
+          <div class="file">
+            <span class="file-path">prisma/migrations/…_fix_person_updated_at/migration.sql</span>
+            <pre><code>-- AlterTable
+ALTER TABLE `people` ALTER COLUMN `updated_at` DROP DEFAULT;</code></pre>
+          </div>
+          <p>
+            One line, and metadata-only: dropping a column <em>default</em> is an
+            in-place catalogue change, not a table rebuild. (Making a column
+            <code>NOT NULL</code> is the expensive one — that rebuilds and fails on
+            any remaining <code>NULL</code>, which is why lesson 12's column went
+            in with an expand-and-contract.)
+          </p>
+          <div class="callout">
+            <span class="callout-title">Is it safe to drop the default?</span>
+            <p>
+              Yes, and the proof is in your own schema. Remove the default and the
+              column has none — so every insert must supply a value. Prisma's
+              <code>@updatedAt</code> does: the client stamps it on create
+              <em>and</em> update. The <code>User</code> model is the live
+              demonstration — <code>users.updated_at</code> has been
+              <code>@updatedAt</code> with no default since lesson 04, and
+              registration has worked the whole time.
+            </p>
+          </div>
+          <p>
+            Commit the repair on its own now, with a message about the column, not
+            the feature.
+          </p>
+        </li>
+
+        <li>
+          <h3>The transport learns <code>PATCH</code></h3>
+          <div class="file">
+            <span class="file-path">client/src/lib/api.ts (additions)</span>
+            <pre><code>export function updatePerson(
+  slug: string,
+  personId: string,
+  patch: UpdatePersonRequest,
+): Promise&lt;PersonResource&gt; {
+  return request&lt;PersonResource&gt;(
+    `/api/families/${encodeURIComponent(slug)}/people/${encodeURIComponent(personId)}`,
+    { method: "PATCH", body: patch },
+  );
+}</code></pre>
+          </div>
+          <p>Add <code>UpdatePersonRequest</code> to the type import.</p>
+        </li>
+
+        <li>
+          <h3>A row that becomes a form</h3>
+          <p>
+            Replace the plain <code>&lt;li&gt;</code> in the list with a
+            <code>PersonRow</code> that can toggle into an edit form. It reuses the
+            exact invalidate pattern from the create — same key, same rule.
+          </p>
+          <div class="file">
+            <span class="file-path">client/src/PeoplePage.tsx (the row)</span>
+            <pre><code>import type { Gender, PersonResource } from "./contracts";
+import { ApiError, createPerson, getPeople, updatePerson } from "./lib/api";
+
+function PersonRow({ slug, person }: { slug: string; person: PersonResource }) {
+  const queryClient = useQueryClient();
+  const [editing, setEditing] = useState(false);
+  const [name, setName] = useState(person.name);
+
+  const invalidate = () =&gt;
+    queryClient.invalidateQueries({ queryKey: peopleKey(slug) });
+
+  const rename = useMutation({
+    mutationFn: (next: string) =&gt; updatePerson(slug, person.id, { name: next }),
+    onSuccess: () =&gt; {
+      setEditing(false);
+      void invalidate();
+    },
+  });
+
+  if (editing) {
+    return (
+      &lt;li&gt;
+        &lt;form
+          onSubmit={(event) =&gt; {
+            event.preventDefault();
+            rename.mutate(name.trim());
+          }}
+        &gt;
+          &lt;input
+            value={name}
+            onChange={(event) =&gt; setName(event.target.value)}
+          /&gt;{" "}
+          &lt;button type="submit" disabled={rename.isPending}&gt;
+            Save
+          &lt;/button&gt;{" "}
+          &lt;button type="button" onClick={() =&gt; setEditing(false)}&gt;
+            Cancel
+          &lt;/button&gt;
+        &lt;/form&gt;
+      &lt;/li&gt;
+    );
+  }
+
+  return (
+    &lt;li&gt;
+      {person.name} {person.living ? "· living" : "· deceased"}{" "}
+      &lt;button
+        type="button"
+        onClick={() =&gt; {
+          setName(person.name);
+          setEditing(true);
+        }}
+      &gt;
+        Edit
+      &lt;/button&gt;
+    &lt;/li&gt;
+  );
+}</code></pre>
+          </div>
+          <p>And use it in the list:</p>
+          <div class="file">
+            <span class="file-path">client/src/PeoplePage.tsx (PeopleList body)</span>
+            <pre><code>          {query.data.map((person) =&gt; (
+            &lt;PersonRow key={person.id} slug={slug} person={person} /&gt;
+          ))}</code></pre>
+          </div>
+        </li>
+      </ol>
+
+      <h2>Verify after</h2>
+      <pre><code>npm run typecheck        # exit 0
+npm run check:people     # exit 0 -- the scoped write is unchanged
+npm run build:client     # exit 0</code></pre>
+      <p>
+        Then prove the column actually moves, because that is the whole point of
+        the first commit. Edit a person in the browser, and read the row back:
+      </p>
+      <pre><code>npm run db:studio
+# open people, edit a name in the UI, watch updated_at change
+# (it must differ from created_at after the edit; before this lesson it never did)</code></pre>
+
+      <div class="callout warn">
+        <span class="callout-title">Break it on purpose — predict first</span>
+        <p>
+          Revert the schema line to <code>@default(now())</code>, generate, and
+          edit a person again. Predict what <code>updated_at</code> will show,
+          then look: it is frozen at creation time. The row changed, the
+          timestamp did not, and nothing errored — the worst shape a defect can
+          take. Put <code>@updatedAt</code> back. Then ask the sharper question:
+          <em>why did no test catch this?</em> Because no check compares two
+          columns; <code>check:people</code> proves scoping, not freshness.
+          Name the gap rather than pretending it is covered.
+        </p>
+      </div>
+
+      <h2>Decisions carried into the next sittings</h2>
+      <ul>
+        <li>
+          <strong>The edit form renames; it does not edit gender or dates.</strong>
+          The endpoint accepts the full <code>UpdatePersonRequest</code> — the
+          service and the validator are general — but the screen only offers a name
+          change. Build the richer form when a screen needs it (the profile page),
+          not because the API could. And when you widen <code>PersonResource</code>,
+          do it in the view first and let the compiler find the call sites.
+        </li>
+        <li>
+          <strong>One repair, one commit, and it came first.</strong> This sitting
+          has two commits and that is correct: a defect repair and the feature that
+          depends on it are different changes with different reasons to exist. The
+          general rule still stands — do not smuggle an unrelated fix into a
+          feature commit.
+        </li>
+        <li>
+          <strong>Optimistic editing still declined.</strong> Cancelling and
+          re-saving a rename could use an optimistic update; on localhost it would
+          be invisible either way. The trigger from 16c has not fired.
+        </li>
+      </ul>
+
+      <h2>Primary sources</h2>
+      <div class="callout win">
+        <span class="callout-title">Read these against the code</span>
+        <p>
+          <a href="https://www.prisma.io/docs/orm/reference/prisma-schema-reference">Prisma schema reference</a>
+          for <code>@updatedAt</code> and <code>@default</code> — and note it says
+          the field is set by the client, which is why dropping the database
+          default is safe ·
+          <a href="https://dev.mysql.com/doc/refman/8.0/en/innodb-online-ddl-operations.html">MySQL 8.0 — Online DDL Operations</a>
+          for the column table that rates a default change as metadata-only while
+          <code>NOT NULL</code> "Rebuilds Table: Yes" ·
+          <a href="../reference/0003-prisma-data-layer.html">Reference 03</a> for
+          migrations, and <a href="../reference/0011-live-schema-and-growing-lists.html">Reference 11</a>
+          for reading the schema's biography.
+        </p>
+      </div>
+
+      <p>
+        If the migration reads differently than the one line above, stop — that
+        means the schema has drifted from what this lesson assumes, and I want to
+        see it before you apply anything. Ask about <code>@updatedAt</code> on a
+        relation, why the default is client-side, or expand-and-contract — anything
+        unclear is worth the minute.
+      </p>
+
+      <h2>Log it</h2>
+      <ul>
+        <li>Minutes: _</li>
+        <li>One line — what fought back, or what you could not recall: _</li>
+        <li>Committed: <code>&lt;hash&gt;</code> (the repair) and <code>&lt;hash&gt;</code> (the edit)</li>
+      </ul>
+      <p>
+        Add both to this week's block in <a href="../PROGRESS.md">PROGRESS.md</a>.
+      </p>
+
+      <footer class="lesson-footer">
+        <p class="next-up">
+          <strong>Next:</strong> Lesson 16e — deleting a person, the one verb that
+          answers with no body at all.
+        </p>
+        <p>
+          <a href="../MISSION.md">MISSION.md</a> ·
+          <a href="../ROADMAP.md">ROADMAP.md</a> ·
+          <a href="../GLOSSARY.md">GLOSSARY.md</a> ·
+          <a href="0016c-the-mutation-that-invalidates.html">Lesson 16c</a> ·
+          <a href="0016f-practice.html">Lesson 16f</a> ·
+          <a href="../reference/0003-prisma-data-layer.html">Reference 03</a>
+        </p>
+      </footer>
+    </div>
+    <script src="../assets/quiz.js"></script>
+  </body>
+</html>
